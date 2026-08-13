@@ -49,6 +49,7 @@ class Market(BaseModel):
     event_ticker: str | None = None
     title: str | None = None
     status: str | None = None
+    close_time: str | None = None
     yes_bid: int | None = None
     yes_ask: int | None = None
     no_bid: int | None = None
