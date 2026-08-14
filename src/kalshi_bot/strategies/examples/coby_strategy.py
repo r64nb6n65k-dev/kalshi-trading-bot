@@ -45,7 +45,6 @@ if close_dt.tzinfo is None:
 close_dt = close_dt.replace(tzinfo=timezone.utc)
 
 now = datetime.now(timezone.utc)
-
 return (close_dt - now).total_seconds()
 
 except ValueError:
@@ -72,17 +71,11 @@ def on_market_data(
 self,
 ctx: StrategyContext,
 ) -> list[OrderRequest]:
-
 m = ctx.market
 inventory = ctx.position_for(m.ticker)
 
-# -------------------------
 # EXIT EXISTING YES POSITION
-# -------------------------
-
 if inventory > 0 and m.yes_bid is not None:
-
-# Take profit
 if m.yes_bid >= self.take_profit:
 return [
 OrderRequest(
@@ -95,7 +88,6 @@ yes_price=m.yes_bid,
 )
 ]
 
-# Stop loss
 if m.yes_bid <= self.stop_price:
 return [
 OrderRequest(
@@ -109,15 +101,10 @@ type=OrderType.MARKET,
 
 return []
 
-# -------------------------
 # EXIT EXISTING NO POSITION
-# -------------------------
-
 if inventory < 0 and m.no_bid is not None:
-
 count = abs(inventory)
 
-# Take profit
 if m.no_bid >= self.take_profit:
 return [
 OrderRequest(
@@ -130,7 +117,6 @@ no_price=m.no_bid,
 )
 ]
 
-# Stop loss
 if m.no_bid <= self.stop_price:
 return [
 OrderRequest(
@@ -144,44 +130,30 @@ type=OrderType.MARKET,
 
 return []
 
-# -------------------------
 # ENTRY TIMING FILTER
-# -------------------------
-
 seconds_left = self._seconds_to_close(m.close_time)
 
 if seconds_left is None:
 return []
 
-# Don't enter before final five minutes.
 if seconds_left > self.entry_window_seconds:
 return []
 
-# Don't enter after market close.
 if seconds_left <= 0:
 return []
 
-# -------------------------
 # EXTERNAL MARKET SIGNAL
-# -------------------------
-
 signal = self._external_signal()
 
-# Until BTC/VWAP data is wired in,
-# the bot intentionally makes no entry.
+# Entries remain disabled until BTC/VWAP data is connected.
 if signal is None:
 return []
 
-# -------------------------
 # YES ENTRY
-# -------------------------
-
 if signal is Side.YES:
-
 if m.yes_ask is None:
 return []
 
-# Never chase above our tested entry ceiling.
 if m.yes_ask > self.entry_max:
 return []
 
@@ -196,16 +168,11 @@ yes_price=m.yes_ask,
 )
 ]
 
-# -------------------------
 # NO ENTRY
-# -------------------------
-
 if signal is Side.NO:
-
 if m.no_ask is None:
 return []
 
-# Never chase above our tested entry ceiling.
 if m.no_ask > self.entry_max:
 return []
 
