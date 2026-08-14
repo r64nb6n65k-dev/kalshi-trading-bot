@@ -27,6 +27,7 @@ from kalshi_bot.strategies.examples.fair_value import FairValue
 from kalshi_bot.strategies.examples.market_maker import MarketMaker
 from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
 from kalshi_bot.strategies.examples.momentum import Momentum
+from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
 
 app = typer.Typer(
     add_completion=False,
@@ -40,6 +41,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
     "mean_reversion": MeanReversion,
     "arbitrage": ArbitrageYesNo,
     "fair_value": FairValue,
+    "coby_strategy": CobyStrategy,
 }
 
 
