@@ -38,27 +38,32 @@ class TradingEngine:
         self.dry_run = dry_run
         self.poll_interval = poll_interval
         self._running = False
+async def _snapshot(self, ticker: str) -> StrategyContext:
+    if ticker == "KXBTC15M":
+        markets = await self.client.get_markets(
+            status="open",
+            series_ticker="KXBTC15M",
+            limit=100,
+        )
+        if not markets:
+            raise RuntimeError("No open KXBTC15M market found")
 
-    async def _snapshot(self, ticker: str) -> StrategyContext:
-        if ticker == "KXBTC15M":
-            markets = await self.client.get_markets(
-                status="open",
-                series_ticker="KXBTC15M",
-                limit=100,
-    )
-    if not markets:
-        raise RuntimeError("No open KXBTC15M market found")
-
-    market = min(markets, key=lambda m: m.close_time or "")
-       else:
+        market = min(markets, key=lambda m: m.close_time or "")
+    else:
         market = await self.client.get_market(ticker)
-        positions: dict[str, Position] = {}
-        balance = 0
-        if self.client.authenticated:
-            for pos in await self.client.get_positions():
-                positions[pos.ticker] = pos
-            balance = (await self.client.get_balance()).balance
-        return StrategyContext(market=market, positions=positions, balance=balance)
+
+    positions: dict[str, Position] = {}
+    balance = 0
+    if self.client.authenticated:
+        for pos in await self.client.get_positions():
+            positions[pos.ticker] = pos
+        balance = (await self.client.get_balance()).balance
+
+    return StrategyContext(
+        market=market,
+        positions=positions,
+        balance=balance,
+    )
 
     async def _submit(self, order: OrderRequest, current_position: int) -> Order | None:
         decision = self.risk.check(order, current_position)
