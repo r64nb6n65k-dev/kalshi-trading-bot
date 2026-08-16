@@ -102,8 +102,11 @@ def markets(
     async def _run() -> None:
         settings = load_settings()
         async with KalshiClient.from_settings(settings) as client:
-            rows = await client.get_markets(status=status, limit=1000)
-            rows = [m for m in rows if ("BTC" in str(m.ticker).upper() or "BITCOIN" in str(m.title).upper())]
+            rows = await client.get_markets(
+    status=status,
+    series_ticker="KXBTC15M",
+    limit=100,
+)
             table = Table(title=f"Kalshi markets ({settings.environment.value})")
             table.add_column("Ticker", style="cyan")
             table.add_column("Title")
