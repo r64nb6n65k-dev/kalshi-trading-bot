@@ -38,7 +38,7 @@ from kalshi_bot.exchange.models import (
     Position,
 )
 
-API_PREFIX = "/trade-api/v2"
+API_PREFIX = ""
 
 
 class KalshiError(RuntimeError):
