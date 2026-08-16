@@ -11,7 +11,6 @@ Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
 from __future__ import annotations
 
 import asyncio
-
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Order, OrderRequest, Position
 from kalshi_bot.risk.manager import RiskManager
@@ -38,32 +37,16 @@ class TradingEngine:
         self.dry_run = dry_run
         self.poll_interval = poll_interval
         self._running = False
-async def _snapshot(self, ticker: str) -> StrategyContext:
-    if ticker == "KXBTC15M":
-        markets = await self.client.get_markets(
-            status="open",
-            series_ticker="KXBTC15M",
-            limit=100,
-        )
-        if not markets:
-            raise RuntimeError("No open KXBTC15M market found")
 
-        market = min(markets, key=lambda m: m.close_time or "")
-    else:
+    async def _snapshot(self, ticker: str) -> StrategyContext:
         market = await self.client.get_market(ticker)
-
-    positions: dict[str, Position] = {}
-    balance = 0
-    if self.client.authenticated:
-        for pos in await self.client.get_positions():
-            positions[pos.ticker] = pos
-        balance = (await self.client.get_balance()).balance
-
-    return StrategyContext(
-        market=market,
-        positions=positions,
-        balance=balance,
-    )
+        positions: dict[str, Position] = {}
+        balance = 0
+        if self.client.authenticated:
+            for pos in await self.client.get_positions():
+                positions[pos.ticker] = pos
+            balance = (await self.client.get_balance()).balance
+        return StrategyContext(market=market, positions=positions, balance=balance)
 
     async def _submit(self, order: OrderRequest, current_position: int) -> Order | None:
         decision = self.risk.check(order, current_position)
@@ -77,30 +60,30 @@ async def _snapshot(self, ticker: str) -> StrategyContext:
         logger.info("Submitted order %s for %s", order_resp.order_id, order.ticker)
         return order_resp
 
-async def run(self, ticker: str, max_ticks: int | None = None) -> None:
-    """Run the engine on ``ticker`` until stopped or ``max_ticks`` reached."""
-    self._running = True
-    self.strategy.on_start()
-    logger.info(
-        "Engine started | strategy=%s | ticker=%s | dry_run=%s",
-        self.strategy.name,
-        ticker,
-        self.dry_run,
-    )
-    tick = 0
-    try:
-        while self._running:
-            ctx = await self._snapshot(ticker)
-            for order in self.strategy.on_market_data(ctx):
-                await self._submit(order, ctx.position_for(order.ticker))
-            tick += 1
-            if max_ticks is not None and tick >= max_ticks:
-                break
-            await asyncio.sleep(self.poll_interval)
-    finally:
-        self.strategy.on_stop()
-        self._running = False
-        logger.info("Engine stopped after %d tick(s)", tick)
+    async def run(self, ticker: str, max_ticks: int | None = None) -> None:
+        """Run the engine on ``ticker`` until stopped or ``max_ticks`` reached."""
+        self._running = True
+        self.strategy.on_start()
+        logger.info(
+            "Engine started | strategy=%s | ticker=%s | dry_run=%s",
+            self.strategy.name,
+            ticker,
+            self.dry_run,
+        )
+        tick = 0
+        try:
+            while self._running:
+                ctx = await self._snapshot(ticker)
+                for order in self.strategy.on_market_data(ctx):
+                    await self._submit(order, ctx.position_for(order.ticker))
+                tick += 1
+                if max_ticks is not None and tick >= max_ticks:
+                    break
+                await asyncio.sleep(self.poll_interval)
+        finally:
+            self.strategy.on_stop()
+            self._running = False
+            logger.info("Engine stopped after %d tick(s)", tick)
 
     def stop(self) -> None:
         """Signal the engine to stop after the current tick."""
