@@ -57,7 +57,7 @@ class Market(BaseModel):
     last_price: int | None = None
     volume: int | None = None
     open_interest: int | None = None
-        @model_validator(mode="before")
+    @model_validator(mode="before")
     @classmethod
     def convert_dollar_prices(cls, data):
         if isinstance(data, dict):
