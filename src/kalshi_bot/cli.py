@@ -103,7 +103,7 @@ def markets(
         settings = load_settings()
         async with KalshiClient.from_settings(settings) as client:
             rows = await client.get_markets(status=status, limit=1000)
-            rows = [m for m in rows if "BTC" IN STR(M.TICKER).UPPER() or "BITCOIN" in str(m.title).upper()]
+            rows = [m for m in rows if ("BTC" in str(m.ticker).upper() or "BITCOIN" in str(m.title).upper())]
             table = Table(title=f"Kalshi markets ({settings.environment.value})")
             table.add_column("Ticker", style="cyan")
             table.add_column("Title")
