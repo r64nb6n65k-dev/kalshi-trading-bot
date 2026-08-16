@@ -41,10 +41,10 @@ class TradingEngine:
 
     async def _snapshot(self, ticker: str) -> StrategyContext:
         if ticker == "KXBTC15M":
-        markets = await self.client.get_markets(
-        status="open",
-        series_ticker="KXBTC15M",
-        limit=100,
+            markets = await self.client.get_markets(
+                status="open",
+                series_ticker="KXBTC15M",
+                limit=100,
     )
     if not markets:
         raise RuntimeError("No open KXBTC15M market found")
