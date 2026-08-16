@@ -72,7 +72,7 @@ class Settings(BaseSettings):
 
     # --- Environment -----------------------------------------------------
     environment: Environment = Field(
-        default=Environment.DEMO,
+        default=Environment.PROD,
         description="Trading environment: 'demo' (sandbox) or 'prod'.",
     )
 
