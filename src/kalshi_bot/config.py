@@ -30,7 +30,7 @@ REST_BASE_URLS: dict[Environment, str] = {
 }
 
 WS_BASE_URLS: dict[Environment, str] = {
-    Environment.PROD: "wss://api.elections.kalshi.com/trade-api/ws/v2",
+    Environment.PROD: "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
     Environment.DEMO: "wss://demo-api.kalshi.co/trade-api/ws/v2",
 }
 
