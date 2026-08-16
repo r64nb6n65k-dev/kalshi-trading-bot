@@ -50,7 +50,7 @@ class TradingEngine:
         raise RuntimeError("No open KXBTC15M market found")
 
     market = min(markets, key=lambda m: m.close_time or "")
-    else:
+       else:
         market = await self.client.get_market(ticker)
         positions: dict[str, Position] = {}
         balance = 0
