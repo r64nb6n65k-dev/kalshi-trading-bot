@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Side(str, Enum):
@@ -57,6 +57,24 @@ class Market(BaseModel):
     last_price: int | None = None
     volume: int | None = None
     open_interest: int | None = None
+        @model_validator(mode="before")
+    @classmethod
+    def convert_dollar_prices(cls, data):
+        if isinstance(data, dict):
+            data = dict(data)
+            price_fields = {
+                "yes_bid": "yes_bid_dollars",
+                "yes_ask": "yes_ask_dollars",
+                "no_bid": "no_bid_dollars",
+                "no_ask": "no_ask_dollars",
+                "last_price": "last_price_dollars",
+            }
+
+            for cents_field, dollars_field in price_fields.items():
+                if data.get(cents_field) is None and data.get(dollars_field) not in (None, ""):
+                    data[cents_field] = round(float(data[dollars_field]) * 100)
+
+        return data
 
 
 class OrderRequest(BaseModel):
