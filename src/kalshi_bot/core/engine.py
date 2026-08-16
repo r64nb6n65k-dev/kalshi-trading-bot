@@ -77,30 +77,30 @@ async def _snapshot(self, ticker: str) -> StrategyContext:
         logger.info("Submitted order %s for %s", order_resp.order_id, order.ticker)
         return order_resp
 
-    async def run(self, ticker: str, max_ticks: int | None = None) -> None:
-        """Run the engine on ``ticker`` until stopped or ``max_ticks`` reached."""
-        self._running = True
-        self.strategy.on_start()
-        logger.info(
-            "Engine started | strategy=%s | ticker=%s | dry_run=%s",
-            self.strategy.name,
-            ticker,
-            self.dry_run,
-        )
-        tick = 0
-        try:
-            while self._running:
-                ctx = await self._snapshot(ticker)
-                for order in self.strategy.on_market_data(ctx):
-                    await self._submit(order, ctx.position_for(order.ticker))
-                tick += 1
-                if max_ticks is not None and tick >= max_ticks:
-                    break
-                await asyncio.sleep(self.poll_interval)
-        finally:
-            self.strategy.on_stop()
-            self._running = False
-            logger.info("Engine stopped after %d tick(s)", tick)
+async def run(self, ticker: str, max_ticks: int | None = None) -> None:
+    """Run the engine on ``ticker`` until stopped or ``max_ticks`` reached."""
+    self._running = True
+    self.strategy.on_start()
+    logger.info(
+        "Engine started | strategy=%s | ticker=%s | dry_run=%s",
+        self.strategy.name,
+        ticker,
+        self.dry_run,
+    )
+    tick = 0
+    try:
+        while self._running:
+            ctx = await self._snapshot(ticker)
+            for order in self.strategy.on_market_data(ctx):
+                await self._submit(order, ctx.position_for(order.ticker))
+            tick += 1
+            if max_ticks is not None and tick >= max_ticks:
+                break
+            await asyncio.sleep(self.poll_interval)
+    finally:
+        self.strategy.on_stop()
+        self._running = False
+        logger.info("Engine stopped after %d tick(s)", tick)
 
     def stop(self) -> None:
         """Signal the engine to stop after the current tick."""
