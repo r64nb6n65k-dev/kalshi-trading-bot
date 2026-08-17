@@ -28,6 +28,7 @@ from kalshi_bot.strategies.examples.market_maker import MarketMaker
 from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
 from kalshi_bot.strategies.examples.momentum import Momentum
 from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
+from kalshi_bot.dashboard import start_dashboard
 
 app = typer.Typer(
     add_completion=False,
@@ -149,6 +150,7 @@ def run(
         raise typer.Exit(code=1)
 
     async def _run() -> None:
+        start_dashboard()
         settings = load_settings()
         # Dry-run unless --live is explicitly passed.
         dry_run = not live
