@@ -149,7 +149,7 @@ class CobyStrategy(Strategy):
             entry_price = m.no_ask
 
         # Preserve the existing 90-cent minimum entry rule.
-        if entry_price < self.entry_max:
+        if entry_price < self.entry_min or entry_price > self.entry_max:
             return []
 
         self._paper_ticker = m.ticker
