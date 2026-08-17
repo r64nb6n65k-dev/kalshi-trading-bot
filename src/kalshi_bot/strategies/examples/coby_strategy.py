@@ -6,6 +6,7 @@ from typing import Any
 from kalshi_bot.exchange.models import Side
 from kalshi_bot.strategies.base import Strategy, StrategyContext
 from kalshi_bot.telemetry.logging import get_logger
+from kalshi_bot.dashboard import record_entry, record_exit
 
 logger = get_logger(__name__)
 
@@ -91,6 +92,16 @@ class CobyStrategy(Strategy):
             self.size,
             trade_pnl,
             self._paper_total_pnl_cents,
+        )
+                record_exit(
+            ticker=self._paper_ticker,
+            side=self._paper_side.value,
+            entry_price=self._paper_entry_price,
+            exit_price=exit_price,
+            reason=reason,
+            count=self.size,
+            pnl_cents=trade_pnl,
+            total_pnl_cents=self._paper_total_pnl_cents,
         )
         self._reset_position()
 
