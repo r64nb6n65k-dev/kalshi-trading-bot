@@ -30,7 +30,8 @@ class CobyStrategy(Strategy):
     def __init__(self, **params: Any) -> None:
         super().__init__(**params)
 
-        self.entry_max = int(params.get("entry_max", 90))
+        self.entry_min = int(params.get("entry_min", 90))
+        self.entry_max = int(params.get("entry_max",95))
         self.take_profit = int(params.get("take_profit", 98))
         self.stop_price = int(params.get("stop_price", 79))
         self.entry_window_seconds = int(
