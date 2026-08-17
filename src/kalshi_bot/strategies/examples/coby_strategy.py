@@ -5,18 +5,22 @@ from typing import Any
 
 from kalshi_bot.exchange.models import Action, OrderRequest, OrderType, Side
 from kalshi_bot.strategies.base import Strategy, StrategyContext
+from kalshi_bot.strategies.examples.tradingview_signal import (
+    get_latest_signal,
+    start_webhook_server,
+)
 
 
 class CobyStrategy(Strategy):
     """
     Late-market Kalshi strategy.
 
-    Version 1:
+    Version 2:
     - Only considers entries in the final 5 minutes.
     - Maximum entry price: 90 cents.
     - Take profit: 98 cents.
     - Stop trigger: 79 cents.
-    - Does NOT enter until the external BTC/VWAP signal is connected.
+    - Uses the latest TradingView BTC/VWAP webhook signal.
     """
 
     name = "coby_strategy"
@@ -31,6 +35,13 @@ class CobyStrategy(Strategy):
             params.get("entry_window_seconds", 300)
         )
         self.size = int(params.get("size", 1))
+        self.signal_max_age_seconds = float(
+            params.get("signal_max_age_seconds", 45)
+        )
+
+    def on_start(self) -> None:
+        super().on_start()
+        start_webhook_server()
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
@@ -51,19 +62,17 @@ class CobyStrategy(Strategy):
             return None
 
     def _external_signal(self) -> Side | None:
-        """
-        Placeholder for BTC/Gold market-data logic.
+        latest = get_latest_signal(self.signal_max_age_seconds)
+        if latest is None:
+            return None
 
-        Later this will evaluate:
-        - underlying price vs Kalshi target
-        - VWAP
-        - trend
-        - momentum / follow-through
-        - chop
-        - distance from target
+        signal = latest.get("signal")
 
-        Returns Side.YES, Side.NO, or None.
-        """
+        if signal == "YES":
+            return Side.YES
+
+        if signal == "NO":
+            return Side.NO
 
         return None
 
@@ -145,7 +154,7 @@ class CobyStrategy(Strategy):
         # EXTERNAL MARKET SIGNAL
         signal = self._external_signal()
 
-        # Entries remain disabled until BTC/VWAP data is connected.
+        # No fresh TradingView signal means no entry.
         if signal is None:
             return []
 
