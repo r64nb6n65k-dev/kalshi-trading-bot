@@ -46,7 +46,7 @@ class CobyStrategy(Strategy):
         self.entry_window_seconds = int(
             params.get("entry_window_seconds", 300)
         )
-        self.size = int(params.get("size", 1))
+        self.size = int(params.get("size", 500))
 
         self._paper_ticker: str | None = None
         self._paper_side: Side | None = None
