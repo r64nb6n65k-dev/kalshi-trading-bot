@@ -1,16 +1,9 @@
-"""The live trading engine.
-
-Polls a market, hands the snapshot to a strategy, runs each emitted order
-through the :class:`~kalshi_bot.risk.manager.RiskManager`, and either submits it
-(live) or logs it (dry-run). Dry-run is the default and is strongly recommended
-until you fully understand a strategy.
-
-Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
-"""
+"""Live trading engine with confirmed execution callbacks."""
 
 from __future__ import annotations
 
 import asyncio
+
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Order, OrderRequest, Position
 from kalshi_bot.risk.manager import RiskManager
@@ -21,8 +14,6 @@ logger = get_logger(__name__)
 
 
 class TradingEngine:
-    """Drives a single strategy against a single market."""
-
     def __init__(
         self,
         client: KalshiClient,
@@ -47,7 +38,6 @@ class TradingEngine:
             )
             if not markets:
                 raise RuntimeError("No open KXBTC15M market found")
-
             market = min(markets, key=lambda m: m.close_time or "")
         else:
             market = await self.client.get_market(ticker)
@@ -59,26 +49,58 @@ class TradingEngine:
                 positions[pos.ticker] = pos
             balance = (await self.client.get_balance()).balance
 
-        return StrategyContext(
-            market=market,
-            positions=positions,
-            balance=balance,
-        )
+        return StrategyContext(market=market, positions=positions, balance=balance)
 
-    async def _submit(self, order: OrderRequest, current_position: int) -> Order | None:
+    def _notify_order_result(
+        self,
+        request: OrderRequest,
+        result: Order | None,
+        seconds_left: float | None,
+    ) -> None:
+        callback = getattr(self.strategy, "on_order_result", None)
+        if callable(callback):
+            callback(request, result, seconds_left)
+
+    async def _submit(
+        self,
+        order: OrderRequest,
+        current_position: int,
+        seconds_left: float | None = None,
+    ) -> Order | None:
         decision = self.risk.check(order, current_position)
         if not decision.approved:
-            logger.warning("Order vetoed by risk manager: %s | %s", decision.reason, order)
+            logger.warning(
+                "Order vetoed by risk manager: %s | %s",
+                decision.reason,
+                order,
+            )
+            self._notify_order_result(order, None, seconds_left)
             return None
+
         if self.dry_run:
             logger.info("[DRY-RUN] would submit: %s", order.to_payload())
             return None
-        order_resp = await self.client.create_order(order)
-        logger.info("Submitted order %s for %s", order_resp.order_id, order.ticker)
+
+        try:
+            order_resp = await self.client.create_order(order)
+        except Exception:
+            # Clear the strategy's pending-order flag so one API error does not
+            # permanently freeze entry or exit attempts.
+            logger.exception("Live order submission failed | %s", order)
+            self._notify_order_result(order, None, seconds_left)
+            return None
+
+        logger.info(
+            "Submitted order %s for %s | fill_count=%d | remaining_count=%s",
+            order_resp.order_id,
+            order.ticker,
+            order_resp.fill_count,
+            order_resp.remaining_count,
+        )
+        self._notify_order_result(order, order_resp, seconds_left)
         return order_resp
 
     async def run(self, ticker: str, max_ticks: int | None = None) -> None:
-        """Run the engine on ``ticker`` until stopped or ``max_ticks`` reached."""
         self._running = True
         self.strategy.on_start()
         logger.info(
@@ -91,8 +113,19 @@ class TradingEngine:
         try:
             while self._running:
                 ctx = await self._snapshot(ticker)
+
+                seconds_left = None
+                helper = getattr(self.strategy, "_seconds_to_close", None)
+                if callable(helper):
+                    seconds_left = helper(ctx.market.close_time)
+
                 for order in self.strategy.on_market_data(ctx):
-                    await self._submit(order, ctx.position_for(order.ticker))
+                    await self._submit(
+                        order,
+                        ctx.position_for(order.ticker),
+                        seconds_left,
+                    )
+
                 tick += 1
                 if max_ticks is not None and tick >= max_ticks:
                     break
@@ -103,5 +136,4 @@ class TradingEngine:
             logger.info("Engine stopped after %d tick(s)", tick)
 
     def stop(self) -> None:
-        """Signal the engine to stop after the current tick."""
         self._running = False
