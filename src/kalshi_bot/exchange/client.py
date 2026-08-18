@@ -144,12 +144,12 @@ class KalshiClient:
         return [Position.model_validate(p) for p in data.get("market_positions", [])]
 
     async def create_order(self, order: OrderRequest) -> Order:
-        """Create an order using Kalshi's current V2 event-order endpoint."""
+        """Create an order using Kalshi's V2 event-order endpoint."""
 
         action = order.action.value
         outcome = order.side.value
 
-        # Kalshi V2 uses a single YES-side book:
+        # Kalshi V2 uses one YES-side book:
         # bid = buy YES / sell NO
         # ask = sell YES / buy NO
         if action == "buy" and outcome == "yes":
@@ -210,19 +210,36 @@ class KalshiClient:
             json=payload,
         )
 
-        order_id = created["order_id"]
+        # V2 create already returns enough information to acknowledge the
+        # submission. Do not immediately fetch the order again just to build
+        # the repo's legacy Order model; the create response is authoritative
+        # for this submission and already includes fill/remaining quantities.
+        fill_count = int(float(created.get("fill_count", "0")))
+        remaining_count = int(float(created.get("remaining_count", "0")))
 
-        # The V2 create endpoint returns a compact response. Fetch the full
-        # order through the existing read endpoint so the rest of the bot can
-        # keep using the current Order model unchanged.
-        data = await self._request(
-            "GET",
-            f"/portfolio/orders/{order_id}",
+        if fill_count >= order.count:
+            status = "executed"
+        elif remaining_count > 0:
+            status = "resting"
+        else:
+            # For IOC, this includes unfilled or partially-filled orders whose
+            # unfilled remainder was canceled immediately.
+            status = "canceled"
+
+        return Order(
+            order_id=created["order_id"],
+            ticker=order.ticker,
+            status=status,
+            side=order.side,
+            action=order.action,
+            yes_price=order.yes_price,
+            no_price=order.no_price,
+            count=order.count,
+            remaining_count=remaining_count,
         )
-        return Order.model_validate(data["order"])
 
     async def cancel_order(self, order_id: str) -> Order:
-        """Cancel an order by ID (``DELETE /portfolio/orders/{id}``)."""
+        """Cancel an order by ID using the legacy read-compatible model."""
         data = await self._request("DELETE", f"/portfolio/orders/{order_id}")
         return Order.model_validate(data["order"])
 
