@@ -152,10 +152,12 @@ class CobyStrategy(Strategy):
             return []
 
         # Entry timing filter.
+        # Only enter during the configured entry window, and never open
+        # a new position during the final 60 seconds of the market.
         if seconds_left is None:
             return []
 
-        if seconds_left <= 0 or seconds_left > self.entry_window_seconds:
+        if seconds_left <= 60 or seconds_left > self.entry_window_seconds:
             return []
 
         side: Side | None = None
