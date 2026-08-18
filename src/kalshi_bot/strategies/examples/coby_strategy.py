@@ -1,8 +1,19 @@
-"""Coby's 15-minute Kalshi strategy.
+"""Coby's 15-minute Kalshi live strategy.
 
-This strategy is intentionally paper-only. It simulates one position per
-15-minute market, enters during the configured final-seconds window, and
-records exits for take-profit or stop-loss conditions.
+Live-entry rules:
+- One entry attempt maximum per 15-minute market ticker.
+- Only enter during the final ``entry_window_seconds``.
+- Never open a new position with 60 seconds or less remaining.
+- Enter a YES or NO side only when the executable ask is within the
+  configured 90c-95c entry range.
+- Cap each live entry at $100 notional and 100 contracts.
+- Exit at or above ``take_profit``.
+- Exit at or below ``stop_price``.
+
+IMPORTANT:
+The framework remains dry-run unless the CLI is explicitly started with
+``--live``. Every emitted OrderRequest still passes through the framework's
+risk manager before execution.
 """
 
 from __future__ import annotations
@@ -10,8 +21,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from kalshi_bot.dashboard import record_entry, record_exit
-from kalshi_bot.exchange.models import Side
+from kalshi_bot.exchange.models import (
+    Action,
+    OrderRequest,
+    OrderType,
+    Side,
+    TimeInForce,
+)
 from kalshi_bot.strategies.base import Strategy, StrategyContext
 from kalshi_bot.telemetry.logging import get_logger
 
@@ -20,19 +36,7 @@ logger = get_logger(__name__)
 
 
 class CobyStrategy(Strategy):
-    """Paper-trading strategy for Kalshi 15-minute markets.
-
-    Rules:
-    - One simulated entry maximum per market ticker.
-    - Only enter during the final ``entry_window_seconds``.
-    - Enter a YES or NO side only when that side's bid is within the
-      configured entry range.
-    - Exit at or above ``take_profit``.
-    - Exit at or below ``stop_price``.
-    - Simulates positions internally and never emits a real OrderRequest.
-
-    This build is intentionally for collecting dry-run data.
-    """
+    """Coby's 15-minute BTC Kalshi strategy with live-order support."""
 
     name = "coby_strategy"
 
@@ -46,14 +50,20 @@ class CobyStrategy(Strategy):
         self.entry_window_seconds = int(
             params.get("entry_window_seconds", 300)
         )
-        self.size = int(params.get("size", 500))
 
-        self._paper_ticker: str | None = None
-        self._paper_side: Side | None = None
-        self._paper_entry_price: int | None = None
-        self._paper_entry_time: datetime | None = None
+        # Hard live-entry caps.
+        self.max_contracts = int(params.get("max_contracts", 100))
+        self.max_notional_cents = int(
+            params.get("max_notional_cents", 10_000)
+        )
+
+        # One attempted entry per ticker. This prevents repeated orders if an
+        # IOC order does not fill or only partially fills.
         self._traded_tickers: set[str] = set()
-        self._paper_total_pnl_cents = 0
+
+        # Remember which side we attempted for each ticker so we do not have
+        # to infer YES/NO from the sign convention used by position_for().
+        self._side_by_ticker: dict[str, Side] = {}
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
@@ -71,128 +81,183 @@ class CobyStrategy(Strategy):
         except ValueError:
             return None
 
-    def _reset_position(self) -> None:
-        self._paper_ticker = None
-        self._paper_side = None
-        self._paper_entry_price = None
-        self._paper_entry_time = None
+    def _entry_count(self, entry_price: int) -> int:
+        """Return a whole-contract count that never exceeds the $100 cap."""
+        if entry_price <= 0:
+            return 0
 
-    def _log_exit(self, exit_price: int, reason: str) -> None:
-        if (
-            self._paper_ticker is None
-            or self._paper_side is None
-            or self._paper_entry_price is None
-        ):
-            return
+        count_by_notional = self.max_notional_cents // entry_price
+        return max(0, min(self.max_contracts, count_by_notional))
 
-        pnl_per_contract = exit_price - self._paper_entry_price
-        trade_pnl = pnl_per_contract * self.size
-        self._paper_total_pnl_cents += trade_pnl
+    def _order(
+        self,
+        *,
+        ticker: str,
+        action: Action,
+        side: Side,
+        price: int,
+        count: int,
+    ) -> OrderRequest:
+        """Build an IOC limit order in the repo's existing YES/NO model."""
+        kwargs: dict[str, Any] = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": OrderType.LIMIT,
+            "time_in_force": TimeInForce.IMMEDIATE_OR_CANCEL,
+        }
 
-        logger.info(
-            "PAPER EXIT | ticker=%s | side=%s | entry=%dc | exit=%dc | "
-            "reason=%s | count=%d | pnl=%+dc | total_pnl=%+dc",
-            self._paper_ticker,
-            self._paper_side.value,
-            self._paper_entry_price,
-            exit_price,
-            reason,
-            self.size,
-            trade_pnl,
-            self._paper_total_pnl_cents,
-        )
+        if side is Side.YES:
+            kwargs["yes_price"] = price
+        else:
+            kwargs["no_price"] = price
 
-        record_exit(
-            ticker=self._paper_ticker,
-            side=self._paper_side.value,
-            entry_price=self._paper_entry_price,
-            exit_price=exit_price,
-            reason=reason,
-            count=self.size,
-            pnl_cents=trade_pnl,
-            total_pnl_cents=self._paper_total_pnl_cents,
-        )
+        return OrderRequest(**kwargs)
 
-        self._reset_position()
-
-    def on_market_data(self, ctx: StrategyContext) -> list:
+    def on_market_data(
+        self,
+        ctx: StrategyContext,
+    ) -> list[OrderRequest]:
         m = ctx.market
         seconds_left = self._seconds_to_close(m.close_time)
 
-        # If Kalshi has rolled to a new 15-minute ticker while a paper trade
-        # is still open, record it as unresolved rather than inventing a result.
-        if self._paper_ticker is not None and self._paper_ticker != m.ticker:
-            logger.warning(
-                "PAPER ROLLOVER_UNRESOLVED | ticker=%s | side=%s | entry=%dc",
-                self._paper_ticker,
-                self._paper_side.value if self._paper_side else "UNKNOWN",
-                self._paper_entry_price or 0,
-            )
-            self._reset_position()
+        if seconds_left is None:
+            return []
 
-        # Manage an existing paper position.
-        if self._paper_ticker == m.ticker and self._paper_side is not None:
-            bid = m.yes_bid if self._paper_side is Side.YES else m.no_bid
+        position = ctx.position_for(m.ticker)
 
+        # --------------------------------------------------------------
+        # MANAGE AN EXISTING LIVE POSITION
+        # --------------------------------------------------------------
+        if position != 0:
+            side = self._side_by_ticker.get(m.ticker)
+
+            # Conservative fail-safe: if we somehow have a position but do
+            # not know which outcome side created it, do not guess.
+            if side is None:
+                logger.error(
+                    "LIVE EXIT BLOCKED | ticker=%s | position=%s | "
+                    "reason=UNKNOWN_SIDE",
+                    m.ticker,
+                    position,
+                )
+                return []
+
+            count = abs(int(position))
+            if count <= 0:
+                return []
+
+            bid = m.yes_bid if side is Side.YES else m.no_bid
             if bid is None:
                 return []
 
             if bid >= self.take_profit:
-                self._log_exit(bid, "TAKE_PROFIT")
-                return []
+                logger.warning(
+                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | "
+                    "bid=%dc | reason=TAKE_PROFIT | count=%d",
+                    m.ticker,
+                    side.value,
+                    bid,
+                    count,
+                )
+                return [
+                    self._order(
+                        ticker=m.ticker,
+                        action=Action.SELL,
+                        side=side,
+                        price=bid,
+                        count=count,
+                    )
+                ]
 
             if bid <= self.stop_price:
-                self._log_exit(bid, "STOP")
-                return []
+                logger.warning(
+                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | "
+                    "bid=%dc | reason=STOP | count=%d",
+                    m.ticker,
+                    side.value,
+                    bid,
+                    count,
+                )
+                return [
+                    self._order(
+                        ticker=m.ticker,
+                        action=Action.SELL,
+                        side=side,
+                        price=bid,
+                        count=count,
+                    )
+                ]
 
             return []
 
-        # One simulated entry maximum per 15-minute market.
+        # --------------------------------------------------------------
+        # NEW ENTRY
+        # --------------------------------------------------------------
+
+        # One attempted entry maximum per 15-minute market.
         if m.ticker in self._traded_tickers:
             return []
 
-        # Entry timing filter.
-        # Only enter during the configured entry window, and never open
-        # a new position during the final 60 seconds of the market.
-        if seconds_left is None:
-            return []
-
+        # Only enter during the final five minutes, but never during the
+        # final 60 seconds.
         if seconds_left <= 60 or seconds_left > self.entry_window_seconds:
             return []
 
         side: Side | None = None
         entry_price: int | None = None
 
-        # Enter whichever side is trading inside the configured entry band.
+        # LIVE entry uses the ask because that is the immediately executable
+        # buy-side price. The paper version used bids, which can overstate
+        # how favorable a real entry would be.
         if (
-            m.yes_bid is not None
-            and self.entry_min <= m.yes_bid <= self.entry_max
+            m.yes_ask is not None
+            and self.entry_min <= m.yes_ask <= self.entry_max
         ):
             side = Side.YES
-            entry_price = m.yes_bid
+            entry_price = m.yes_ask
         elif (
-            m.no_bid is not None
-            and self.entry_min <= m.no_bid <= self.entry_max
+            m.no_ask is not None
+            and self.entry_min <= m.no_ask <= self.entry_max
         ):
             side = Side.NO
-            entry_price = m.no_bid
+            entry_price = m.no_ask
 
         if side is None or entry_price is None:
             return []
 
-        self._paper_ticker = m.ticker
-        self._paper_side = side
-        self._paper_entry_price = entry_price
-        self._paper_entry_time = datetime.now(timezone.utc)
-        self._traded_tickers.add(m.ticker)
+        count = self._entry_count(entry_price)
+        if count <= 0:
+            return []
 
-        logger.info(
-            "PAPER ENTER | ticker=%s | side=%s | entry=%dc | count=%d | "
-            "seconds_left=%.1f | yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s",
+        notional_cents = entry_price * count
+
+        # Second hard check so a parameter mistake cannot push this strategy
+        # above the configured live-entry notional.
+        if notional_cents > self.max_notional_cents:
+            logger.error(
+                "LIVE ENTRY BLOCKED | ticker=%s | notional=%dc | limit=%dc",
+                m.ticker,
+                notional_cents,
+                self.max_notional_cents,
+            )
+            return []
+
+        # Mark before emitting the order so repeated market-data ticks cannot
+        # fire duplicate entry orders.
+        self._traded_tickers.add(m.ticker)
+        self._side_by_ticker[m.ticker] = side
+
+        logger.warning(
+            "LIVE ENTRY SIGNAL | ticker=%s | side=%s | entry=%dc | "
+            "count=%d | notional=$%.2f | seconds_left=%.1f | "
+            "yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s",
             m.ticker,
             side.value,
             entry_price,
-            self.size,
+            count,
+            notional_cents / 100,
             seconds_left,
             m.yes_bid,
             m.yes_ask,
@@ -200,13 +265,12 @@ class CobyStrategy(Strategy):
             m.no_ask,
         )
 
-        record_entry(
-            ticker=m.ticker,
-            side=side.value,
-            entry_price=entry_price,
-            count=self.size,
-            seconds_left=seconds_left,
-        )
-
-        # PAPER ONLY: never emit a real OrderRequest.
-        return []
+        return [
+            self._order(
+                ticker=m.ticker,
+                action=Action.BUY,
+                side=side,
+                price=entry_price,
+                count=count,
+            )
+        ]
