@@ -144,8 +144,81 @@ class KalshiClient:
         return [Position.model_validate(p) for p in data.get("market_positions", [])]
 
     async def create_order(self, order: OrderRequest) -> Order:
-        """Create an order (``POST /portfolio/orders``)."""
-        data = await self._request("POST", "/portfolio/orders", json=order.to_payload())
+        """Create an order using Kalshi's current V2 event-order endpoint."""
+
+        action = order.action.value
+        outcome = order.side.value
+
+        # Kalshi V2 uses a single YES-side book:
+        # bid = buy YES / sell NO
+        # ask = sell YES / buy NO
+        if action == "buy" and outcome == "yes":
+            book_side = "bid"
+            price_cents = order.yes_price
+        elif action == "sell" and outcome == "yes":
+            book_side = "ask"
+            price_cents = order.yes_price
+        elif action == "buy" and outcome == "no":
+            book_side = "ask"
+            price_cents = None if order.no_price is None else 100 - order.no_price
+        elif action == "sell" and outcome == "no":
+            book_side = "bid"
+            price_cents = None if order.no_price is None else 100 - order.no_price
+        else:
+            raise ValueError(
+                f"Unsupported order direction: action={action}, side={outcome}"
+            )
+
+        if price_cents is None:
+            raise ValueError("Order price is required")
+
+        raw_tif = (
+            order.time_in_force.value
+            if order.time_in_force is not None
+            else "good_till_canceled"
+        )
+
+        tif_map = {
+            "ioc": "immediate_or_cancel",
+            "immediate_or_cancel": "immediate_or_cancel",
+            "gtc": "good_till_canceled",
+            "good_till_canceled": "good_till_canceled",
+            "fok": "fill_or_kill",
+            "fill_or_kill": "fill_or_kill",
+        }
+
+        time_in_force = tif_map.get(raw_tif)
+        if time_in_force is None:
+            raise ValueError(f"Unsupported time_in_force: {raw_tif}")
+
+        payload: dict[str, Any] = {
+            "ticker": order.ticker,
+            "side": book_side,
+            "count": f"{order.count:.2f}",
+            "price": f"{price_cents / 100:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": bool(order.post_only) if order.post_only is not None else False,
+        }
+
+        if order.client_order_id is not None:
+            payload["client_order_id"] = order.client_order_id
+
+        created = await self._request(
+            "POST",
+            "/portfolio/events/orders",
+            json=payload,
+        )
+
+        order_id = created["order_id"]
+
+        # The V2 create endpoint returns a compact response. Fetch the full
+        # order through the existing read endpoint so the rest of the bot can
+        # keep using the current Order model unchanged.
+        data = await self._request(
+            "GET",
+            f"/portfolio/orders/{order_id}",
+        )
         return Order.model_validate(data["order"])
 
     async def cancel_order(self, order_id: str) -> Order:
