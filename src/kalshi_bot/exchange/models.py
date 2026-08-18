@@ -2,7 +2,7 @@
 
 Compatibility build for the current Kalshi V2 API. It preserves the original
 framework's integer-cent / whole-contract interface while mapping current V2
-fixed-point fields into those legacy fields where needed.
+fixed-point and dollar fields into those legacy fields.
 """
 
 from __future__ import annotations
@@ -17,13 +17,23 @@ from pydantic import BaseModel, Field, model_validator
 def _dollars_to_cents(value: Any) -> int:
     if value is None:
         return 0
-    return int((Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return int(
+        (Decimal(str(value)) * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
 
 
 def _fp_to_int(value: Any) -> int:
     if value is None:
         return 0
-    return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return int(
+        Decimal(str(value)).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
 
 
 class Side(str, Enum):
@@ -61,6 +71,35 @@ class Market(BaseModel):
     open_interest: int | None = None
     close_time: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _map_v2_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        d = dict(data)
+
+        # Current Kalshi V2 market responses expose prices as dollar strings
+        # such as "0.9300". Preserve any legacy integer-cent field if it is
+        # already present; otherwise map the V2 dollar field into cents.
+        for legacy, v2 in (
+            ("yes_bid", "yes_bid_dollars"),
+            ("yes_ask", "yes_ask_dollars"),
+            ("no_bid", "no_bid_dollars"),
+            ("no_ask", "no_ask_dollars"),
+            ("last_price", "last_price_dollars"),
+        ):
+            if d.get(legacy) is None and d.get(v2) is not None:
+                d[legacy] = _dollars_to_cents(d[v2])
+
+        if d.get("volume") is None and d.get("volume_fp") is not None:
+            d["volume"] = _fp_to_int(d["volume_fp"])
+
+        if d.get("open_interest") is None and d.get("open_interest_fp") is not None:
+            d["open_interest"] = _fp_to_int(d["open_interest_fp"])
+
+        return d
+
 
 class OrderRequest(BaseModel):
     ticker: str
@@ -89,8 +128,6 @@ class Order(BaseModel):
     count: int | None = None
     remaining_count: int | None = None
     client_order_id: str | None = None
-
-    # V2 execution metadata used by the live strategy.
     fill_count: int = 0
     average_fill_price: str | None = None
     outcome_fill_price: int | None = None
@@ -133,9 +170,6 @@ class Position(BaseModel):
             return data
         d = dict(data)
 
-        # Current Kalshi V2 returns fixed-point position_fp. The old framework
-        # expected "position", so without this mapping every live position
-        # silently appeared as zero.
         if "position" not in d and "position_fp" in d:
             d["position"] = _fp_to_int(d.get("position_fp"))
 
