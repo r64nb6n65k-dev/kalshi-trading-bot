@@ -1,30 +1,14 @@
-"""Coby's 15-minute Kalshi live strategy.
-
-Live-entry rules:
-- One entry attempt maximum per 15-minute market ticker.
-- Only enter during the final ``entry_window_seconds``.
-- Never open a new position with 60 seconds or less remaining.
-- Enter a YES or NO side only when the executable ask is within the
-  configured 90c-95c entry range.
-- Cap each live entry at $100 notional and 100 contracts.
-- Exit at or above ``take_profit``.
-- Exit at or below ``stop_price``.
-
-IMPORTANT:
-The framework remains dry-run unless the CLI is explicitly started with
-``--live``. Every emitted OrderRequest still passes through the framework's
-risk manager before execution.
-
-This build adds diagnostic SKIP logging only. Trading rules are unchanged.
-"""
+"""Coby's 15-minute Kalshi live strategy with confirmed-fill tracking."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
 
+from kalshi_bot.dashboard import record_entry, record_exit, update_open_count
 from kalshi_bot.exchange.models import (
     Action,
+    Order,
     OrderRequest,
     OrderType,
     Side,
@@ -33,13 +17,10 @@ from kalshi_bot.exchange.models import (
 from kalshi_bot.strategies.base import Strategy, StrategyContext
 from kalshi_bot.telemetry.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 
 class CobyStrategy(Strategy):
-    """Coby's 15-minute BTC Kalshi strategy with live-order support."""
-
     name = "coby_strategy"
 
     def __init__(self, **params: Any) -> None:
@@ -49,69 +30,44 @@ class CobyStrategy(Strategy):
         self.entry_max = int(params.get("entry_max", 95))
         self.take_profit = int(params.get("take_profit", 98))
         self.stop_price = int(params.get("stop_price", 79))
-        self.entry_window_seconds = int(
-            params.get("entry_window_seconds", 300)
-        )
-
+        self.entry_window_seconds = int(params.get("entry_window_seconds", 300))
         self.max_contracts = int(params.get("max_contracts", 100))
-        self.max_notional_cents = int(
-            params.get("max_notional_cents", 10_000)
-        )
+        self.max_notional_cents = int(params.get("max_notional_cents", 10_000))
+
+        # For a triggered stop, use an aggressively marketable limit. Kalshi's
+        # V2 order API is limit-order based; 1c prioritizes getting out over
+        # preserving the 79c trigger price. A 79c stop is NOT a guaranteed fill.
+        self.stop_exit_floor = int(params.get("stop_exit_floor", 1))
 
         self._traded_tickers: set[str] = set()
+        self._closed_tickers: set[str] = set()
         self._side_by_ticker: dict[str, Side] = {}
-        self._last_skip_reason_by_ticker: dict[str, str] = {}
+        self._entry_price_by_ticker: dict[str, int] = {}
+        self._filled_count_by_ticker: dict[str, int] = {}
+        self._pending_action: dict[str, Action] = {}
+        self._exit_reason: dict[str, str] = {}
+
+        self._exit_fill_value_by_ticker: dict[str, int] = {}
+        self._exit_fill_count_by_ticker: dict[str, int] = {}
+        self._total_pnl_cents = 0
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
             return None
-
         try:
-            close_dt = datetime.fromisoformat(
-                close_time.replace("Z", "+00:00")
-            )
+            close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
             if close_dt.tzinfo is None:
                 close_dt = close_dt.replace(tzinfo=timezone.utc)
-
-            now = datetime.now(timezone.utc)
-            return (close_dt - now).total_seconds()
+            return (close_dt - datetime.now(timezone.utc)).total_seconds()
         except ValueError:
             return None
 
-    def _entry_count(self, entry_price: int) -> int:
-        """Return a whole-contract count that never exceeds the $100 cap."""
-        if entry_price <= 0:
+    def _entry_count(self, limit_price: int) -> int:
+        if limit_price <= 0:
             return 0
-
-        count_by_notional = self.max_notional_cents // entry_price
-        return max(0, min(self.max_contracts, count_by_notional))
-
-    def _log_skip(
-        self,
-        *,
-        ticker: str,
-        reason: str,
-        seconds_left: float | None,
-        yes_bid: int | None,
-        yes_ask: int | None,
-        no_bid: int | None,
-        no_ask: int | None,
-    ) -> None:
-        if self._last_skip_reason_by_ticker.get(ticker) == reason:
-            return
-
-        self._last_skip_reason_by_ticker[ticker] = reason
-
-        logger.info(
-            "LIVE SKIP | ticker=%s | reason=%s | seconds_left=%s | "
-            "yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s",
-            ticker,
-            reason,
-            f"{seconds_left:.1f}" if seconds_left is not None else "UNKNOWN",
-            yes_bid,
-            yes_ask,
-            no_bid,
-            no_ask,
+        return max(
+            0,
+            min(self.max_contracts, self.max_notional_cents // limit_price),
         )
 
     def _order(
@@ -131,67 +87,221 @@ class CobyStrategy(Strategy):
             "type": OrderType.LIMIT,
             "time_in_force": TimeInForce.IMMEDIATE_OR_CANCEL,
         }
-
         if side is Side.YES:
             kwargs["yes_price"] = price
         else:
             kwargs["no_price"] = price
-
         return OrderRequest(**kwargs)
 
-    def on_market_data(
+    def _known_position_count(self, ticker: str, ctx_position: int) -> int:
+        # Local confirmed-fill state takes priority over a potentially stale
+        # REST snapshot immediately after a partial exit.
+        if ticker in self._filled_count_by_ticker:
+            return self._filled_count_by_ticker[ticker]
+        return abs(int(ctx_position)) if ctx_position != 0 else 0
+
+    def _recover_side_from_position(self, ticker: str, ctx_position: int) -> Side | None:
+        side = self._side_by_ticker.get(ticker)
+        if side is not None:
+            return side
+        if ctx_position > 0:
+            side = Side.YES
+        elif ctx_position < 0:
+            side = Side.NO
+        else:
+            return None
+        self._side_by_ticker[ticker] = side
+        self._filled_count_by_ticker[ticker] = abs(int(ctx_position))
+        logger.warning(
+            "LIVE POSITION RECOVERED | ticker=%s | side=%s | count=%d",
+            ticker,
+            side.value,
+            abs(int(ctx_position)),
+        )
+        return side
+
+    def on_order_result(
         self,
-        ctx: StrategyContext,
-    ) -> list[OrderRequest]:
+        request: OrderRequest,
+        result: Order | None,
+        seconds_left: float | None = None,
+    ) -> None:
+        ticker = request.ticker
+        self._pending_action.pop(ticker, None)
+
+        if result is None:
+            return
+
+        fill_count = int(result.fill_count or 0)
+        if fill_count <= 0:
+            logger.warning(
+                "LIVE NO FILL | ticker=%s | action=%s | side=%s",
+                ticker,
+                request.action.value,
+                request.side.value,
+            )
+            return
+
+        fill_price = result.outcome_fill_price
+        if fill_price is None:
+            # V2 should return average_fill_price whenever fill_count > 0.
+            # This fallback keeps protection active if that metadata is absent.
+            fill_price = (
+                request.yes_price
+                if request.side is Side.YES
+                else request.no_price
+            )
+
+        if fill_price is None:
+            logger.error(
+                "LIVE FILL WITHOUT PRICE | ticker=%s | action=%s",
+                ticker,
+                request.action.value,
+            )
+            return
+
+        fill_price = int(fill_price)
+
+        if request.action is Action.BUY:
+            self._traded_tickers.add(ticker)
+            self._side_by_ticker[ticker] = request.side
+            self._entry_price_by_ticker[ticker] = fill_price
+            self._filled_count_by_ticker[ticker] = fill_count
+
+            record_entry(
+                ticker=ticker,
+                side=request.side.value,
+                entry_price=fill_price,
+                count=fill_count,
+                seconds_left=seconds_left,
+            )
+            logger.warning(
+                "LIVE ENTRY FILLED | ticker=%s | side=%s | "
+                "fill=%dc | count=%d",
+                ticker,
+                request.side.value,
+                fill_price,
+                fill_count,
+            )
+            return
+
+        if request.action is Action.SELL:
+            side = self._side_by_ticker.get(ticker, request.side)
+            old_count = self._filled_count_by_ticker.get(ticker, fill_count)
+            remaining = max(0, old_count - fill_count)
+
+            self._exit_fill_value_by_ticker[ticker] = (
+                self._exit_fill_value_by_ticker.get(ticker, 0)
+                + fill_price * fill_count
+            )
+            self._exit_fill_count_by_ticker[ticker] = (
+                self._exit_fill_count_by_ticker.get(ticker, 0)
+                + fill_count
+            )
+
+            if remaining > 0:
+                self._filled_count_by_ticker[ticker] = remaining
+                update_open_count(ticker, remaining)
+                logger.warning(
+                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | "
+                    "fill=%dc | filled=%d | remaining=%d",
+                    ticker,
+                    side.value,
+                    fill_price,
+                    fill_count,
+                    remaining,
+                )
+                return
+
+            self._filled_count_by_ticker.pop(ticker, None)
+            self._closed_tickers.add(ticker)
+
+            entry_price = self._entry_price_by_ticker.pop(ticker, None)
+            reason = self._exit_reason.pop(ticker, "EXIT")
+            total_exit_count = self._exit_fill_count_by_ticker.pop(ticker, 0)
+            total_exit_value = self._exit_fill_value_by_ticker.pop(ticker, 0)
+
+            if total_exit_count > 0:
+                avg_exit = round(total_exit_value / total_exit_count)
+            else:
+                avg_exit = fill_price
+
+            if entry_price is not None:
+                pnl_cents = (avg_exit - entry_price) * total_exit_count
+                self._total_pnl_cents += pnl_cents
+                record_exit(
+                    ticker=ticker,
+                    side=side.value,
+                    entry_price=entry_price,
+                    exit_price=avg_exit,
+                    reason=reason,
+                    count=total_exit_count,
+                    pnl_cents=pnl_cents,
+                    total_pnl_cents=self._total_pnl_cents,
+                )
+            else:
+                logger.warning(
+                    "LIVE EXIT FILLED BUT ENTRY PRICE UNKNOWN | "
+                    "ticker=%s | side=%s | exit=%dc | count=%d",
+                    ticker,
+                    side.value,
+                    avg_exit,
+                    total_exit_count,
+                )
+
+            self._side_by_ticker.pop(ticker, None)
+
+            logger.warning(
+                "LIVE EXIT FILLED | ticker=%s | side=%s | "
+                "avg_exit=%dc | count=%d | reason=%s",
+                ticker,
+                side.value,
+                avg_exit,
+                total_exit_count,
+                reason,
+            )
+
+    def on_market_data(self, ctx: StrategyContext) -> list[OrderRequest]:
         m = ctx.market
         seconds_left = self._seconds_to_close(m.close_time)
-
         if seconds_left is None:
-            self._log_skip(
-                ticker=m.ticker,
-                reason="MISSING_OR_INVALID_CLOSE_TIME",
-                seconds_left=None,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-            )
             return []
 
-        position = ctx.position_for(m.ticker)
+        ctx_position = ctx.position_for(m.ticker)
 
-        if position != 0:
-            side = self._side_by_ticker.get(m.ticker)
+        # A fully confirmed exit wins over a stale positions snapshot.
+        if m.ticker in self._closed_tickers:
+            return []
 
+        count = self._known_position_count(m.ticker, ctx_position)
+
+        if count > 0:
+            side = self._recover_side_from_position(m.ticker, ctx_position)
             if side is None:
                 logger.error(
-                    "LIVE EXIT BLOCKED | ticker=%s | position=%s | "
-                    "reason=UNKNOWN_SIDE",
+                    "LIVE EXIT BLOCKED | ticker=%s | count=%d | reason=UNKNOWN_SIDE",
                     m.ticker,
-                    position,
+                    count,
                 )
                 return []
 
-            count = abs(int(position))
-            if count <= 0:
+            if self._pending_action.get(m.ticker) is Action.SELL:
                 return []
 
             bid = m.yes_bid if side is Side.YES else m.no_bid
             if bid is None:
-                logger.info(
-                    "LIVE EXIT WAIT | ticker=%s | side=%s | reason=NO_BID",
-                    m.ticker,
-                    side.value,
-                )
                 return []
 
             if bid >= self.take_profit:
+                self._pending_action[m.ticker] = Action.SELL
+                self._exit_reason[m.ticker] = "TAKE_PROFIT"
                 logger.warning(
-                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | "
-                    "bid=%dc | reason=TAKE_PROFIT | count=%d",
+                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%dc | "
+                    "limit=%dc | reason=TAKE_PROFIT | count=%d",
                     m.ticker,
                     side.value,
                     bid,
+                    self.take_profit,
                     count,
                 )
                 return [
@@ -199,18 +309,21 @@ class CobyStrategy(Strategy):
                         ticker=m.ticker,
                         action=Action.SELL,
                         side=side,
-                        price=bid,
+                        price=self.take_profit,
                         count=count,
                     )
                 ]
 
             if bid <= self.stop_price:
+                self._pending_action[m.ticker] = Action.SELL
+                self._exit_reason[m.ticker] = "STOP"
                 logger.warning(
-                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | "
-                    "bid=%dc | reason=STOP | count=%d",
+                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%dc | "
+                    "limit=%dc | reason=STOP | count=%d",
                     m.ticker,
                     side.value,
                     bid,
+                    self.stop_exit_floor,
                     count,
                 )
                 return [
@@ -218,7 +331,7 @@ class CobyStrategy(Strategy):
                         ticker=m.ticker,
                         action=Action.SELL,
                         side=side,
-                        price=bid,
+                        price=self.stop_exit_floor,
                         count=count,
                     )
                 ]
@@ -226,116 +339,43 @@ class CobyStrategy(Strategy):
             return []
 
         if m.ticker in self._traded_tickers:
-            self._log_skip(
-                ticker=m.ticker,
-                reason="ALREADY_TRADED",
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-            )
             return []
 
-        if seconds_left > self.entry_window_seconds:
-            self._log_skip(
-                ticker=m.ticker,
-                reason="TOO_EARLY",
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-            )
+        if self._pending_action.get(m.ticker) is Action.BUY:
             return []
 
-        if seconds_left <= 60:
-            self._log_skip(
-                ticker=m.ticker,
-                reason="FINAL_60_SECONDS",
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-            )
+        if seconds_left <= 60 or seconds_left > self.entry_window_seconds:
             return []
 
         side: Side | None = None
-        entry_price: int | None = None
+        observed_ask: int | None = None
 
-        if (
-            m.yes_ask is not None
-            and self.entry_min <= m.yes_ask <= self.entry_max
-        ):
-            side = Side.YES
-            entry_price = m.yes_ask
-        elif (
-            m.no_ask is not None
-            and self.entry_min <= m.no_ask <= self.entry_max
-        ):
-            side = Side.NO
-            entry_price = m.no_ask
+        if m.yes_ask is not None and self.entry_min <= m.yes_ask <= self.entry_max:
+            side, observed_ask = Side.YES, m.yes_ask
+        elif m.no_ask is not None and self.entry_min <= m.no_ask <= self.entry_max:
+            side, observed_ask = Side.NO, m.no_ask
 
-        if side is None or entry_price is None:
-            if m.yes_ask is None and m.no_ask is None:
-                reason = "NO_USABLE_ASK"
-            else:
-                reason = "PRICE_OUTSIDE_90_95"
-
-            self._log_skip(
-                ticker=m.ticker,
-                reason=reason,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-            )
+        if side is None or observed_ask is None:
             return []
 
-        count = self._entry_count(entry_price)
+        # Marketable IOC limit capped at 95c. It can fill at any better price,
+        # but never authorizes an entry above the strategy's max.
+        limit_price = self.entry_max
+        count = self._entry_count(limit_price)
         if count <= 0:
-            self._log_skip(
-                ticker=m.ticker,
-                reason="INVALID_POSITION_SIZE",
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-            )
             return []
 
-        notional_cents = entry_price * count
-
-        if notional_cents > self.max_notional_cents:
-            logger.error(
-                "LIVE ENTRY BLOCKED | ticker=%s | notional=%dc | limit=%dc",
-                m.ticker,
-                notional_cents,
-                self.max_notional_cents,
-            )
-            return []
-
-        self._last_skip_reason_by_ticker.pop(m.ticker, None)
-        self._traded_tickers.add(m.ticker)
-        self._side_by_ticker[m.ticker] = side
+        self._pending_action[m.ticker] = Action.BUY
 
         logger.warning(
-            "LIVE ENTRY SIGNAL | ticker=%s | side=%s | entry=%dc | "
-            "count=%d | notional=$%.2f | seconds_left=%.1f | "
-            "yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s",
+            "LIVE ENTRY SIGNAL | ticker=%s | side=%s | observed_ask=%dc | "
+            "limit=%dc | count=%d | seconds_left=%.1f",
             m.ticker,
             side.value,
-            entry_price,
+            observed_ask,
+            limit_price,
             count,
-            notional_cents / 100,
             seconds_left,
-            m.yes_bid,
-            m.yes_ask,
-            m.no_bid,
-            m.no_ask,
         )
 
         return [
@@ -343,7 +383,7 @@ class CobyStrategy(Strategy):
                 ticker=m.ticker,
                 action=Action.BUY,
                 side=side,
-                price=entry_price,
+                price=limit_price,
                 count=count,
             )
         ]
