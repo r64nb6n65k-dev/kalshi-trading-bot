@@ -261,6 +261,29 @@ class CobyStrategy(Strategy):
                 reason,
             )
 
+    def _log_entry_check(
+        self,
+        *,
+        ticker: str,
+        seconds_left: float | None,
+        yes_bid: int | None,
+        yes_ask: int | None,
+        no_bid: int | None,
+        no_ask: int | None,
+        reason: str,
+    ) -> None:
+        logger.info(
+            "ENTRY CHECK | ticker=%s | seconds_left=%s | "
+            "yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s | reason=%s",
+            ticker,
+            "None" if seconds_left is None else f"{seconds_left:.1f}",
+            yes_bid,
+            yes_ask,
+            no_bid,
+            no_ask,
+            reason,
+        )
+
     def on_market_data(self, ctx: StrategyContext) -> list[OrderRequest]:
         m = ctx.market
         seconds_left = self._seconds_to_close(m.close_time)
@@ -339,12 +362,51 @@ class CobyStrategy(Strategy):
             return []
 
         if m.ticker in self._traded_tickers:
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="ALREADY_TRADED",
+            )
             return []
 
         if self._pending_action.get(m.ticker) is Action.BUY:
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="ENTRY_PENDING",
+            )
             return []
 
-        if seconds_left <= 60 or seconds_left > self.entry_window_seconds:
+        if seconds_left <= 60:
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="FINAL_60_SECONDS",
+            )
+            return []
+
+        if seconds_left > self.entry_window_seconds:
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="TOO_EARLY",
+            )
             return []
 
         side: Side | None = None
@@ -356,6 +418,15 @@ class CobyStrategy(Strategy):
             side, observed_ask = Side.NO, m.no_ask
 
         if side is None or observed_ask is None:
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="ASK_NOT_IN_90_95",
+            )
             return []
 
         # Marketable IOC limit capped at 95c. It can fill at any better price,
