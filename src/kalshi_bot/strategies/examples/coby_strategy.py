@@ -14,6 +14,8 @@ IMPORTANT:
 The framework remains dry-run unless the CLI is explicitly started with
 ``--live``. Every emitted OrderRequest still passes through the framework's
 risk manager before execution.
+
+This build adds diagnostic SKIP logging only. Trading rules are unchanged.
 """
 
 from __future__ import annotations
@@ -51,19 +53,14 @@ class CobyStrategy(Strategy):
             params.get("entry_window_seconds", 300)
         )
 
-        # Hard live-entry caps.
         self.max_contracts = int(params.get("max_contracts", 100))
         self.max_notional_cents = int(
             params.get("max_notional_cents", 10_000)
         )
 
-        # One attempted entry per ticker. This prevents repeated orders if an
-        # IOC order does not fill or only partially fills.
         self._traded_tickers: set[str] = set()
-
-        # Remember which side we attempted for each ticker so we do not have
-        # to infer YES/NO from the sign convention used by position_for().
         self._side_by_ticker: dict[str, Side] = {}
+        self._last_skip_reason_by_ticker: dict[str, str] = {}
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
@@ -89,6 +86,34 @@ class CobyStrategy(Strategy):
         count_by_notional = self.max_notional_cents // entry_price
         return max(0, min(self.max_contracts, count_by_notional))
 
+    def _log_skip(
+        self,
+        *,
+        ticker: str,
+        reason: str,
+        seconds_left: float | None,
+        yes_bid: int | None,
+        yes_ask: int | None,
+        no_bid: int | None,
+        no_ask: int | None,
+    ) -> None:
+        if self._last_skip_reason_by_ticker.get(ticker) == reason:
+            return
+
+        self._last_skip_reason_by_ticker[ticker] = reason
+
+        logger.info(
+            "LIVE SKIP | ticker=%s | reason=%s | seconds_left=%s | "
+            "yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s",
+            ticker,
+            reason,
+            f"{seconds_left:.1f}" if seconds_left is not None else "UNKNOWN",
+            yes_bid,
+            yes_ask,
+            no_bid,
+            no_ask,
+        )
+
     def _order(
         self,
         *,
@@ -98,7 +123,6 @@ class CobyStrategy(Strategy):
         price: int,
         count: int,
     ) -> OrderRequest:
-        """Build an IOC limit order in the repo's existing YES/NO model."""
         kwargs: dict[str, Any] = {
             "ticker": ticker,
             "action": action,
@@ -123,18 +147,22 @@ class CobyStrategy(Strategy):
         seconds_left = self._seconds_to_close(m.close_time)
 
         if seconds_left is None:
+            self._log_skip(
+                ticker=m.ticker,
+                reason="MISSING_OR_INVALID_CLOSE_TIME",
+                seconds_left=None,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+            )
             return []
 
         position = ctx.position_for(m.ticker)
 
-        # --------------------------------------------------------------
-        # MANAGE AN EXISTING LIVE POSITION
-        # --------------------------------------------------------------
         if position != 0:
             side = self._side_by_ticker.get(m.ticker)
 
-            # Conservative fail-safe: if we somehow have a position but do
-            # not know which outcome side created it, do not guess.
             if side is None:
                 logger.error(
                     "LIVE EXIT BLOCKED | ticker=%s | position=%s | "
@@ -150,6 +178,11 @@ class CobyStrategy(Strategy):
 
             bid = m.yes_bid if side is Side.YES else m.no_bid
             if bid is None:
+                logger.info(
+                    "LIVE EXIT WAIT | ticker=%s | side=%s | reason=NO_BID",
+                    m.ticker,
+                    side.value,
+                )
                 return []
 
             if bid >= self.take_profit:
@@ -192,25 +225,45 @@ class CobyStrategy(Strategy):
 
             return []
 
-        # --------------------------------------------------------------
-        # NEW ENTRY
-        # --------------------------------------------------------------
-
-        # One attempted entry maximum per 15-minute market.
         if m.ticker in self._traded_tickers:
+            self._log_skip(
+                ticker=m.ticker,
+                reason="ALREADY_TRADED",
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+            )
             return []
 
-        # Only enter during the final five minutes, but never during the
-        # final 60 seconds.
-        if seconds_left <= 60 or seconds_left > self.entry_window_seconds:
+        if seconds_left > self.entry_window_seconds:
+            self._log_skip(
+                ticker=m.ticker,
+                reason="TOO_EARLY",
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+            )
+            return []
+
+        if seconds_left <= 60:
+            self._log_skip(
+                ticker=m.ticker,
+                reason="FINAL_60_SECONDS",
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+            )
             return []
 
         side: Side | None = None
         entry_price: int | None = None
 
-        # LIVE entry uses the ask because that is the immediately executable
-        # buy-side price. The paper version used bids, which can overstate
-        # how favorable a real entry would be.
         if (
             m.yes_ask is not None
             and self.entry_min <= m.yes_ask <= self.entry_max
@@ -225,16 +278,37 @@ class CobyStrategy(Strategy):
             entry_price = m.no_ask
 
         if side is None or entry_price is None:
+            if m.yes_ask is None and m.no_ask is None:
+                reason = "NO_USABLE_ASK"
+            else:
+                reason = "PRICE_OUTSIDE_90_95"
+
+            self._log_skip(
+                ticker=m.ticker,
+                reason=reason,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+            )
             return []
 
         count = self._entry_count(entry_price)
         if count <= 0:
+            self._log_skip(
+                ticker=m.ticker,
+                reason="INVALID_POSITION_SIZE",
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+            )
             return []
 
         notional_cents = entry_price * count
 
-        # Second hard check so a parameter mistake cannot push this strategy
-        # above the configured live-entry notional.
         if notional_cents > self.max_notional_cents:
             logger.error(
                 "LIVE ENTRY BLOCKED | ticker=%s | notional=%dc | limit=%dc",
@@ -244,8 +318,7 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        # Mark before emitting the order so repeated market-data ticks cannot
-        # fire duplicate entry orders.
+        self._last_skip_reason_by_ticker.pop(m.ticker, None)
         self._traded_tickers.add(m.ticker)
         self._side_by_ticker[m.ticker] = side
 
