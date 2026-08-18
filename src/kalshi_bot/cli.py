@@ -1,171 +1,235 @@
-"""Command-line interface for the Kalshi Trading Bot.
-
-Run ``kalshi-bot --help`` after installing, or ``python -m kalshi_bot --help``.
-
-Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
-"""
+"""Async Kalshi REST client with current V2 event-order execution."""
 
 from __future__ import annotations
 
-import asyncio
+import time
+import uuid
+from decimal import Decimal, ROUND_HALF_UP
+from types import TracebackType
+from typing import Any
+from urllib.parse import urlsplit
 
-import typer
-from rich.console import Console
-from rich.table import Table
+import httpx
+from cryptography.hazmat.primitives.asymmetric import rsa
 
-from kalshi_bot import __version__
-from kalshi_bot.backtesting.data import random_walk_snapshots
-from kalshi_bot.backtesting.engine import Backtester
-from kalshi_bot.backtesting.report import render as render_report
-from kalshi_bot.config import load_settings
-from kalshi_bot.core.engine import TradingEngine
-from kalshi_bot.exchange.client import KalshiClient
-from kalshi_bot.risk.manager import RiskManager
-from kalshi_bot.strategies.base import Strategy
-from kalshi_bot.strategies.examples.arbitrage import ArbitrageYesNo
-from kalshi_bot.strategies.examples.fair_value import FairValue
-from kalshi_bot.strategies.examples.market_maker import MarketMaker
-from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
-from kalshi_bot.strategies.examples.momentum import Momentum
-from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
-from kalshi_bot.dashboard import start_dashboard
+from kalshi_bot.config import Settings
+from kalshi_bot.exchange.auth import build_auth_headers, load_private_key
+from kalshi_bot.exchange.models import Balance, Market, Order, OrderRequest, Position
+from kalshi_bot.telemetry.logging import get_logger
 
-app = typer.Typer(
-    add_completion=False,
-    help="Kalshi Trading Bot — open-source framework by Viprasol Tech.",
-)
-console = Console()
-
-STRATEGIES: dict[str, type[Strategy]] = {
-    "market_maker": MarketMaker,
-    "momentum": Momentum,
-    "mean_reversion": MeanReversion,
-    "arbitrage": ArbitrageYesNo,
-    "fair_value": FairValue,
-    "coby_strategy": CobyStrategy,
-}
+logger = get_logger(__name__)
+API_PREFIX = ""
 
 
-@app.command()
-def version() -> None:
-    """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] — by Viprasol Tech")
+def _yes_dollars_to_cents(value: str) -> int:
+    return int((Decimal(value) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-@app.command()
-def strategies() -> None:
-    """List the bundled example strategies."""
-    table = Table(title="Bundled strategies (educational only)")
-    table.add_column("Name", style="cyan")
-    table.add_column("Class")
-    table.add_column("Summary")
-    summaries = {
-        "market_maker": "Quote both sides around mid with an inventory cap.",
-        "momentum": "Trade in the direction of short-term last-price momentum.",
-        "mean_reversion": "Fade moves beyond N standard deviations from the mean.",
-        "arbitrage": "Buy YES+NO when their combined ask is below 100c.",
-        "fair_value": "Buy YES below your fair probability, Kelly-sized.",
-    }
-    for name, cls in STRATEGIES.items():
-        table.add_row(name, cls.__name__, summaries.get(name, ""))
-    console.print(table)
+class KalshiError(RuntimeError):
+    def __init__(self, status_code: int, body: str) -> None:
+        super().__init__(f"Kalshi API error {status_code}: {body}")
+        self.status_code = status_code
+        self.body = body
 
 
-@app.command()
-def backtest(
-    strategy: str = typer.Argument("momentum", help=f"One of: {', '.join(STRATEGIES)}"),
-    ticks: int = typer.Option(200, help="Number of synthetic snapshots to replay."),
-    balance: int = typer.Option(100_000, help="Starting balance in cents."),
-    seed: int = typer.Option(42, help="RNG seed for the synthetic random walk."),
-) -> None:
-    """Backtest a strategy on synthetic data and print a metrics report.
+class KalshiClient:
+    def __init__(
+        self,
+        base_url: str,
+        api_key_id: str | None = None,
+        private_key: rsa.RSAPrivateKey | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._api_key_id = api_key_id
+        self._private_key = private_key
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=timeout,
+            event_hooks={"request": [self._sign_request]},
+        )
 
-    Uses an offline random walk so it runs with no network or credentials.
-    """
-    if strategy not in STRATEGIES:
-        choices = ", ".join(STRATEGIES)
-        console.print(f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]")
-        raise typer.Exit(code=1)
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "KalshiClient":
+        private_key = None
+        if settings.api_key_id:
+            private_key = load_private_key(settings.private_key_path)
+        return cls(
+            base_url=settings.rest_base_url,
+            api_key_id=settings.api_key_id or None,
+            private_key=private_key,
+            timeout=settings.request_timeout,
+        )
 
-    snapshots = random_walk_snapshots(n=ticks, seed=seed)
-    bt = Backtester(starting_balance_cents=balance)
-    report = bt.run(STRATEGIES[strategy](), snapshots)
-    render_report(report, console=console, title=f"Backtest: {strategy} ({ticks} ticks)")
+    @property
+    def authenticated(self) -> bool:
+        return self._api_key_id is not None and self._private_key is not None
 
-
-@app.command()
-def markets(
-    status: str = typer.Option("open", help="Filter by market status."),
-    limit: int = typer.Option(10, help="Maximum markets to list."),
-) -> None:
-    """List markets from Kalshi (public data, no credentials needed)."""
-
-    async def _run() -> None:
-        settings = load_settings()
-        async with KalshiClient.from_settings(settings) as client:
-            rows = await client.get_markets(
-    status=status,
-    series_ticker="KXBTC15M",
-    limit=100,
-)
-            table = Table(title=f"Kalshi markets ({settings.environment.value})")
-            table.add_column("Ticker", style="cyan")
-            table.add_column("Title")
-            table.add_column("Yes Bid", justify="right")
-            table.add_column("Yes Ask", justify="right")
-            for m in rows:
-                table.add_row(m.ticker, m.title or "-", str(m.yes_bid), str(m.yes_ask))
-            console.print(table)
-
-    asyncio.run(_run())
-
-
-@app.command()
-def balance() -> None:
-    """Show your portfolio balance (requires credentials)."""
-
-    async def _run() -> None:
-        settings = load_settings()
-        async with KalshiClient.from_settings(settings) as client:
-            if not client.authenticated:
-                console.print("[red]No credentials configured. Set KALSHI_API_KEY_ID.[/]")
-                raise typer.Exit(code=1)
-            bal = await client.get_balance()
-            console.print(f"Balance: [bold green]${bal.balance / 100:,.2f}[/]")
-
-    asyncio.run(_run())
-
-
-@app.command()
-def run(
-    strategy: str = typer.Argument(..., help=f"One of: {', '.join(STRATEGIES)}"),
-    ticker: str = typer.Argument(..., help="Market ticker to trade."),
-    ticks: int = typer.Option(5, help="Number of poll cycles before stopping."),
-    live: bool = typer.Option(False, "--live", help="Send real orders (default is dry-run)."),
-) -> None:
-    """Run a strategy live or in dry-run mode."""
-    if strategy not in STRATEGIES:
-        choices = ", ".join(STRATEGIES)
-        console.print(f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]")
-        raise typer.Exit(code=1)
-
-    async def _run() -> None:
-        start_dashboard()
-        settings = load_settings()
-        # Dry-run unless --live is explicitly passed.
-        dry_run = not live
-        async with KalshiClient.from_settings(settings) as client:
-            engine = TradingEngine(
-                client=client,
-                strategy=STRATEGIES[strategy](),
-                risk=RiskManager.from_settings(settings.risk),
-                dry_run=dry_run,
-                poll_interval=settings.poll_interval,
+    async def _sign_request(self, request: httpx.Request) -> None:
+        if not self.authenticated:
+            return
+        assert self._api_key_id is not None and self._private_key is not None
+        path = urlsplit(str(request.url)).path
+        timestamp_ms = int(time.time() * 1000)
+        request.headers.update(
+            build_auth_headers(
+                self._api_key_id,
+                self._private_key,
+                timestamp_ms,
+                request.method,
+                path,
             )
-            await engine.run(ticker, max_ticks=ticks)
+        )
 
-    asyncio.run(_run())
+    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        response = await self._client.request(method, API_PREFIX + path, **kwargs)
+        if response.is_error:
+            raise KalshiError(response.status_code, response.text)
+        return response.json()
 
+    async def get_markets(self, **params: Any) -> list[Market]:
+        data = await self._request("GET", "/markets", params=params)
+        return [Market.model_validate(m) for m in data.get("markets", [])]
 
-if __name__ == "__main__":
-    app()
+    async def get_market(self, ticker: str) -> Market:
+        data = await self._request("GET", f"/markets/{ticker}")
+        return Market.model_validate(data["market"])
+
+    async def get_orderbook(self, ticker: str, depth: int | None = None) -> dict[str, Any]:
+        params = {"depth": depth} if depth is not None else {}
+        data = await self._request("GET", f"/markets/{ticker}/orderbook", params=params)
+        return data.get("orderbook", {})
+
+    async def get_balance(self) -> Balance:
+        data = await self._request("GET", "/portfolio/balance")
+        return Balance.model_validate(data)
+
+    async def get_positions(self, **params: Any) -> list[Position]:
+        data = await self._request("GET", "/portfolio/positions", params=params)
+        return [Position.model_validate(p) for p in data.get("market_positions", [])]
+
+    async def create_order(self, order: OrderRequest) -> Order:
+        action = order.action.value
+        outcome = order.side.value
+
+        # V2 uses one YES-side book:
+        # bid = buy YES, ask = sell YES.
+        if action == "buy" and outcome == "yes":
+            book_side, yes_price_cents = "bid", order.yes_price
+        elif action == "sell" and outcome == "yes":
+            book_side, yes_price_cents = "ask", order.yes_price
+        elif action == "buy" and outcome == "no":
+            book_side = "ask"
+            yes_price_cents = None if order.no_price is None else 100 - order.no_price
+        elif action == "sell" and outcome == "no":
+            book_side = "bid"
+            yes_price_cents = None if order.no_price is None else 100 - order.no_price
+        else:
+            raise ValueError(f"Unsupported order direction: {action}/{outcome}")
+
+        if yes_price_cents is None:
+            raise ValueError("Order price is required")
+        if not 0 < yes_price_cents < 100:
+            raise ValueError(f"Order price out of range: {yes_price_cents}")
+
+        raw_tif = (
+            order.time_in_force.value
+            if order.time_in_force is not None
+            else "good_till_canceled"
+        )
+        tif_map = {
+            "ioc": "immediate_or_cancel",
+            "immediate_or_cancel": "immediate_or_cancel",
+            "gtc": "good_till_canceled",
+            "good_till_canceled": "good_till_canceled",
+            "fok": "fill_or_kill",
+            "fill_or_kill": "fill_or_kill",
+        }
+        time_in_force = tif_map.get(raw_tif)
+        if time_in_force is None:
+            raise ValueError(f"Unsupported time_in_force: {raw_tif}")
+
+        client_order_id = order.client_order_id or str(uuid.uuid4())
+        payload: dict[str, Any] = {
+            "ticker": order.ticker,
+            "client_order_id": client_order_id,
+            "side": book_side,
+            "count": f"{order.count:.2f}",
+            "price": f"{yes_price_cents / 100:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": bool(order.post_only) if order.post_only is not None else False,
+        }
+
+        created = await self._request("POST", "/portfolio/events/orders", json=payload)
+
+        fill_count = int(Decimal(str(created.get("fill_count", "0"))))
+        remaining_count = int(Decimal(str(created.get("remaining_count", "0"))))
+        average_fill_price = created.get("average_fill_price")
+
+        outcome_fill_price: int | None = None
+        if fill_count > 0 and average_fill_price is not None:
+            yes_fill_cents = _yes_dollars_to_cents(str(average_fill_price))
+            outcome_fill_price = (
+                yes_fill_cents if outcome == "yes" else 100 - yes_fill_cents
+            )
+
+        result = Order(
+            order_id=created["order_id"],
+            ticker=order.ticker,
+            status="executed" if fill_count > 0 else "canceled",
+            side=order.side,
+            action=order.action,
+            yes_price=order.yes_price,
+            no_price=order.no_price,
+            count=order.count,
+            remaining_count=remaining_count,
+            client_order_id=client_order_id,
+            fill_count=fill_count,
+            average_fill_price=average_fill_price,
+            outcome_fill_price=outcome_fill_price,
+        )
+
+        logger.warning(
+            "LIVE ORDER RESULT | ticker=%s | order_id=%s | action=%s | "
+            "outcome=%s | requested=%d | fill_count=%d | remaining=%d | "
+            "limit_yes=%dc | average_fill_price=%s | outcome_fill=%s",
+            order.ticker,
+            created.get("order_id"),
+            action,
+            outcome,
+            order.count,
+            fill_count,
+            remaining_count,
+            yes_price_cents,
+            average_fill_price,
+            outcome_fill_price,
+        )
+        return result
+
+    async def cancel_order(self, order_id: str) -> Order:
+        data = await self._request("DELETE", f"/portfolio/events/orders/{order_id}")
+        return Order(
+            order_id=data["order_id"],
+            ticker="",
+            status="canceled",
+            client_order_id=data.get("client_order_id"),
+        )
+
+    async def get_orders(self, **params: Any) -> list[Order]:
+        data = await self._request("GET", "/portfolio/orders", params=params)
+        return [Order.model_validate(o) for o in data.get("orders", [])]
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "KalshiClient":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
