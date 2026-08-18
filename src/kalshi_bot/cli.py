@@ -23,7 +23,7 @@ from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.strategies.base import Strategy
-from kalshi_bot.strategies.coby_strategy import CobyStrategy
+from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
 from kalshi_bot.strategies.examples.arbitrage import ArbitrageYesNo
 from kalshi_bot.strategies.examples.fair_value import FairValue
 from kalshi_bot.strategies.examples.market_maker import MarketMaker
