@@ -1,26 +1,14 @@
 """Async Kalshi REST client with RSA-PSS request signing.
 
-Wraps the public market-data endpoints and the authenticated portfolio/trading
-endpoints under ``/trade-api/v2``. Auth headers are attached automatically to
-every request via an httpx event hook.
-
-Example:
-    ```python
-    from kalshi_bot.config import load_settings
-    from kalshi_bot.exchange.client import KalshiClient
-
-    settings = load_settings()
-    async with KalshiClient.from_settings(settings) as client:
-        balance = await client.get_balance()
-        markets = await client.get_markets(status="open", limit=10)
-    ```
-
-Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
+Current V2 event-order implementation with confirmed fill metadata and
+reduce-only protection on exits.
 """
 
 from __future__ import annotations
 
 import time
+import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from types import TracebackType
 from typing import Any
 from urllib.parse import urlsplit
@@ -30,20 +18,23 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from kalshi_bot.config import Settings
 from kalshi_bot.exchange.auth import build_auth_headers, load_private_key
-from kalshi_bot.exchange.models import (
-    Balance,
-    Market,
-    Order,
-    OrderRequest,
-    Position,
-)
+from kalshi_bot.exchange.models import Balance, Market, Order, OrderRequest, Position
+from kalshi_bot.telemetry.logging import get_logger
 
+logger = get_logger(__name__)
 API_PREFIX = ""
 
 
-class KalshiError(RuntimeError):
-    """Raised when the Kalshi API returns an error response."""
+def _dollars_to_cents(value: str) -> int:
+    return int(
+        (Decimal(str(value)) * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
 
+
+class KalshiError(RuntimeError):
     def __init__(self, status_code: int, body: str) -> None:
         super().__init__(f"Kalshi API error {status_code}: {body}")
         self.status_code = status_code
@@ -51,8 +42,6 @@ class KalshiError(RuntimeError):
 
 
 class KalshiClient:
-    """Async REST client for the Kalshi trading API."""
-
     def __init__(
         self,
         base_url: str,
@@ -70,15 +59,11 @@ class KalshiClient:
         )
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> KalshiClient:
-        """Build a client from :class:`~kalshi_bot.config.Settings`.
-
-        Loads the RSA private key only when an API key ID is configured, so the
-        client can still be used for public market data without credentials.
-        """
+    def from_settings(cls, settings: Settings) -> "KalshiClient":
         private_key = None
         if settings.api_key_id:
             private_key = load_private_key(settings.private_key_path)
+
         return cls(
             base_url=settings.rest_base_url,
             api_key_id=settings.api_key_id or None,
@@ -88,89 +73,122 @@ class KalshiClient:
 
     @property
     def authenticated(self) -> bool:
-        """Whether credentials are present for signed requests."""
         return self._api_key_id is not None and self._private_key is not None
 
     async def _sign_request(self, request: httpx.Request) -> None:
-        """httpx event hook: attach Kalshi auth headers to every request.
-
-        The signed path includes the ``/trade-api/v2`` prefix and excludes the
-        query string.
-        """
         if not self.authenticated:
             return
-        assert self._api_key_id is not None and self._private_key is not None
+
+        assert self._api_key_id is not None
+        assert self._private_key is not None
+
         path = urlsplit(str(request.url)).path
         timestamp_ms = int(time.time() * 1000)
-        headers = build_auth_headers(
-            self._api_key_id, self._private_key, timestamp_ms, request.method, path
-        )
-        request.headers.update(headers)
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        response = await self._client.request(method, API_PREFIX + path, **kwargs)
+        request.headers.update(
+            build_auth_headers(
+                self._api_key_id,
+                self._private_key,
+                timestamp_ms,
+                request.method,
+                path,
+            )
+        )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        response = await self._client.request(
+            method,
+            API_PREFIX + path,
+            **kwargs,
+        )
+
         if response.is_error:
             raise KalshiError(response.status_code, response.text)
-        return response.json()  # type: ignore[no-any-return]
 
-    # --- Market data (public) -------------------------------------------
+        return response.json()
 
     async def get_markets(self, **params: Any) -> list[Market]:
-        """List markets. Filter by ``status``, ``event_ticker``, ``series_ticker``, ``limit``."""
         data = await self._request("GET", "/markets", params=params)
         return [Market.model_validate(m) for m in data.get("markets", [])]
 
     async def get_market(self, ticker: str) -> Market:
-        """Fetch a single market by ticker."""
         data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data["market"])
 
-    async def get_orderbook(self, ticker: str, depth: int | None = None) -> dict[str, Any]:
-        """Fetch the order book for a market."""
+    async def get_orderbook(
+        self,
+        ticker: str,
+        depth: int | None = None,
+    ) -> dict[str, Any]:
         params = {"depth": depth} if depth is not None else {}
-        data = await self._request("GET", f"/markets/{ticker}/orderbook", params=params)
-        return data.get("orderbook", {})  # type: ignore[no-any-return]
-
-    # --- Portfolio / trading (authenticated) ----------------------------
+        data = await self._request(
+            "GET",
+            f"/markets/{ticker}/orderbook",
+            params=params,
+        )
+        return data.get("orderbook", {})
 
     async def get_balance(self) -> Balance:
-        """Get the portfolio cash balance (in cents)."""
         data = await self._request("GET", "/portfolio/balance")
         return Balance.model_validate(data)
 
     async def get_positions(self, **params: Any) -> list[Position]:
-        """List open positions."""
-        data = await self._request("GET", "/portfolio/positions", params=params)
-        return [Position.model_validate(p) for p in data.get("market_positions", [])]
+        data = await self._request(
+            "GET",
+            "/portfolio/positions",
+            params=params,
+        )
+        return [
+            Position.model_validate(p)
+            for p in data.get("market_positions", [])
+        ]
 
     async def create_order(self, order: OrderRequest) -> Order:
-        """Create an order using Kalshi's V2 event-order endpoint."""
+        """Create a V2 event order.
+
+        BUY orders may open/increase a position.
+        SELL orders are always reduce-only so an exit can never cross flat
+        and create exposure on the opposite side.
+        """
 
         action = order.action.value
         outcome = order.side.value
 
-        # Kalshi V2 uses one YES-side book:
-        # bid = buy YES / sell NO
-        # ask = sell YES / buy NO
         if action == "buy" and outcome == "yes":
             book_side = "bid"
-            price_cents = order.yes_price
+            yes_price_cents = order.yes_price
         elif action == "sell" and outcome == "yes":
             book_side = "ask"
-            price_cents = order.yes_price
+            yes_price_cents = order.yes_price
         elif action == "buy" and outcome == "no":
             book_side = "ask"
-            price_cents = None if order.no_price is None else 100 - order.no_price
+            yes_price_cents = (
+                None if order.no_price is None
+                else 100 - order.no_price
+            )
         elif action == "sell" and outcome == "no":
             book_side = "bid"
-            price_cents = None if order.no_price is None else 100 - order.no_price
+            yes_price_cents = (
+                None if order.no_price is None
+                else 100 - order.no_price
+            )
         else:
             raise ValueError(
                 f"Unsupported order direction: action={action}, side={outcome}"
             )
 
-        if price_cents is None:
+        if yes_price_cents is None:
             raise ValueError("Order price is required")
+
+        if not 0 < yes_price_cents < 100:
+            raise ValueError(
+                f"Order price must be between 1 and 99 cents: {yes_price_cents}"
+            )
 
         raw_tif = (
             order.time_in_force.value
@@ -191,18 +209,23 @@ class KalshiClient:
         if time_in_force is None:
             raise ValueError(f"Unsupported time_in_force: {raw_tif}")
 
+        client_order_id = order.client_order_id or str(uuid.uuid4())
+
         payload: dict[str, Any] = {
             "ticker": order.ticker,
+            "client_order_id": client_order_id,
             "side": book_side,
             "count": f"{order.count:.2f}",
-            "price": f"{price_cents / 100:.4f}",
+            "price": f"{yes_price_cents / 100:.4f}",
             "time_in_force": time_in_force,
             "self_trade_prevention_type": "taker_at_cross",
-            "post_only": bool(order.post_only) if order.post_only is not None else False,
+            "post_only": (
+                bool(order.post_only)
+                if order.post_only is not None
+                else False
+            ),
+            "reduce_only": action == "sell",
         }
-
-        if order.client_order_id is not None:
-            payload["client_order_id"] = order.client_order_id
 
         created = await self._request(
             "POST",
@@ -210,23 +233,27 @@ class KalshiClient:
             json=payload,
         )
 
-        # V2 create already returns enough information to acknowledge the
-        # submission. Do not immediately fetch the order again just to build
-        # the repo's legacy Order model; the create response is authoritative
-        # for this submission and already includes fill/remaining quantities.
-        fill_count = int(float(created.get("fill_count", "0")))
-        remaining_count = int(float(created.get("remaining_count", "0")))
+        fill_count = int(Decimal(str(created.get("fill_count", "0"))))
+        remaining_count = int(Decimal(str(created.get("remaining_count", "0"))))
+        average_fill_price = created.get("average_fill_price")
+
+        outcome_fill_price: int | None = None
+        if fill_count > 0 and average_fill_price is not None:
+            yes_fill_cents = _dollars_to_cents(str(average_fill_price))
+            outcome_fill_price = (
+                yes_fill_cents
+                if outcome == "yes"
+                else 100 - yes_fill_cents
+            )
 
         if fill_count >= order.count:
             status = "executed"
         elif remaining_count > 0:
             status = "resting"
         else:
-            # For IOC, this includes unfilled or partially-filled orders whose
-            # unfilled remainder was canceled immediately.
             status = "canceled"
 
-        return Order(
+        result = Order(
             order_id=created["order_id"],
             ticker=order.ticker,
             status=status,
@@ -236,25 +263,67 @@ class KalshiClient:
             no_price=order.no_price,
             count=order.count,
             remaining_count=remaining_count,
+            client_order_id=client_order_id,
+            fill_count=fill_count,
+            average_fill_price=(
+                str(average_fill_price)
+                if average_fill_price is not None
+                else None
+            ),
+            outcome_fill_price=outcome_fill_price,
         )
 
+        logger.warning(
+            "LIVE ORDER RESULT | ticker=%s | order_id=%s | "
+            "action=%s | outcome=%s | book_side=%s | "
+            "reduce_only=%s | requested=%d | fill_count=%d | "
+            "remaining=%d | limit_yes=%dc | "
+            "average_fill_price=%s | outcome_fill=%s",
+            order.ticker,
+            created.get("order_id"),
+            action,
+            outcome,
+            book_side,
+            action == "sell",
+            order.count,
+            fill_count,
+            remaining_count,
+            yes_price_cents,
+            average_fill_price,
+            outcome_fill_price,
+        )
+
+        return result
+
     async def cancel_order(self, order_id: str) -> Order:
-        """Cancel an order by ID using the legacy read-compatible model."""
-        data = await self._request("DELETE", f"/portfolio/orders/{order_id}")
-        return Order.model_validate(data["order"])
+        data = await self._request(
+            "DELETE",
+            f"/portfolio/events/orders/{order_id}",
+        )
+
+        return Order(
+            order_id=data["order_id"],
+            ticker="",
+            status="canceled",
+            client_order_id=data.get("client_order_id"),
+        )
 
     async def get_orders(self, **params: Any) -> list[Order]:
-        """List orders, optionally filtered by ``ticker``/``status``."""
-        data = await self._request("GET", "/portfolio/orders", params=params)
-        return [Order.model_validate(o) for o in data.get("orders", [])]
+        data = await self._request(
+            "GET",
+            "/portfolio/orders",
+            params=params,
+        )
 
-    # --- Lifecycle ------------------------------------------------------
+        return [
+            Order.model_validate(o)
+            for o in data.get("orders", [])
+        ]
 
     async def aclose(self) -> None:
-        """Close the underlying HTTP connection pool."""
         await self._client.aclose()
 
-    async def __aenter__(self) -> KalshiClient:
+    async def __aenter__(self) -> "KalshiClient":
         return self
 
     async def __aexit__(
