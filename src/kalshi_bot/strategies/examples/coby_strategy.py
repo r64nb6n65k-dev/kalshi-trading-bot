@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from kalshi_bot.dashboard import record_entry, record_exit, update_open_count
 from kalshi_bot.exchange.models import (
@@ -31,12 +32,19 @@ class CobyStrategy(Strategy):
         self.take_profit = int(params.get("take_profit", 98))
         self.stop_price = int(params.get("stop_price", 79))
         self.entry_window_seconds = int(params.get("entry_window_seconds", 300))
-        self.max_contracts = int(params.get("max_contracts", 100))
-        self.max_notional_cents = int(params.get("max_notional_cents", 10_000))
+        self.max_contracts = int(params.get("max_contracts", 200))
+        self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
+        self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
-        # For a triggered stop, use an aggressively marketable limit. Kalshi's
-        # V2 order API is limit-order based; 1c prioritizes getting out over
-        # preserving the 79c trigger price. A 79c stop is NOT a guaranteed fill.
+        self.trading_timezone = ZoneInfo(
+            str(params.get("trading_timezone", "America/Chicago"))
+        )
+        self.trading_start_hour = int(params.get("trading_start_hour", 6))
+        self.trading_end_hour = int(params.get("trading_end_hour", 19))
+
+        # For a triggered stop or final-minute exit, use an aggressively
+        # marketable limit. Kalshi's V2 order API is limit-order based; 1c
+        # prioritizes getting out. Neither trigger guarantees a fill.
         self.stop_exit_floor = int(params.get("stop_exit_floor", 1))
 
         self._traded_tickers: set[str] = set()
@@ -61,6 +69,10 @@ class CobyStrategy(Strategy):
             return (close_dt - datetime.now(timezone.utc)).total_seconds()
         except ValueError:
             return None
+
+    def _within_trading_hours(self) -> bool:
+        local_hour = datetime.now(self.trading_timezone).hour
+        return self.trading_start_hour <= local_hour < self.trading_end_hour
 
     def _entry_count(self, limit_price: int) -> int:
         if limit_price <= 0:
@@ -94,8 +106,6 @@ class CobyStrategy(Strategy):
         return OrderRequest(**kwargs)
 
     def _known_position_count(self, ticker: str, ctx_position: int) -> int:
-        # Local confirmed-fill state takes priority over a potentially stale
-        # REST snapshot immediately after a partial exit.
         if ticker in self._filled_count_by_ticker:
             return self._filled_count_by_ticker[ticker]
         return abs(int(ctx_position)) if ctx_position != 0 else 0
@@ -144,8 +154,6 @@ class CobyStrategy(Strategy):
 
         fill_price = result.outcome_fill_price
         if fill_price is None:
-            # V2 should return average_fill_price whenever fill_count > 0.
-            # This fallback keeps protection active if that metadata is absent.
             fill_price = (
                 request.yes_price
                 if request.side is Side.YES
@@ -176,8 +184,7 @@ class CobyStrategy(Strategy):
                 seconds_left=seconds_left,
             )
             logger.warning(
-                "LIVE ENTRY FILLED | ticker=%s | side=%s | "
-                "fill=%dc | count=%d",
+                "LIVE ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d",
                 ticker,
                 request.side.value,
                 fill_price,
@@ -203,8 +210,8 @@ class CobyStrategy(Strategy):
                 self._filled_count_by_ticker[ticker] = remaining
                 update_open_count(ticker, remaining)
                 logger.warning(
-                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | "
-                    "fill=%dc | filled=%d | remaining=%d",
+                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | fill=%dc | "
+                    "filled=%d | remaining=%d",
                     ticker,
                     side.value,
                     fill_price,
@@ -241,8 +248,8 @@ class CobyStrategy(Strategy):
                 )
             else:
                 logger.warning(
-                    "LIVE EXIT FILLED BUT ENTRY PRICE UNKNOWN | "
-                    "ticker=%s | side=%s | exit=%dc | count=%d",
+                    "LIVE EXIT FILLED BUT ENTRY PRICE UNKNOWN | ticker=%s | "
+                    "side=%s | exit=%dc | count=%d",
                     ticker,
                     side.value,
                     avg_exit,
@@ -252,8 +259,8 @@ class CobyStrategy(Strategy):
             self._side_by_ticker.pop(ticker, None)
 
             logger.warning(
-                "LIVE EXIT FILLED | ticker=%s | side=%s | "
-                "avg_exit=%dc | count=%d | reason=%s",
+                "LIVE EXIT FILLED | ticker=%s | side=%s | avg_exit=%dc | "
+                "count=%d | reason=%s",
                 ticker,
                 side.value,
                 avg_exit,
@@ -273,8 +280,8 @@ class CobyStrategy(Strategy):
         reason: str,
     ) -> None:
         logger.info(
-            "ENTRY CHECK | ticker=%s | seconds_left=%s | "
-            "yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s | reason=%s",
+            "ENTRY CHECK | ticker=%s | seconds_left=%s | yes_bid=%s | "
+            "yes_ask=%s | no_bid=%s | no_ask=%s | reason=%s",
             ticker,
             "None" if seconds_left is None else f"{seconds_left:.1f}",
             yes_bid,
@@ -292,7 +299,6 @@ class CobyStrategy(Strategy):
 
         ctx_position = ctx.position_for(m.ticker)
 
-        # A fully confirmed exit wins over a stale positions snapshot.
         if m.ticker in self._closed_tickers:
             return []
 
@@ -312,6 +318,31 @@ class CobyStrategy(Strategy):
                 return []
 
             bid = m.yes_bid if side is Side.YES else m.no_bid
+
+            if seconds_left <= self.final_exit_seconds:
+                self._pending_action[m.ticker] = Action.SELL
+                self._exit_reason[m.ticker] = "FINAL_60_SECOND_EXIT"
+                logger.warning(
+                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%s | "
+                    "limit=%dc | seconds_left=%.1f | "
+                    "reason=FINAL_60_SECOND_EXIT | count=%d",
+                    m.ticker,
+                    side.value,
+                    bid,
+                    self.stop_exit_floor,
+                    seconds_left,
+                    count,
+                )
+                return [
+                    self._order(
+                        ticker=m.ticker,
+                        action=Action.SELL,
+                        side=side,
+                        price=self.stop_exit_floor,
+                        count=count,
+                    )
+                ]
+
             if bid is None:
                 return []
 
@@ -359,6 +390,18 @@ class CobyStrategy(Strategy):
                     )
                 ]
 
+            return []
+
+        if not self._within_trading_hours():
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="OUTSIDE_TRADING_HOURS_6AM_7PM_CENTRAL",
+            )
             return []
 
         if m.ticker in self._traded_tickers:
@@ -429,8 +472,6 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        # Marketable IOC limit capped at 95c. It can fill at any better price,
-        # but never authorizes an entry above the strategy's max.
         limit_price = self.entry_max
         count = self._entry_count(limit_price)
         if count <= 0:
