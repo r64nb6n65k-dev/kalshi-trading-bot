@@ -1,11 +1,4 @@
-"""Risk management: pre-trade checks and position sizing.
-
-The :class:`RiskManager` vetoes orders that would breach configured limits and
-provides a fractional-Kelly position sizer. Every order produced by a strategy
-passes through :meth:`check` before it can be sent.
-
-Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
-"""
+"""Risk management: pre-trade checks and position sizing."""
 
 from __future__ import annotations
 
@@ -22,14 +15,14 @@ if TYPE_CHECKING:
 class RiskLimits:
     """Configurable risk limits."""
 
-    max_contracts_per_order: int = 100
+    max_contracts_per_order: int = 200
     max_position_per_market: int = 500
-    max_order_notional_cents: int = 50_000  # max cents committed by one order
-    kelly_fraction: float = 0.25  # fractional Kelly (quarter-Kelly default)
+    max_order_notional_cents: int = 50_000
+    kelly_fraction: float = 0.25
 
     @classmethod
     def from_settings(cls, risk: RiskSettings) -> RiskLimits:
-        """Build limits from validated :class:`~kalshi_bot.config.RiskSettings`."""
+        """Build limits from validated risk settings."""
         return cls(
             max_contracts_per_order=risk.max_contracts_per_order,
             max_position_per_market=risk.max_position_per_market,
@@ -54,7 +47,7 @@ class RiskManager:
 
     @classmethod
     def from_settings(cls, risk: RiskSettings) -> RiskManager:
-        """Build a risk manager from :class:`~kalshi_bot.config.RiskSettings`."""
+        """Build a risk manager from validated risk settings."""
         return cls(RiskLimits.from_settings(risk))
 
     def check(self, order: OrderRequest, current_position: int) -> RiskDecision:
@@ -62,7 +55,12 @@ class RiskManager:
         if order.count > self.limits.max_contracts_per_order:
             return RiskDecision(False, "order count exceeds max_contracts_per_order")
 
-        signed = order.count if order.action.value == "buy" else -order.count
+        # YES contracts are represented as positive positions and NO contracts
+        # as negative positions. Buying NO moves the position negative; selling
+        # NO moves it back toward zero.
+        side_direction = 1 if order.side.value == "yes" else -1
+        action_direction = 1 if order.action.value == "buy" else -1
+        signed = order.count * side_direction * action_direction
         projected = current_position + signed
         if abs(projected) > self.limits.max_position_per_market:
             return RiskDecision(False, "projected position exceeds max_position_per_market")
@@ -75,20 +73,7 @@ class RiskManager:
         return RiskDecision(True)
 
     def kelly_size(self, edge_prob: float, price_cents: int, bankroll_cents: int) -> int:
-        """Fractional-Kelly contract count for a binary contract.
-
-        Args:
-            edge_prob: Your estimated probability the contract resolves YES (0-1).
-            price_cents: Current YES price in cents (1-99).
-            bankroll_cents: Available bankroll in cents.
-
-        Returns:
-            Number of contracts to buy (>= 0), capped by per-order limits.
-
-        For a contract priced ``p`` (as a fraction) that pays 1 on win, the
-        Kelly fraction is ``f = (edge_prob - p) / (1 - p)``. A non-positive
-        result means no edge, so size 0.
-        """
+        """Return a fractional-Kelly contract count capped by order limits."""
         p = price_cents / 100.0
         if not 0.0 < p < 1.0:
             return 0
