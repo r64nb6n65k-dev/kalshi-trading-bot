@@ -1,0 +1,1319 @@
+From 7289bfb879437ed6db3f24dbcb86b3a766668002 Mon Sep 17 00:00:00 2001
+From: r64nb6n65k-dev <r64nb6n65k@privaterelay.appleid.com>
+Date: Thu, 20 Aug 2026 02:06:40 +0000
+Subject: [PATCH] Add BTC market filters and one-second paper trading
+
+---
+ .env.example                                  |   2 +-
+ src/kalshi_bot/cli.py                         |  46 ++-
+ src/kalshi_bot/config.py                      |  15 +-
+ src/kalshi_bot/core/engine.py                 |  60 +++-
+ src/kalshi_bot/data/bitcoin.py                | 151 +++++++++
+ src/kalshi_bot/exchange/models.py             |  12 +-
+ src/kalshi_bot/strategies/base.py             |  21 +-
+ .../strategies/examples/coby_strategy.py      | 312 ++++++++++++++----
+ tests/unit/test_bitcoin_feed.py               |  66 ++++
+ tests/unit/test_coby_strategy.py              |  97 ++++++
+ tests/unit/test_config.py                     |   8 +-
+ tests/unit/test_engine_paper.py               |  54 +++
+ tests/unit/test_models.py                     |  15 +
+ 13 files changed, 759 insertions(+), 100 deletions(-)
+ create mode 100644 src/kalshi_bot/data/bitcoin.py
+ create mode 100644 tests/unit/test_bitcoin_feed.py
+ create mode 100644 tests/unit/test_coby_strategy.py
+ create mode 100644 tests/unit/test_engine_paper.py
+
+diff --git a/.env.example b/.env.example
+index b3b1821..8a71c3a 100644
+--- a/.env.example
++++ b/.env.example
+@@ -22,7 +22,7 @@ KALSHI_DRY_RUN=true
+ KALSHI_REQUEST_TIMEOUT=10
+ 
+ # Seconds between market polls in the live engine.
+-KALSHI_POLL_INTERVAL=2
++KALSHI_POLL_INTERVAL=1
+ 
+ # --- Risk limits -------------------------------------------------------------
+ # Nested settings use a double-underscore delimiter. All are optional; the
+diff --git a/src/kalshi_bot/cli.py b/src/kalshi_bot/cli.py
+index 4788218..88b8e47 100644
+--- a/src/kalshi_bot/cli.py
++++ b/src/kalshi_bot/cli.py
+@@ -20,17 +20,17 @@ from kalshi_bot.backtesting.report import render as render_report
+ from kalshi_bot.config import load_settings
+ from kalshi_bot.core.engine import TradingEngine
+ from kalshi_bot.dashboard import start_dashboard
++from kalshi_bot.data.bitcoin import BitcoinPriceFeed
+ from kalshi_bot.exchange.client import KalshiClient
+ from kalshi_bot.risk.manager import RiskManager
+ from kalshi_bot.strategies.base import Strategy
+-from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
+ from kalshi_bot.strategies.examples.arbitrage import ArbitrageYesNo
++from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
+ from kalshi_bot.strategies.examples.fair_value import FairValue
+ from kalshi_bot.strategies.examples.market_maker import MarketMaker
+ from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
+ from kalshi_bot.strategies.examples.momentum import Momentum
+ 
+-
+ app = typer.Typer(
+     add_completion=False,
+     help="Kalshi Trading Bot â open-source framework by Viprasol Tech.",
+@@ -51,9 +51,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
+ @app.command()
+ def version() -> None:
+     """Print the installed version."""
+-    console.print(
+-        f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech"
+-    )
++    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech")
+ 
+ 
+ @app.command()
+@@ -101,9 +99,7 @@ def backtest(
+     """Backtest a strategy on synthetic data and print a metrics report."""
+     if strategy not in STRATEGIES:
+         choices = ", ".join(STRATEGIES)
+-        console.print(
+-            f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]"
+-        )
++        console.print(f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]")
+         raise typer.Exit(code=1)
+ 
+     snapshots = random_walk_snapshots(n=ticks, seed=seed)
+@@ -138,9 +134,7 @@ def markets(
+                 limit=limit,
+             )
+ 
+-            table = Table(
+-                title=f"Kalshi markets ({settings.environment.value})"
+-            )
++            table = Table(title=f"Kalshi markets ({settings.environment.value})")
+             table.add_column("Ticker", style="cyan")
+             table.add_column("Title")
+             table.add_column("Yes Bid", justify="right")
+@@ -168,17 +162,12 @@ def balance() -> None:
+ 
+         async with KalshiClient.from_settings(settings) as client:
+             if not client.authenticated:
+-                console.print(
+-                    "[red]No credentials configured. "
+-                    "Set KALSHI_API_KEY_ID.[/]"
+-                )
++                console.print("[red]No credentials configured. Set KALSHI_API_KEY_ID.[/]")
+                 raise typer.Exit(code=1)
+ 
+             bal = await client.get_balance()
+ 
+-            console.print(
+-                f"Balance: [bold green]${bal.balance / 100:,.2f}[/]"
+-            )
++            console.print(f"Balance: [bold green]${bal.balance / 100:,.2f}[/]")
+ 
+     asyncio.run(_run())
+ 
+@@ -194,8 +183,8 @@ def run(
+         help="Market ticker or series ticker to trade.",
+     ),
+     ticks: int = typer.Option(
+-        5,
+-        help="Number of poll cycles before stopping.",
++        0,
++        help="Number of poll cycles before stopping (0 runs continuously).",
+     ),
+     live: bool = typer.Option(
+         False,
+@@ -206,9 +195,7 @@ def run(
+     """Run a strategy live or in dry-run mode."""
+     if strategy not in STRATEGIES:
+         choices = ", ".join(STRATEGIES)
+-        console.print(
+-            f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]"
+-        )
++        console.print(f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]")
+         raise typer.Exit(code=1)
+ 
+     # Keep the web dashboard running in the same Railway process.
+@@ -221,17 +208,26 @@ def run(
+         dry_run = not live
+ 
+         async with KalshiClient.from_settings(settings) as client:
++            bitcoin_feed = None
++            strategy_params = {}
++            if strategy == "coby_strategy":
++                bitcoin_feed = BitcoinPriceFeed(
++                    ws_url=settings.btc_ws_url,
++                    product_id=settings.btc_product_id,
++                )
++                strategy_params["max_btc_age_seconds"] = settings.btc_max_age_seconds
+             engine = TradingEngine(
+                 client=client,
+-                strategy=STRATEGIES[strategy](),
++                strategy=STRATEGIES[strategy](**strategy_params),
+                 risk=RiskManager.from_settings(settings.risk),
+                 dry_run=dry_run,
+                 poll_interval=settings.poll_interval,
++                bitcoin_feed=bitcoin_feed,
+             )
+ 
+             await engine.run(
+                 ticker,
+-                max_ticks=ticks,
++                max_ticks=None if ticks == 0 else ticks,
+             )
+ 
+     asyncio.run(_run())
+diff --git a/src/kalshi_bot/config.py b/src/kalshi_bot/config.py
+index 6e7d65f..8f842e9 100644
+--- a/src/kalshi_bot/config.py
++++ b/src/kalshi_bot/config.py
+@@ -73,11 +73,24 @@ class Settings(BaseSettings):
+     )
+ 
+     poll_interval: float = Field(
+-        default=2.0,
++        default=1.0,
+         gt=0.0,
+         description="Seconds between market polls in the live engine.",
+     )
+ 
++    btc_ws_url: str = Field(
++        default="wss://advanced-trade-ws.coinbase.com",
++        description="Public BTC/USD WebSocket used as a BRTI proxy.",
++    )
++
++    btc_product_id: str = Field(default="BTC-USD")
++
++    btc_max_age_seconds: float = Field(
++        default=3.0,
++        gt=0.0,
++        description="Reject entries when the BTC stream is older than this.",
++    )
++
+     risk: RiskSettings = Field(default_factory=RiskSettings)
+ 
+     @field_validator("api_key_id")
+diff --git a/src/kalshi_bot/core/engine.py b/src/kalshi_bot/core/engine.py
+index 8e5f78f..5fafa05 100644
+--- a/src/kalshi_bot/core/engine.py
++++ b/src/kalshi_bot/core/engine.py
+@@ -3,9 +3,11 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import time
+ 
++from kalshi_bot.data.bitcoin import BitcoinPriceFeed
+ from kalshi_bot.exchange.client import KalshiClient
+-from kalshi_bot.exchange.models import Order, OrderRequest, Position
++from kalshi_bot.exchange.models import Market, Order, OrderRequest, Position, Side
+ from kalshi_bot.risk.manager import RiskManager
+ from kalshi_bot.strategies.base import Strategy, StrategyContext
+ from kalshi_bot.telemetry.logging import get_logger
+@@ -13,6 +15,10 @@ from kalshi_bot.telemetry.logging import get_logger
+ logger = get_logger(__name__)
+ 
+ 
++def tick_id() -> int:
++    return time.time_ns()
++
++
+ class TradingEngine:
+     def __init__(
+         self,
+@@ -20,13 +26,15 @@ class TradingEngine:
+         strategy: Strategy,
+         risk: RiskManager,
+         dry_run: bool = True,
+-        poll_interval: float = 2.0,
++        poll_interval: float = 1.0,
++        bitcoin_feed: BitcoinPriceFeed | None = None,
+     ) -> None:
+         self.client = client
+         self.strategy = strategy
+         self.risk = risk
+         self.dry_run = dry_run
+         self.poll_interval = poll_interval
++        self.bitcoin_feed = bitcoin_feed
+         self._running = False
+ 
+     async def _snapshot(self, ticker: str) -> StrategyContext:
+@@ -49,22 +57,30 @@ class TradingEngine:
+                 positions[pos.ticker] = pos
+             balance = (await self.client.get_balance()).balance
+ 
+-        return StrategyContext(market=market, positions=positions, balance=balance)
++        underlying_ticks = self.bitcoin_feed.snapshot() if self.bitcoin_feed is not None else ()
++        return StrategyContext(
++            market=market,
++            positions=positions,
++            balance=balance,
++            underlying_ticks=underlying_ticks,
++        )
+ 
+     def _notify_order_result(
+         self,
+         request: OrderRequest,
+         result: Order | None,
+         seconds_left: float | None,
++        is_live: bool = True,
+     ) -> None:
+         callback = getattr(self.strategy, "on_order_result", None)
+         if callable(callback):
+-            callback(request, result, seconds_left)
++            callback(request, result, seconds_left, is_live)
+ 
+     async def _submit(
+         self,
+         order: OrderRequest,
+         current_position: int,
++        market: Market,
+         seconds_left: float | None = None,
+     ) -> Order | None:
+         decision = self.risk.check(order, current_position)
+@@ -78,8 +94,35 @@ class TradingEngine:
+             return None
+ 
+         if self.dry_run:
+-            logger.info("[DRY-RUN] would submit: %s", order.to_payload())
+-            return None
++            if order.side is Side.YES:
++                fill_price = market.yes_ask if order.action.value == "buy" else market.yes_bid
++            else:
++                fill_price = market.no_ask if order.action.value == "buy" else market.no_bid
++            if fill_price is None:
++                logger.warning("PAPER NO FILL | missing executable quote | %s", order)
++                self._notify_order_result(order, None, seconds_left, is_live=False)
++                return None
++            paper_fill = Order(
++                order_id=f"paper-{order.ticker}-{tick_id()}",
++                ticker=order.ticker,
++                status="executed",
++                side=order.side,
++                action=order.action,
++                count=order.count,
++                remaining_count=0,
++                fill_count=order.count,
++                outcome_fill_price=fill_price,
++            )
++            logger.warning(
++                "PAPER FILL | ticker=%s | action=%s | side=%s | fill=%dc | count=%d",
++                order.ticker,
++                order.action.value,
++                order.side.value,
++                fill_price,
++                order.count,
++            )
++            self._notify_order_result(order, paper_fill, seconds_left, is_live=False)
++            return paper_fill
+ 
+         try:
+             order_resp = await self.client.create_order(order)
+@@ -102,6 +145,8 @@ class TradingEngine:
+ 
+     async def run(self, ticker: str, max_ticks: int | None = None) -> None:
+         self._running = True
++        if self.bitcoin_feed is not None:
++            await self.bitcoin_feed.start()
+         self.strategy.on_start()
+         logger.info(
+             "Engine started | strategy=%s | ticker=%s | dry_run=%s",
+@@ -123,6 +168,7 @@ class TradingEngine:
+                     await self._submit(
+                         order,
+                         ctx.position_for(order.ticker),
++                        ctx.market,
+                         seconds_left,
+                     )
+ 
+@@ -131,6 +177,8 @@ class TradingEngine:
+                     break
+                 await asyncio.sleep(self.poll_interval)
+         finally:
++            if self.bitcoin_feed is not None:
++                await self.bitcoin_feed.stop()
+             self.strategy.on_stop()
+             self._running = False
+             logger.info("Engine stopped after %d tick(s)", tick)
+diff --git a/src/kalshi_bot/data/bitcoin.py b/src/kalshi_bot/data/bitcoin.py
+new file mode 100644
+index 0000000..3777e7c
+--- /dev/null
++++ b/src/kalshi_bot/data/bitcoin.py
+@@ -0,0 +1,151 @@
++"""Resilient public BTC/USD trade stream for strategy filtering."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from collections import deque
++from contextlib import suppress
++from datetime import UTC, datetime, timedelta
++
++import websockets
++
++from kalshi_bot.strategies.base import UnderlyingTick
++from kalshi_bot.telemetry.logging import get_logger
++
++logger = get_logger(__name__)
++
++
++class BitcoinPriceFeed:
++    """Maintain a rolling window of public Coinbase BTC/USD trades.
++
++    Coinbase is a proxy, not Kalshi's licensed CF Benchmarks BRTI settlement
++    stream. The strategy therefore treats missing or stale data as a hard entry
++    veto and logs the source on every decision.
++    """
++
++    def __init__(
++        self,
++        ws_url: str,
++        product_id: str = "BTC-USD",
++        history_minutes: int = 20,
++    ) -> None:
++        self.ws_url = ws_url
++        self.product_id = product_id
++        self._history = timedelta(minutes=history_minutes)
++        self._ticks: deque[UnderlyingTick] = deque()
++        self._task: asyncio.Task[None] | None = None
++        self._stopping = False
++
++    async def start(self) -> None:
++        if self._task is None or self._task.done():
++            self._stopping = False
++            self._task = asyncio.create_task(self._run(), name="btc-price-feed")
++
++    async def stop(self) -> None:
++        self._stopping = True
++        if self._task is not None:
++            self._task.cancel()
++            with suppress(asyncio.CancelledError):
++                await self._task
++        self._task = None
++
++    def snapshot(self) -> tuple[UnderlyingTick, ...]:
++        return tuple(self._ticks)
++
++    def _append(self, tick: UnderlyingTick) -> None:
++        if self._ticks:
++            last = self._ticks[-1]
++            last_second = int(last.timestamp.timestamp())
++            tick_second = int(tick.timestamp.timestamp())
++            if tick_second < last_second:
++                return
++            if tick_second == last_second:
++                combined_size = last.size + tick.size
++                combined_price = (
++                    (last.price * last.size + tick.price * tick.size) / combined_size
++                    if combined_size > 0
++                    else tick.price
++                )
++                self._ticks[-1] = UnderlyingTick(
++                    price=combined_price,
++                    size=combined_size,
++                    timestamp=tick.timestamp,
++                    source=tick.source,
++                )
++                return
++        self._ticks.append(tick)
++        cutoff = tick.timestamp - self._history
++        while self._ticks and self._ticks[0].timestamp < cutoff:
++            self._ticks.popleft()
++
++    def _handle_message(self, message: dict[str, object]) -> None:
++        if message.get("channel") != "market_trades":
++            return
++        events = message.get("events")
++        if not isinstance(events, list):
++            return
++        for event in events:
++            if not isinstance(event, dict):
++                continue
++            trades = event.get("trades")
++            if not isinstance(trades, list):
++                continue
++            for trade in trades:
++                if not isinstance(trade, dict):
++                    continue
++                if trade.get("product_id") != self.product_id:
++                    continue
++                try:
++                    timestamp = datetime.fromisoformat(str(trade["time"]).replace("Z", "+00:00"))
++                    if timestamp.tzinfo is None:
++                        timestamp = timestamp.replace(tzinfo=UTC)
++                    self._append(
++                        UnderlyingTick(
++                            price=float(trade["price"]),
++                            size=float(trade["size"]),
++                            timestamp=timestamp,
++                            source="COINBASE_PROXY",
++                        )
++                    )
++                except (KeyError, TypeError, ValueError):
++                    logger.exception("Invalid BTC market-trade message")
++
++    async def _run(self) -> None:
++        delay = 1.0
++        while not self._stopping:
++            try:
++                async with websockets.connect(
++                    self.ws_url,
++                    open_timeout=10,
++                    ping_interval=20,
++                    ping_timeout=20,
++                ) as ws:
++                    await ws.send(
++                        json.dumps(
++                            {
++                                "type": "subscribe",
++                                "product_ids": [self.product_id],
++                                "channel": "market_trades",
++                            }
++                        )
++                    )
++                    await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
++                    logger.warning(
++                        "BTC FEED CONNECTED | source=COINBASE_PROXY | product=%s",
++                        self.product_id,
++                    )
++                    delay = 1.0
++                    async for raw in ws:
++                        message = json.loads(raw)
++                        if isinstance(message, dict):
++                            self._handle_message(message)
++            except asyncio.CancelledError:
++                raise
++            except Exception:
++                logger.exception(
++                    "BTC FEED DISCONNECTED | retry_seconds=%.1f",
++                    delay,
++                )
++                await asyncio.sleep(delay)
++                delay = min(delay * 2, 30.0)
+diff --git a/src/kalshi_bot/exchange/models.py b/src/kalshi_bot/exchange/models.py
+index db67fea..cc2c9f3 100644
+--- a/src/kalshi_bot/exchange/models.py
++++ b/src/kalshi_bot/exchange/models.py
+@@ -7,7 +7,7 @@ fixed-point and dollar fields into those legacy fields.
+ 
+ from __future__ import annotations
+ 
+-from decimal import Decimal, ROUND_HALF_UP
++from decimal import ROUND_HALF_UP, Decimal
+ from enum import Enum
+ from typing import Any
+ 
+@@ -70,6 +70,10 @@ class Market(BaseModel):
+     volume: int | None = None
+     open_interest: int | None = None
+     close_time: str | None = None
++    floor_strike: float | None = None
++    rules_primary: str | None = None
++    yes_bid_size: int | None = None
++    yes_ask_size: int | None = None
+ 
+     @model_validator(mode="before")
+     @classmethod
+@@ -98,6 +102,12 @@ class Market(BaseModel):
+         if d.get("open_interest") is None and d.get("open_interest_fp") is not None:
+             d["open_interest"] = _fp_to_int(d["open_interest_fp"])
+ 
++        if d.get("yes_bid_size") is None and d.get("yes_bid_size_fp") is not None:
++            d["yes_bid_size"] = _fp_to_int(d["yes_bid_size_fp"])
++
++        if d.get("yes_ask_size") is None and d.get("yes_ask_size_fp") is not None:
++            d["yes_ask_size"] = _fp_to_int(d["yes_ask_size_fp"])
++
+         return d
+ 
+ 
+diff --git a/src/kalshi_bot/strategies/base.py b/src/kalshi_bot/strategies/base.py
+index 6fff6f5..bd080c4 100644
+--- a/src/kalshi_bot/strategies/base.py
++++ b/src/kalshi_bot/strategies/base.py
+@@ -10,18 +10,37 @@ Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
+ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
++from dataclasses import dataclass
++from datetime import datetime
+ from typing import Any
+ 
+ from kalshi_bot.exchange.models import Market, OrderRequest, Position
+ 
+ 
++@dataclass(frozen=True)
++class UnderlyingTick:
++    """One trade from the external BTC reference feed."""
++
++    price: float
++    size: float
++    timestamp: datetime
++    source: str
++
++
+ class StrategyContext:
+     """Read-only snapshot passed to a strategy on each tick."""
+ 
+-    def __init__(self, market: Market, positions: dict[str, Position], balance: int) -> None:
++    def __init__(
++        self,
++        market: Market,
++        positions: dict[str, Position],
++        balance: int,
++        underlying_ticks: tuple[UnderlyingTick, ...] = (),
++    ) -> None:
+         self.market = market
+         self.positions = positions
+         self.balance = balance
++        self.underlying_ticks = underlying_ticks
+ 
+     def position_for(self, ticker: str) -> int:
+         """Net contract position for ``ticker`` (0 if none)."""
+diff --git a/src/kalshi_bot/strategies/examples/coby_strategy.py b/src/kalshi_bot/strategies/examples/coby_strategy.py
+index 76ca8e0..dd66db2 100644
+--- a/src/kalshi_bot/strategies/examples/coby_strategy.py
++++ b/src/kalshi_bot/strategies/examples/coby_strategy.py
+@@ -1,10 +1,12 @@
+-"""Coby's 15-minute Kalshi live strategy with confirmed-fill tracking."""
++"""Coby's 15-minute BTC strategy with underlying-market filters."""
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime, timezone
++from dataclasses import dataclass
++from datetime import UTC, datetime, timedelta
++from itertools import pairwise
++from math import fsum
+ from typing import Any
+-from zoneinfo import ZoneInfo
+ 
+ from kalshi_bot.dashboard import record_entry, record_exit, update_open_count
+ from kalshi_bot.exchange.models import (
+@@ -21,6 +23,21 @@ from kalshi_bot.telemetry.logging import get_logger
+ logger = get_logger(__name__)
+ 
+ 
++@dataclass(frozen=True)
++class BtcAnalysis:
++    price: float
++    target: float
++    distance: float
++    required_distance: float
++    vwap: float
++    trend_change: float
++    efficiency: float
++    target_crossings: int
++    age_seconds: float
++    history_seconds: float
++    source: str
++
++
+ class CobyStrategy(Strategy):
+     name = "coby_strategy"
+ 
+@@ -35,12 +52,16 @@ class CobyStrategy(Strategy):
+         self.max_contracts = int(params.get("max_contracts", 200))
+         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
+         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
+-
+-        self.trading_timezone = ZoneInfo(
+-            str(params.get("trading_timezone", "America/Chicago"))
+-        )
+-        self.trading_start_hour = int(params.get("trading_start_hour", 6))
+-        self.trading_end_hour = int(params.get("trading_end_hour", 19))
++        self.minimum_distance = float(params.get("minimum_distance", 30.0))
++        self.volatility_multiplier = float(params.get("volatility_multiplier", 1.5))
++        self.analysis_seconds = int(params.get("analysis_seconds", 180))
++        self.minimum_history_seconds = int(params.get("minimum_history_seconds", 60))
++        self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 3.0))
++        self.max_target_crossings = int(params.get("max_target_crossings", 1))
++        self.minimum_efficiency = float(params.get("minimum_efficiency", 0.25))
++        self.minimum_trend_change = float(params.get("minimum_trend_change", 5.0))
++        self.required_confirmations = int(params.get("required_confirmations", 3))
++        self.max_spread_cents = int(params.get("max_spread_cents", 4))
+ 
+         # For a triggered stop or final-minute exit, use an aggressively
+         # marketable limit. Kalshi's V2 order API is limit-order based; 1c
+@@ -54,6 +75,7 @@ class CobyStrategy(Strategy):
+         self._filled_count_by_ticker: dict[str, int] = {}
+         self._pending_action: dict[str, Action] = {}
+         self._exit_reason: dict[str, str] = {}
++        self._qualified_count: dict[str, int] = {}
+ 
+         self._exit_fill_value_by_ticker: dict[str, int] = {}
+         self._exit_fill_count_by_ticker: dict[str, int] = {}
+@@ -65,15 +87,11 @@ class CobyStrategy(Strategy):
+         try:
+             close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+             if close_dt.tzinfo is None:
+-                close_dt = close_dt.replace(tzinfo=timezone.utc)
+-            return (close_dt - datetime.now(timezone.utc)).total_seconds()
++                close_dt = close_dt.replace(tzinfo=UTC)
++            return (close_dt - datetime.now(UTC)).total_seconds()
+         except ValueError:
+             return None
+ 
+-    def _within_trading_hours(self) -> bool:
+-        local_hour = datetime.now(self.trading_timezone).hour
+-        return self.trading_start_hour <= local_hour < self.trading_end_hour
+-
+     def _entry_count(self, limit_price: int) -> int:
+         if limit_price <= 0:
+             return 0
+@@ -135,6 +153,7 @@ class CobyStrategy(Strategy):
+         request: OrderRequest,
+         result: Order | None,
+         seconds_left: float | None = None,
++        is_live: bool = True,
+     ) -> None:
+         ticker = request.ticker
+         self._pending_action.pop(ticker, None)
+@@ -154,11 +173,7 @@ class CobyStrategy(Strategy):
+ 
+         fill_price = result.outcome_fill_price
+         if fill_price is None:
+-            fill_price = (
+-                request.yes_price
+-                if request.side is Side.YES
+-                else request.no_price
+-            )
++            fill_price = request.yes_price if request.side is Side.YES else request.no_price
+ 
+         if fill_price is None:
+             logger.error(
+@@ -176,15 +191,17 @@ class CobyStrategy(Strategy):
+             self._entry_price_by_ticker[ticker] = fill_price
+             self._filled_count_by_ticker[ticker] = fill_count
+ 
+-            record_entry(
+-                ticker=ticker,
+-                side=request.side.value,
+-                entry_price=fill_price,
+-                count=fill_count,
+-                seconds_left=seconds_left,
+-            )
++            if is_live:
++                record_entry(
++                    ticker=ticker,
++                    side=request.side.value,
++                    entry_price=fill_price,
++                    count=fill_count,
++                    seconds_left=seconds_left,
++                )
+             logger.warning(
+-                "LIVE ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d",
++                "%s ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d",
++                "LIVE" if is_live else "PAPER",
+                 ticker,
+                 request.side.value,
+                 fill_price,
+@@ -198,20 +215,18 @@ class CobyStrategy(Strategy):
+             remaining = max(0, old_count - fill_count)
+ 
+             self._exit_fill_value_by_ticker[ticker] = (
+-                self._exit_fill_value_by_ticker.get(ticker, 0)
+-                + fill_price * fill_count
++                self._exit_fill_value_by_ticker.get(ticker, 0) + fill_price * fill_count
+             )
+             self._exit_fill_count_by_ticker[ticker] = (
+-                self._exit_fill_count_by_ticker.get(ticker, 0)
+-                + fill_count
++                self._exit_fill_count_by_ticker.get(ticker, 0) + fill_count
+             )
+ 
+             if remaining > 0:
+                 self._filled_count_by_ticker[ticker] = remaining
+-                update_open_count(ticker, remaining)
++                if is_live:
++                    update_open_count(ticker, remaining)
+                 logger.warning(
+-                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | fill=%dc | "
+-                    "filled=%d | remaining=%d",
++                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | fill=%dc | filled=%d | remaining=%d",
+                     ticker,
+                     side.value,
+                     fill_price,
+@@ -236,16 +251,17 @@ class CobyStrategy(Strategy):
+             if entry_price is not None:
+                 pnl_cents = (avg_exit - entry_price) * total_exit_count
+                 self._total_pnl_cents += pnl_cents
+-                record_exit(
+-                    ticker=ticker,
+-                    side=side.value,
+-                    entry_price=entry_price,
+-                    exit_price=avg_exit,
+-                    reason=reason,
+-                    count=total_exit_count,
+-                    pnl_cents=pnl_cents,
+-                    total_pnl_cents=self._total_pnl_cents,
+-                )
++                if is_live:
++                    record_exit(
++                        ticker=ticker,
++                        side=side.value,
++                        entry_price=entry_price,
++                        exit_price=avg_exit,
++                        reason=reason,
++                        count=total_exit_count,
++                        pnl_cents=pnl_cents,
++                        total_pnl_cents=self._total_pnl_cents,
++                    )
+             else:
+                 logger.warning(
+                     "LIVE EXIT FILLED BUT ENTRY PRICE UNKNOWN | ticker=%s | "
+@@ -259,13 +275,17 @@ class CobyStrategy(Strategy):
+             self._side_by_ticker.pop(ticker, None)
+ 
+             logger.warning(
+-                "LIVE EXIT FILLED | ticker=%s | side=%s | avg_exit=%dc | "
+-                "count=%d | reason=%s",
++                "%s EXIT FILLED | ticker=%s | side=%s | avg_exit=%dc | "
++                "count=%d | reason=%s | pnl_cents=%s",
++                "LIVE" if is_live else "PAPER",
+                 ticker,
+                 side.value,
+                 avg_exit,
+                 total_exit_count,
+                 reason,
++                (avg_exit - entry_price) * total_exit_count
++                if entry_price is not None
++                else "UNKNOWN",
+             )
+ 
+     def _log_entry_check(
+@@ -291,6 +311,100 @@ class CobyStrategy(Strategy):
+             reason,
+         )
+ 
++    def _btc_analysis(self, ctx: StrategyContext) -> BtcAnalysis | None:
++        target = ctx.market.floor_strike
++        if target is None or not ctx.underlying_ticks:
++            return None
++
++        now = datetime.now(UTC)
++        cutoff = now - timedelta(seconds=self.analysis_seconds)
++        ticks = [tick for tick in ctx.underlying_ticks if tick.timestamp >= cutoff]
++        if not ticks:
++            return None
++
++        latest = ticks[-1]
++        age = (now - latest.timestamp).total_seconds()
++        history_seconds = (latest.timestamp - ticks[0].timestamp).total_seconds()
++
++        # Use one closing price per second for direction/choppiness so bursts of
++        # trades do not dominate those statistics.
++        second_prices: dict[int, float] = {}
++        for tick in ticks:
++            second_prices[int(tick.timestamp.timestamp())] = tick.price
++        prices = list(second_prices.values())
++        if len(prices) < 2:
++            return None
++
++        recent_30 = prices[-30:]
++        recent_range = max(recent_30) - min(recent_30)
++        required_distance = max(
++            self.minimum_distance,
++            self.volatility_multiplier * recent_range,
++        )
++
++        path = fsum(abs(b - a) for a, b in pairwise(prices))
++        efficiency = abs(prices[-1] - prices[0]) / path if path > 0 else 0.0
++
++        window = min(15, max(1, len(prices) // 2))
++        recent_mean = fsum(prices[-window:]) / window
++        prior = prices[-2 * window : -window]
++        prior_mean = fsum(prior) / len(prior) if prior else prices[0]
++        trend_change = recent_mean - prior_mean
++
++        target_crossings = 0
++        previous_sign = prices[0] >= target
++        for price in prices[1:]:
++            current_sign = price >= target
++            if current_sign != previous_sign:
++                target_crossings += 1
++            previous_sign = current_sign
++
++        weighted = [(tick.price, tick.size) for tick in ticks if tick.size > 0]
++        total_size = fsum(size for _, size in weighted)
++        vwap = (
++            fsum(price * size for price, size in weighted) / total_size
++            if total_size > 0
++            else fsum(prices) / len(prices)
++        )
++
++        return BtcAnalysis(
++            price=latest.price,
++            target=float(target),
++            distance=abs(latest.price - float(target)),
++            required_distance=required_distance,
++            vwap=vwap,
++            trend_change=trend_change,
++            efficiency=efficiency,
++            target_crossings=target_crossings,
++            age_seconds=age,
++            history_seconds=history_seconds,
++            source=latest.source,
++        )
++
++    def _btc_rejection(self, analysis: BtcAnalysis, side: Side) -> str | None:
++        direction = 1 if side is Side.YES else -1
++        signed_target_distance = (analysis.price - analysis.target) * direction
++        signed_vwap_distance = (analysis.price - analysis.vwap) * direction
++        signed_trend = analysis.trend_change * direction
++
++        if analysis.age_seconds > self.max_btc_age_seconds:
++            return "BTC_DATA_STALE"
++        if analysis.history_seconds < self.minimum_history_seconds:
++            return "BTC_HISTORY_WARMING_UP"
++        if signed_target_distance <= 0:
++            return "BTC_WRONG_SIDE_OF_TARGET"
++        if analysis.distance < analysis.required_distance:
++            return "BTC_DISTANCE_TOO_SMALL"
++        if analysis.target_crossings > self.max_target_crossings:
++            return "BTC_CHOPPY_TARGET_CROSSINGS"
++        if analysis.efficiency < self.minimum_efficiency:
++            return "BTC_CHOPPY_LOW_EFFICIENCY"
++        if signed_trend < self.minimum_trend_change:
++            return "BTC_TREND_NOT_CONFIRMED"
++        if signed_vwap_distance <= 0:
++            return "BTC_WRONG_SIDE_OF_VWAP"
++        return None
++
+     def on_market_data(self, ctx: StrategyContext) -> list[OrderRequest]:
+         m = ctx.market
+         seconds_left = self._seconds_to_close(m.close_time)
+@@ -392,18 +506,6 @@ class CobyStrategy(Strategy):
+ 
+             return []
+ 
+-        if not self._within_trading_hours():
+-            self._log_entry_check(
+-                ticker=m.ticker,
+-                seconds_left=seconds_left,
+-                yes_bid=m.yes_bid,
+-                yes_ask=m.yes_ask,
+-                no_bid=m.no_bid,
+-                no_ask=m.no_ask,
+-                reason="OUTSIDE_TRADING_HOURS_6AM_7PM_CENTRAL",
+-            )
+-            return []
+-
+         if m.ticker in self._traded_tickers:
+             self._log_entry_check(
+                 ticker=m.ticker,
+@@ -461,6 +563,7 @@ class CobyStrategy(Strategy):
+             side, observed_ask = Side.NO, m.no_ask
+ 
+         if side is None or observed_ask is None:
++            self._qualified_count[m.ticker] = 0
+             self._log_entry_check(
+                 ticker=m.ticker,
+                 seconds_left=seconds_left,
+@@ -472,22 +575,109 @@ class CobyStrategy(Strategy):
+             )
+             return []
+ 
++        selected_bid = m.yes_bid if side is Side.YES else m.no_bid
++        if selected_bid is None or observed_ask - selected_bid > self.max_spread_cents:
++            self._qualified_count[m.ticker] = 0
++            self._log_entry_check(
++                ticker=m.ticker,
++                seconds_left=seconds_left,
++                yes_bid=m.yes_bid,
++                yes_ask=m.yes_ask,
++                no_bid=m.no_bid,
++                no_ask=m.no_ask,
++                reason="SPREAD_TOO_WIDE",
++            )
++            return []
++
+         limit_price = self.entry_max
+         count = self._entry_count(limit_price)
+         if count <= 0:
+             return []
+ 
++        available_at_ask = m.yes_ask_size if side is Side.YES else m.yes_bid_size
++        if available_at_ask is None or available_at_ask < count:
++            self._qualified_count[m.ticker] = 0
++            self._log_entry_check(
++                ticker=m.ticker,
++                seconds_left=seconds_left,
++                yes_bid=m.yes_bid,
++                yes_ask=m.yes_ask,
++                no_bid=m.no_bid,
++                no_ask=m.no_ask,
++                reason="INSUFFICIENT_ENTRY_LIQUIDITY",
++            )
++            return []
++
++        analysis = self._btc_analysis(ctx)
++        if analysis is None:
++            self._qualified_count[m.ticker] = 0
++            self._log_entry_check(
++                ticker=m.ticker,
++                seconds_left=seconds_left,
++                yes_bid=m.yes_bid,
++                yes_ask=m.yes_ask,
++                no_bid=m.no_bid,
++                no_ask=m.no_ask,
++                reason="BTC_DATA_OR_TARGET_MISSING",
++            )
++            return []
++
++        rejection = self._btc_rejection(analysis, side)
++        if rejection is not None:
++            self._qualified_count[m.ticker] = 0
++            logger.info(
++                "BTC FILTER | ticker=%s | side=%s | price=%.2f | target=%.2f | "
++                "distance=%.2f | required=%.2f | vwap=%.2f | trend=%.2f | "
++                "efficiency=%.3f | crossings=%d | age=%.2f | source=%s | reason=%s",
++                m.ticker,
++                side.value,
++                analysis.price,
++                analysis.target,
++                analysis.distance,
++                analysis.required_distance,
++                analysis.vwap,
++                analysis.trend_change,
++                analysis.efficiency,
++                analysis.target_crossings,
++                analysis.age_seconds,
++                analysis.source,
++                rejection,
++            )
++            return []
++
++        confirmations = self._qualified_count.get(m.ticker, 0) + 1
++        self._qualified_count[m.ticker] = confirmations
++        if confirmations < self.required_confirmations:
++            logger.info(
++                "BTC FILTER QUALIFIED | ticker=%s | confirmation=%d/%d | "
++                "price=%.2f | target=%.2f | distance=%.2f | required=%.2f",
++                m.ticker,
++                confirmations,
++                self.required_confirmations,
++                analysis.price,
++                analysis.target,
++                analysis.distance,
++                analysis.required_distance,
++            )
++            return []
++
+         self._pending_action[m.ticker] = Action.BUY
+ 
+         logger.warning(
+-            "LIVE ENTRY SIGNAL | ticker=%s | side=%s | observed_ask=%dc | "
+-            "limit=%dc | count=%d | seconds_left=%.1f",
++            "ENTRY SIGNAL | ticker=%s | side=%s | observed_ask=%dc | "
++            "limit=%dc | count=%d | seconds_left=%.1f | btc=%.2f | "
++            "target=%.2f | distance=%.2f | required=%.2f | source=%s",
+             m.ticker,
+             side.value,
+             observed_ask,
+             limit_price,
+             count,
+             seconds_left,
++            analysis.price,
++            analysis.target,
++            analysis.distance,
++            analysis.required_distance,
++            analysis.source,
+         )
+ 
+         return [
+diff --git a/tests/unit/test_bitcoin_feed.py b/tests/unit/test_bitcoin_feed.py
+new file mode 100644
+index 0000000..6047c82
+--- /dev/null
++++ b/tests/unit/test_bitcoin_feed.py
+@@ -0,0 +1,66 @@
++from __future__ import annotations
++
++from kalshi_bot.data.bitcoin import BitcoinPriceFeed
++
++
++def test_parses_coinbase_advanced_trade_message() -> None:
++    feed = BitcoinPriceFeed("wss://example.invalid")
++    feed._handle_message(
++        {
++            "channel": "market_trades",
++            "events": [
++                {
++                    "type": "update",
++                    "trades": [
++                        {
++                            "trade_id": "1",
++                            "product_id": "BTC-USD",
++                            "price": "69588.25",
++                            "size": "0.125",
++                            "side": "BUY",
++                            "time": "2026-08-20T01:00:00.000Z",
++                        }
++                    ],
++                }
++            ],
++        }
++    )
++
++    ticks = feed.snapshot()
++    assert len(ticks) == 1
++    assert ticks[0].price == 69_588.25
++    assert ticks[0].size == 0.125
++    assert ticks[0].source == "COINBASE_PROXY"
++
++
++def test_aggregates_trades_into_one_volume_weighted_second() -> None:
++    feed = BitcoinPriceFeed("wss://example.invalid")
++    message = {
++        "channel": "market_trades",
++        "events": [
++            {
++                "type": "update",
++                "trades": [
++                    {
++                        "product_id": "BTC-USD",
++                        "price": "100",
++                        "size": "1",
++                        "time": "2026-08-20T01:00:00.100Z",
++                    },
++                    {
++                        "product_id": "BTC-USD",
++                        "price": "110",
++                        "size": "3",
++                        "time": "2026-08-20T01:00:00.900Z",
++                    },
++                ],
++            }
++        ],
++    }
++
++    feed._handle_message(message)
++
++    ticks = feed.snapshot()
++    assert len(ticks) == 1
++    assert ticks[0].price == 107.5
++    assert ticks[0].size == 4.0
+diff --git a/tests/unit/test_coby_strategy.py b/tests/unit/test_coby_strategy.py
+new file mode 100644
+index 0000000..7fbcb58
+--- /dev/null
++++ b/tests/unit/test_coby_strategy.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++
++from kalshi_bot.exchange.models import Action, Market, Position, Side
++from kalshi_bot.strategies.base import StrategyContext, UnderlyingTick
++from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
++
++
++def _close_time(seconds: int = 180) -> str:
++    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
++
++
++def _ctx(prices: list[float], *, target: float = 100.0) -> StrategyContext:
++    now = datetime.now(UTC)
++    start = now - timedelta(seconds=len(prices) - 1)
++    ticks = tuple(
++        UnderlyingTick(
++            price=price,
++            size=1.0,
++            timestamp=start + timedelta(seconds=index),
++            source="TEST",
++        )
++        for index, price in enumerate(prices)
++    )
++    market = Market(
++        ticker="KXBTC15M-TEST",
++        close_time=_close_time(),
++        floor_strike=target,
++        yes_bid=91,
++        yes_ask=92,
++        no_bid=8,
++        no_ask=9,
++        yes_bid_size=1_000,
++        yes_ask_size=1_000,
++    )
++    return StrategyContext(
++        market=market,
++        positions={market.ticker: Position(ticker=market.ticker)},
++        balance=100_000,
++        underlying_ticks=ticks,
++    )
++
++
++def test_requires_three_consecutive_qualified_readings() -> None:
++    strategy = CobyStrategy(
++        minimum_history_seconds=30,
++        required_confirmations=3,
++    )
++    ctx = _ctx([110.0 + index for index in range(61)])
++
++    assert strategy.on_market_data(ctx) == []
++    assert strategy.on_market_data(ctx) == []
++    orders = strategy.on_market_data(ctx)
++
++    assert len(orders) == 1
++    assert orders[0].action is Action.BUY
++    assert orders[0].side is Side.YES
++
++
++def test_choppy_target_crossings_block_entry() -> None:
++    strategy = CobyStrategy(
++        minimum_history_seconds=30,
++        minimum_distance=5,
++        volatility_multiplier=0.1,
++        minimum_efficiency=0.0,
++        minimum_trend_change=-100,
++        required_confirmations=1,
++    )
++    prices = [90.0 if index % 2 == 0 else 110.0 for index in range(61)]
++    prices[-1] = 120.0
++
++    assert strategy.on_market_data(_ctx(prices)) == []
++
++
++def test_exit_does_not_require_btc_feed() -> None:
++    strategy = CobyStrategy()
++    ticker = "KXBTC15M-TEST"
++    strategy._side_by_ticker[ticker] = Side.YES
++    strategy._filled_count_by_ticker[ticker] = 10
++    market = Market(
++        ticker=ticker,
++        close_time=_close_time(),
++        yes_bid=79,
++        yes_ask=80,
++    )
++    ctx = StrategyContext(
++        market=market,
++        positions={ticker: Position(ticker=ticker, position=10)},
++        balance=100_000,
++    )
++
++    orders = strategy.on_market_data(ctx)
++
++    assert len(orders) == 1
++    assert orders[0].action is Action.SELL
++    assert orders[0].yes_price == 1
+diff --git a/tests/unit/test_config.py b/tests/unit/test_config.py
+index 87d6998..45cdf5d 100644
+--- a/tests/unit/test_config.py
++++ b/tests/unit/test_config.py
+@@ -9,12 +9,12 @@ from kalshi_bot.config import Environment, RiskSettings, Settings
+ from kalshi_bot.risk.manager import RiskLimits, RiskManager
+ 
+ 
+-def test_defaults_are_demo_and_dry_run() -> None:
++def test_defaults_are_prod_and_dry_run() -> None:
+     s = Settings(_env_file=None)
+-    assert s.environment is Environment.DEMO
++    assert s.environment is Environment.PROD
+     assert s.dry_run is True
+-    assert s.rest_base_url.startswith("https://demo-api.kalshi.co")
+-    assert s.ws_base_url.startswith("wss://demo-api.kalshi.co")
++    assert s.rest_base_url.startswith("https://api.elections.kalshi.com")
++    assert s.ws_base_url.startswith("wss://external-api-ws.kalshi.com")
+ 
+ 
+ def test_prod_urls() -> None:
+diff --git a/tests/unit/test_engine_paper.py b/tests/unit/test_engine_paper.py
+new file mode 100644
+index 0000000..ad94b3f
+--- /dev/null
++++ b/tests/unit/test_engine_paper.py
+@@ -0,0 +1,54 @@
++from __future__ import annotations
++
++from typing import Any, cast
++
++from kalshi_bot.core.engine import TradingEngine
++from kalshi_bot.exchange.client import KalshiClient
++from kalshi_bot.exchange.models import Action, Market, Side
++from kalshi_bot.risk.manager import RiskManager
++from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
++
++
++async def test_paper_orders_fill_and_update_strategy_state() -> None:
++    strategy = CobyStrategy(max_contracts=2, max_notional_cents=1_000)
++    engine = TradingEngine(
++        client=cast(KalshiClient, cast(Any, None)),
++        strategy=strategy,
++        risk=RiskManager(),
++        dry_run=True,
++    )
++    market = Market(
++        ticker="KXBTC15M-TEST",
++        yes_bid=91,
++        yes_ask=92,
++        no_bid=8,
++        no_ask=9,
++    )
++    buy = strategy._order(
++        ticker=market.ticker,
++        action=Action.BUY,
++        side=Side.YES,
++        price=95,
++        count=2,
++    )
++
++    entry = await engine._submit(buy, 0, market, 180.0)
++
++    assert entry is not None
++    assert entry.outcome_fill_price == 92
++    assert strategy._filled_count_by_ticker[market.ticker] == 2
++
++    market.yes_bid = 79
++    sell = strategy._order(
++        ticker=market.ticker,
++        action=Action.SELL,
++        side=Side.YES,
++        price=1,
++        count=2,
++    )
++
++    exit_fill = await engine._submit(sell, 2, market, 120.0)
++
++    assert exit_fill is not None
++    assert exit_fill.outcome_fill_price == 79
++    assert market.ticker in strategy._closed_tickers
+diff --git a/tests/unit/test_models.py b/tests/unit/test_models.py
+index 71cdd5b..2799426 100644
+--- a/tests/unit/test_models.py
++++ b/tests/unit/test_models.py
+@@ -6,6 +6,7 @@ from kalshi_bot.exchange.models import (
+     Action,
+     Balance,
+     Fill,
++    Market,
+     OrderBook,
+     OrderBookLevel,
+     OrderRequest,
+@@ -64,6 +65,20 @@ def test_balance_dollars() -> None:
+     assert Balance(balance=12_345).balance_dollars == 123.45
+ 
+ 
++def test_market_preserves_btc_target_and_liquidity() -> None:
++    market = Market.model_validate(
++        {
++            "ticker": "KXBTC15M-TEST",
++            "floor_strike": 69_588.09,
++            "yes_bid_size_fp": "7442.90",
++            "yes_ask_size_fp": "6247.70",
++        }
++    )
++    assert market.floor_strike == 69_588.09
++    assert market.yes_bid_size == 7443
++    assert market.yes_ask_size == 6248
++
++
+ def test_portfolio_lookup_and_value() -> None:
+     pf = Portfolio(
+         balance_cents=10_000,
+-- 
+2.51.1
+

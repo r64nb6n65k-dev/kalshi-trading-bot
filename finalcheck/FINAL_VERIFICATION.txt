@@ -1,0 +1,31 @@
+COBY MODEL BOT - TRIPLE CHECK VERIFICATION
+
+Verified after the third review:
+- Full Python compile: PASS
+- Full unit test suite: 65/65 PASS
+- CLI CobyStrategy registration: PASS
+- Coinbase BTC feed integration path: PASS
+- Kalshi model/client/risk tests: PASS
+- Model strategy tests: PASS
+- Required 3-reading persistence: PASS
+- Confirmation sequence resets after ANY failed confidence reading: PASS
+- Target-crossing/chop veto: PASS
+- No hard final-five-minute entry rule: PASS
+- No new entries in final 60 seconds: PASS
+- Default hard trading-hours restriction removed; model may monitor/trade continuously: PASS
+- Dynamic stop: min(79c, entry-13c), floored at 1c: PASS
+- Restart recovery does NOT instantly apply 79c to a sub-79c position when entry metadata is unavailable: PASS
+- Dashboard SQLite connections close cleanly: PASS
+- Dashboard all-time stats remain correct beyond 500 trades: PASS
+- Completed trades retain paper/live mode, entry stop, TP, and seconds-left metadata: PASS
+- Dashboard trades/model CSV exports: PASS
+- 600-trade dashboard aggregate + CSV smoke test: PASS
+
+Important design notes:
+- Direction comes from BTC/reference-model data; Kalshi ask measures edge/value.
+- Entry requires default 72% model confidence, 7c minimum edge, anti-chop/target-distance checks, and 3 consecutive qualified readings.
+- Take-profit default remains 98c.
+- Stop trigger is dynamic and execution can be worse during fast markets.
+- Coinbase BTC-USD remains a proxy for Kalshi's licensed settlement reference. This model is not historically calibrated yet.
+- Dashboard database persists across deploys only when Railway volume or COBY_DASHBOARD_DB points to persistent storage.
+- First deployment should be dry-run/data collection before live risk is increased.
