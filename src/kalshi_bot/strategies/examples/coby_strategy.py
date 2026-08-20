@@ -36,6 +36,7 @@ class CobyStrategy(Strategy):
         )
         self.required_confirmations = int(params.get("required_confirmations", 3))
         self.minimum_distance = float(params.get("minimum_distance", 15.0))
+        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 30.0))
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
@@ -68,6 +69,11 @@ class CobyStrategy(Strategy):
 
         self._traded_tickers: set[str] = set()
         self._closed_tickers: set[str] = set()
+
+        # If this market ever triggers CHOPPY_TARGET_CROSSINGS, it is
+        # disqualified from entry for the rest of that 15-minute ticker.
+        self._chop_disqualified_tickers: set[str] = set()
+
         self._side_by_ticker: dict[str, Side] = {}
         self._entry_price_by_ticker: dict[str, int] = {}
         self._filled_count_by_ticker: dict[str, int] = {}
@@ -377,6 +383,18 @@ class CobyStrategy(Strategy):
             )
             return []
 
+        if m.ticker in self._chop_disqualified_tickers:
+            self._log_entry_check(
+                ticker=m.ticker,
+                seconds_left=seconds_left,
+                yes_bid=m.yes_bid,
+                yes_ask=m.yes_ask,
+                no_bid=m.no_bid,
+                no_ask=m.no_ask,
+                reason="SKIP_MARKET_CHOP_DETECTED",
+            )
+            return []
+
         if self._pending_action.get(m.ticker) is Action.BUY:
             return []
 
@@ -474,6 +492,26 @@ class CobyStrategy(Strategy):
             volatility=vol,
         )
 
+        # If BTC crosses the target line two or more times, permanently
+        # disqualify this 15-minute market. This check is active even during
+        # the first five-minute observation period, so obvious chop is rejected
+        # before the entry window opens.
+        if crossings >= 2:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            self._chop_disqualified_tickers.add(m.ticker)
+            record_model_snapshot(
+                **common,
+                decision="SKIP_MARKET",
+                reason="SKIP_MARKET_2_PLUS_TARGET_CROSSINGS",
+            )
+            logger.warning(
+                "MODEL MARKET SKIP | ticker=%s | reason=2_PLUS_TARGET_CROSSINGS | crossings=%d",
+                m.ticker,
+                crossings,
+            )
+            return []
+
         # Observation-only period: no entries before 10:00 remaining.
         if seconds_left > self.entry_window_seconds:
             self._confirmation_count_by_ticker[m.ticker] = 0
@@ -485,14 +523,21 @@ class CobyStrategy(Strategy):
             )
             return []
 
+        # HARD ENTRY RULE: BTC must be at least $30 away from the target.
+        # This is an absolute minimum and cannot be relaxed by volatility logic.
+        if abs(separation) < self.hard_minimum_separation:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason="HARD_MINIMUM_SEPARATION_UNDER_30",
+            )
+            return []
+
         if abs(separation) < dynamic_distance:
             self._confirmation_count_by_ticker[m.ticker] = 0
             record_model_snapshot(**common, decision="WAIT", reason="TOO_CLOSE_TO_TARGET")
-            return []
-
-        if crossings > self.maximum_target_crossings:
-            self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="CHOPPY_TARGET_CROSSINGS")
             return []
 
         if efficiency < self.minimum_efficiency:
