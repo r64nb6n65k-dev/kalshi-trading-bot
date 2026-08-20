@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
+import statistics
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from kalshi_bot.dashboard import record_entry, record_exit, update_open_count
+from kalshi_bot.dashboard import get_open_position, record_entry, record_exit, record_model_snapshot, update_open_count
 from kalshi_bot.exchange.models import (
     Action,
     Order,
@@ -27,15 +29,26 @@ class CobyStrategy(Strategy):
     def __init__(self, **params: Any) -> None:
         super().__init__(**params)
 
-        self.entry_min = int(params.get("entry_min", 90))
-        self.entry_max = int(params.get("entry_max", 95))
+        self.min_confidence = float(params.get("min_confidence", 0.72))
+        self.min_edge_cents = float(params.get("min_edge_cents", 7.0))
+        self.min_history_seconds = float(
+            params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
+        )
+        self.required_confirmations = int(params.get("required_confirmations", 3))
+        self.minimum_distance = float(params.get("minimum_distance", 15.0))
+        self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
+        self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
+        self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
+        self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
+        self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
         self.take_profit = int(params.get("take_profit", 98))
-        self.stop_price = int(params.get("stop_price", 79))
-        self.entry_window_seconds = int(params.get("entry_window_seconds", 300))
+        self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
+        self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
         self.max_contracts = int(params.get("max_contracts", 200))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
+        self.use_trading_hours = bool(params.get("use_trading_hours", False))
         self.trading_timezone = ZoneInfo(
             str(params.get("trading_timezone", "America/Chicago"))
         )
@@ -58,6 +71,8 @@ class CobyStrategy(Strategy):
         self._exit_fill_value_by_ticker: dict[str, int] = {}
         self._exit_fill_count_by_ticker: dict[str, int] = {}
         self._total_pnl_cents = 0
+        self._confirmation_side_by_ticker: dict[str, Side] = {}
+        self._confirmation_count_by_ticker: dict[str, int] = {}
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
@@ -71,6 +86,8 @@ class CobyStrategy(Strategy):
             return None
 
     def _within_trading_hours(self) -> bool:
+        if not self.use_trading_hours:
+            return True
         local_hour = datetime.now(self.trading_timezone).hour
         return self.trading_start_hour <= local_hour < self.trading_end_hour
 
@@ -122,6 +139,9 @@ class CobyStrategy(Strategy):
             return None
         self._side_by_ticker[ticker] = side
         self._filled_count_by_ticker[ticker] = abs(int(ctx_position))
+        saved = get_open_position(ticker)
+        if saved is not None and saved.get("entry_price") is not None:
+            self._entry_price_by_ticker[ticker] = int(saved["entry_price"])
         logger.warning(
             "LIVE POSITION RECOVERED | ticker=%s | side=%s | count=%d",
             ticker,
@@ -183,6 +203,9 @@ class CobyStrategy(Strategy):
                 entry_price=fill_price,
                 count=fill_count,
                 seconds_left=seconds_left,
+                stop_price=max(1, min(self.legacy_stop_cap, fill_price - self.dynamic_stop_gap)),
+                take_profit=self.take_profit,
+                execution_mode="live" if is_live else "paper",
             )
             logger.warning(
                 "LIVE ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d",
@@ -369,12 +392,22 @@ class CobyStrategy(Strategy):
                     )
                 ]
 
-            if bid <= self.stop_price:
+            entry_price = self._entry_price_by_ticker.get(m.ticker)
+            # If a live position is recovered after a container restart and the
+            # persistent dashboard record is unavailable, never fall back to a
+            # hard 79c stop that could instantly kill a legitimate sub-79c entry.
+            # Anchor a temporary stop to the current executable bid instead.
+            dynamic_stop = (
+                max(1, min(self.legacy_stop_cap, entry_price - self.dynamic_stop_gap))
+                if entry_price is not None
+                else max(1, int(bid) - self.dynamic_stop_gap)
+            )
+            if bid <= dynamic_stop:
                 self._pending_action[m.ticker] = Action.SELL
-                self._exit_reason[m.ticker] = "STOP"
+                self._exit_reason[m.ticker] = "DYNAMIC_STOP"
                 logger.warning(
                     "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%dc | "
-                    "limit=%dc | reason=STOP | count=%d",
+                    "limit=%dc | reason=DYNAMIC_STOP | count=%d",
                     m.ticker,
                     side.value,
                     bid,
@@ -441,62 +474,106 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        if seconds_left > self.entry_window_seconds:
-            self._log_entry_check(
-                ticker=m.ticker,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-                reason="TOO_EARLY",
-            )
+        ticks = ctx.underlying_ticks
+        if not ticks:
+            self._log_entry_check(ticker=m.ticker, seconds_left=seconds_left, yes_bid=m.yes_bid, yes_ask=m.yes_ask, no_bid=m.no_bid, no_ask=m.no_ask, reason="NO_BTC_DATA")
             return []
-
-        side: Side | None = None
-        observed_ask: int | None = None
-
-        if m.yes_ask is not None and self.entry_min <= m.yes_ask <= self.entry_max:
-            side, observed_ask = Side.YES, m.yes_ask
-        elif m.no_ask is not None and self.entry_min <= m.no_ask <= self.entry_max:
-            side, observed_ask = Side.NO, m.no_ask
-
-        if side is None or observed_ask is None:
-            self._log_entry_check(
-                ticker=m.ticker,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
-                reason="ASK_NOT_IN_90_95",
-            )
+        latest = ticks[-1]
+        age = (datetime.now(timezone.utc) - latest.timestamp).total_seconds()
+        if age > self.max_btc_age_seconds or m.floor_strike is None:
+            self._log_entry_check(ticker=m.ticker, seconds_left=seconds_left, yes_bid=m.yes_bid, yes_ask=m.yes_ask, no_bid=m.no_bid, no_ask=m.no_ask, reason="BTC_STALE_OR_NO_TARGET")
             return []
-
-        limit_price = self.entry_max
-        count = self._entry_count(limit_price)
-        if count <= 0:
+        history = (latest.timestamp - ticks[0].timestamp).total_seconds()
+        if history < self.min_history_seconds:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             return []
-
-        self._pending_action[m.ticker] = Action.BUY
-
-        logger.warning(
-            "LIVE ENTRY SIGNAL | ticker=%s | side=%s | observed_ask=%dc | "
-            "limit=%dc | count=%d | seconds_left=%.1f",
-            m.ticker,
-            side.value,
-            observed_ask,
-            limit_price,
-            count,
-            seconds_left,
+        def old_price(sec: float) -> float:
+            cutoff = latest.timestamp.timestamp() - sec
+            for tick in reversed(ticks):
+                if tick.timestamp.timestamp() <= cutoff:
+                    return tick.price
+            return ticks[0].price
+        mom15 = latest.price - old_price(15)
+        mom60 = latest.price - old_price(60)
+        recent = [x.price for x in ticks if (latest.timestamp-x.timestamp).total_seconds() <= 60]
+        diffs = [recent[i]-recent[i-1] for i in range(1, len(recent))]
+        vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
+        drift = 0.65*mom15/15.0 + 0.35*mom60/60.0
+        projected = latest.price + drift*min(seconds_left,300)*0.35
+        sigma = max(5.0, max(vol,0.35)*math.sqrt(max(seconds_left,1)))
+        z = (projected-float(m.floor_strike))/sigma
+        model_yes = max(0.01,min(0.99,0.5*(1+math.erf(z/math.sqrt(2)))))
+        model_no = 1-model_yes
+        target = float(m.floor_strike)
+        separation = latest.price - target
+        recent_ticks = [x for x in ticks if (latest.timestamp - x.timestamp).total_seconds() <= 60]
+        path = [x.price for x in recent_ticks]
+        travel = sum(abs(path[i] - path[i - 1]) for i in range(1, len(path)))
+        efficiency = abs(path[-1] - path[0]) / travel if travel > 0 and len(path) > 1 else 1.0
+        crossings = 0
+        for i in range(1, len(path)):
+            a, b = path[i - 1] - target, path[i] - target
+            if a == 0 or b == 0 or (a < 0 < b) or (b < 0 < a):
+                crossings += 1
+        dynamic_distance = max(
+            self.minimum_distance,
+            self.volatility_multiplier * max(vol, 0.35) * math.sqrt(max(1.0, min(seconds_left, 60.0))),
         )
+        common = dict(ticker=m.ticker, seconds_left=seconds_left, btc_price=latest.price, target_price=target, separation=separation, yes_bid=m.yes_bid, yes_ask=m.yes_ask, no_bid=m.no_bid, no_ask=m.no_ask, model_yes=model_yes*100, model_no=model_no*100, edge_yes=None if m.yes_ask is None else model_yes*100-m.yes_ask, edge_no=None if m.no_ask is None else model_no*100-m.no_ask, momentum_15=mom15, momentum_60=mom60, volatility=vol)
+        if abs(separation) < dynamic_distance:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="TOO_CLOSE_TO_TARGET"); return []
+        if crossings > self.maximum_target_crossings:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="CHOPPY_TARGET_CROSSINGS"); return []
+        if efficiency < self.minimum_efficiency:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="LOW_DIRECTIONAL_EFFICIENCY"); return []
+        choices=[]
+        if m.yes_ask is not None: choices.append((model_yes*100-m.yes_ask, model_yes, Side.YES, m.yes_ask))
+        if m.no_ask is not None: choices.append((model_no*100-m.no_ask, model_no, Side.NO, m.no_ask))
+        if not choices:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(**common, decision="WAIT", reason="NO_EXECUTABLE_ASK"); return []
+        edge, confidence, side, observed_ask = max(choices, key=lambda x:x[0])
+        if confidence < self.min_confidence:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_CONFIDENCE_LOW"); return []
+        if edge < self.min_edge_cents:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="EDGE_TOO_SMALL"); return []
+        if side is Side.YES and separation <= 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT"); return []
+        if side is Side.NO and separation >= 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT"); return []
+        trend_change = mom15 - (mom60 / 4.0)
+        if side is Side.YES and trend_change < self.minimum_trend_change and mom15 < 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING"); return []
+        if side is Side.NO and -trend_change < self.minimum_trend_change and mom15 > 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING"); return []
 
-        return [
-            self._order(
-                ticker=m.ticker,
-                action=Action.BUY,
-                side=side,
-                price=limit_price,
-                count=count,
+        previous_side = self._confirmation_side_by_ticker.get(m.ticker)
+        confirmations = self._confirmation_count_by_ticker.get(m.ticker, 0)
+        confirmations = confirmations + 1 if previous_side is side else 1
+        self._confirmation_side_by_ticker[m.ticker] = side
+        self._confirmation_count_by_ticker[m.ticker] = confirmations
+        if confirmations < self.required_confirmations:
+            record_model_snapshot(
+                **common, decision="WAIT",
+                reason=f"CONFIRMING_{confirmations}_OF_{self.required_confirmations}",
             )
-        ]
+            return []
+
+        count = self._entry_count(observed_ask)
+        if count <= 0: return []
+        self._pending_action[m.ticker] = Action.BUY
+        record_model_snapshot(**common, decision="BUY_"+side.value.upper(), reason="MODEL_EDGE_CONFIRMED")
+        logger.warning("MODEL ENTRY | ticker=%s | side=%s | ask=%dc | confidence=%.1f%% | edge=%.1fc | confirmations=%d | seconds_left=%.1f", m.ticker, side.value, observed_ask, confidence*100, edge, confirmations, seconds_left)
+        return [self._order(ticker=m.ticker, action=Action.BUY, side=side, price=observed_ask, count=count)]
