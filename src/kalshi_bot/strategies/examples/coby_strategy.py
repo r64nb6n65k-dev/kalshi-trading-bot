@@ -135,6 +135,7 @@ class CobyStrategy(Strategy):
         request: OrderRequest,
         result: Order | None,
         seconds_left: float | None = None,
+        is_live: bool | None = None,
     ) -> None:
         ticker = request.ticker
         self._pending_action.pop(ticker, None)
