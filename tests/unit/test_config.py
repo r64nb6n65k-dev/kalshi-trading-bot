@@ -9,12 +9,12 @@ from kalshi_bot.config import Environment, RiskSettings, Settings
 from kalshi_bot.risk.manager import RiskLimits, RiskManager
 
 
-def test_defaults_are_demo_and_dry_run() -> None:
+def test_defaults_are_prod_and_dry_run() -> None:
     s = Settings(_env_file=None)
-    assert s.environment is Environment.DEMO
+    assert s.environment is Environment.PROD
     assert s.dry_run is True
-    assert s.rest_base_url.startswith("https://demo-api.kalshi.co")
-    assert s.ws_base_url.startswith("wss://demo-api.kalshi.co")
+    assert s.rest_base_url.startswith("https://api.elections.kalshi.com")
+    assert s.ws_base_url.startswith("wss://external-api-ws.kalshi.com")
 
 
 def test_prod_urls() -> None:

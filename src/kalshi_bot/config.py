@@ -73,9 +73,22 @@ class Settings(BaseSettings):
     )
 
     poll_interval: float = Field(
-        default=2.0,
+        default=1.0,
         gt=0.0,
         description="Seconds between market polls in the live engine.",
+    )
+
+    btc_ws_url: str = Field(
+        default="wss://advanced-trade-ws.coinbase.com",
+        description="Public BTC/USD WebSocket used as a BRTI proxy.",
+    )
+
+    btc_product_id: str = Field(default="BTC-USD")
+
+    btc_max_age_seconds: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Reject entries when the BTC stream is older than this.",
     )
 
     risk: RiskSettings = Field(default_factory=RiskSettings)

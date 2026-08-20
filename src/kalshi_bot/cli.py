@@ -20,16 +20,16 @@ from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
+from kalshi_bot.data.bitcoin import BitcoinPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.strategies.base import Strategy
-from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
 from kalshi_bot.strategies.examples.arbitrage import ArbitrageYesNo
+from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
 from kalshi_bot.strategies.examples.fair_value import FairValue
 from kalshi_bot.strategies.examples.market_maker import MarketMaker
 from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
 from kalshi_bot.strategies.examples.momentum import Momentum
-
 
 app = typer.Typer(
     add_completion=False,
@@ -51,9 +51,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(
-        f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech"
-    )
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech")
 
 
 @app.command()
@@ -101,9 +99,7 @@ def backtest(
     """Backtest a strategy on synthetic data and print a metrics report."""
     if strategy not in STRATEGIES:
         choices = ", ".join(STRATEGIES)
-        console.print(
-            f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]"
-        )
+        console.print(f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]")
         raise typer.Exit(code=1)
 
     snapshots = random_walk_snapshots(n=ticks, seed=seed)
@@ -138,9 +134,7 @@ def markets(
                 limit=limit,
             )
 
-            table = Table(
-                title=f"Kalshi markets ({settings.environment.value})"
-            )
+            table = Table(title=f"Kalshi markets ({settings.environment.value})")
             table.add_column("Ticker", style="cyan")
             table.add_column("Title")
             table.add_column("Yes Bid", justify="right")
@@ -168,17 +162,12 @@ def balance() -> None:
 
         async with KalshiClient.from_settings(settings) as client:
             if not client.authenticated:
-                console.print(
-                    "[red]No credentials configured. "
-                    "Set KALSHI_API_KEY_ID.[/]"
-                )
+                console.print("[red]No credentials configured. Set KALSHI_API_KEY_ID.[/]")
                 raise typer.Exit(code=1)
 
             bal = await client.get_balance()
 
-            console.print(
-                f"Balance: [bold green]${bal.balance / 100:,.2f}[/]"
-            )
+            console.print(f"Balance: [bold green]${bal.balance / 100:,.2f}[/]")
 
     asyncio.run(_run())
 
@@ -194,8 +183,8 @@ def run(
         help="Market ticker or series ticker to trade.",
     ),
     ticks: int = typer.Option(
-        5,
-        help="Number of poll cycles before stopping.",
+        0,
+        help="Number of poll cycles before stopping (0 runs continuously).",
     ),
     live: bool = typer.Option(
         False,
@@ -206,9 +195,7 @@ def run(
     """Run a strategy live or in dry-run mode."""
     if strategy not in STRATEGIES:
         choices = ", ".join(STRATEGIES)
-        console.print(
-            f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]"
-        )
+        console.print(f"[red]Unknown strategy '{strategy}'. Choose from: {choices}[/]")
         raise typer.Exit(code=1)
 
     # Keep the web dashboard running in the same Railway process.
@@ -221,17 +208,26 @@ def run(
         dry_run = not live
 
         async with KalshiClient.from_settings(settings) as client:
+            bitcoin_feed = None
+            strategy_params = {}
+            if strategy == "coby_strategy":
+                bitcoin_feed = BitcoinPriceFeed(
+                    ws_url=settings.btc_ws_url,
+                    product_id=settings.btc_product_id,
+                )
+                strategy_params["max_btc_age_seconds"] = settings.btc_max_age_seconds
             engine = TradingEngine(
                 client=client,
-                strategy=STRATEGIES[strategy](),
+                strategy=STRATEGIES[strategy](**strategy_params),
                 risk=RiskManager.from_settings(settings.risk),
                 dry_run=dry_run,
                 poll_interval=settings.poll_interval,
+                bitcoin_feed=bitcoin_feed,
             )
 
             await engine.run(
                 ticker,
-                max_ticks=ticks,
+                max_ticks=None if ticks == 0 else ticks,
             )
 
     asyncio.run(_run())

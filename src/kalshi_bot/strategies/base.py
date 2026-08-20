@@ -10,18 +10,37 @@ Part of the Kalshi Trading Bot by Viprasol Tech Private Limited.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from kalshi_bot.exchange.models import Market, OrderRequest, Position
 
 
+@dataclass(frozen=True)
+class UnderlyingTick:
+    """One trade from the external BTC reference feed."""
+
+    price: float
+    size: float
+    timestamp: datetime
+    source: str
+
+
 class StrategyContext:
     """Read-only snapshot passed to a strategy on each tick."""
 
-    def __init__(self, market: Market, positions: dict[str, Position], balance: int) -> None:
+    def __init__(
+        self,
+        market: Market,
+        positions: dict[str, Position],
+        balance: int,
+        underlying_ticks: tuple[UnderlyingTick, ...] = (),
+    ) -> None:
         self.market = market
         self.positions = positions
         self.balance = balance
+        self.underlying_ticks = underlying_ticks
 
     def position_for(self, ticker: str) -> int:
         """Net contract position for ``ticker`` (0 if none)."""

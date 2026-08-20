@@ -6,6 +6,7 @@ from kalshi_bot.exchange.models import (
     Action,
     Balance,
     Fill,
+    Market,
     OrderBook,
     OrderBookLevel,
     OrderRequest,
@@ -62,6 +63,20 @@ def test_orderbook_empty_sides() -> None:
 
 def test_balance_dollars() -> None:
     assert Balance(balance=12_345).balance_dollars == 123.45
+
+
+def test_market_preserves_btc_target_and_liquidity() -> None:
+    market = Market.model_validate(
+        {
+            "ticker": "KXBTC15M-TEST",
+            "floor_strike": 69_588.09,
+            "yes_bid_size_fp": "7442.90",
+            "yes_ask_size_fp": "6247.70",
+        }
+    )
+    assert market.floor_strike == 69_588.09
+    assert market.yes_bid_size == 7443
+    assert market.yes_ask_size == 6248
 
 
 def test_portfolio_lookup_and_value() -> None:

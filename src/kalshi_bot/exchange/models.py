@@ -7,7 +7,7 @@ fixed-point and dollar fields into those legacy fields.
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Any
 
@@ -70,6 +70,10 @@ class Market(BaseModel):
     volume: int | None = None
     open_interest: int | None = None
     close_time: str | None = None
+    floor_strike: float | None = None
+    rules_primary: str | None = None
+    yes_bid_size: int | None = None
+    yes_ask_size: int | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -97,6 +101,12 @@ class Market(BaseModel):
 
         if d.get("open_interest") is None and d.get("open_interest_fp") is not None:
             d["open_interest"] = _fp_to_int(d["open_interest_fp"])
+
+        if d.get("yes_bid_size") is None and d.get("yes_bid_size_fp") is not None:
+            d["yes_bid_size"] = _fp_to_int(d["yes_bid_size_fp"])
+
+        if d.get("yes_ask_size") is None and d.get("yes_ask_size_fp") is not None:
+            d["yes_ask_size"] = _fp_to_int(d["yes_ask_size_fp"])
 
         return d
 
