@@ -39,8 +39,12 @@ class CobyStrategy(Strategy):
         self.hard_minimum_separation = float(params.get("hard_minimum_separation", 30.0))
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
-        self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 60.0))
-        self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 120.0))
+
+        # Ignore ALL target crossings during the first 3 minutes.
+        # Crossing count begins from zero after 3 minutes have elapsed.
+        self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 180.0))
+        self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 180.0))
+
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
         self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
         self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
@@ -429,7 +433,7 @@ class CobyStrategy(Strategy):
             self._log_entry_check(
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
-                no_bid=m.no_bid, no_ask=m.no_ask,
+                no_bid=m.no_ask, no_ask=m.no_ask,
                 reason="BTC_STALE_OR_NO_TARGET",
             )
             return []
@@ -467,10 +471,12 @@ class CobyStrategy(Strategy):
         efficiency = abs(path[-1] - path[0]) / travel if travel > 0 and len(path) > 1 else 1.0
 
         # Target-crossing logic:
-        # 0-60s elapsed: ignore/reset crossings.
-        # 60s+ elapsed: count only genuine above<->below sign changes.
+        # 0-180s elapsed: completely ignore/reset crossings.
+        # At 180s elapsed: establish the current side as the baseline.
+        # The baseline itself does NOT count as a crossing.
+        # After 180s: count only genuine above<->below sign changes.
         # Touching the target exactly does not count.
-        # 120s+ elapsed: two counted crossings permanently skip the market.
+        # Two counted crossings after the first 3 minutes permanently skip the market.
         elapsed_seconds = max(0.0, 900.0 - seconds_left)
 
         if elapsed_seconds < self.crossing_ignore_seconds:
@@ -486,8 +492,12 @@ class CobyStrategy(Strategy):
 
             if current_target_side != 0:
                 previous_target_side = self._last_target_side_by_ticker.get(m.ticker)
+
                 if previous_target_side is None:
+                    # First valid reading after the 3-minute mark.
+                    # Establish the baseline only. Do not count a crossing.
                     self._last_target_side_by_ticker[m.ticker] = current_target_side
+
                 elif current_target_side != previous_target_side:
                     self._crossing_count_by_ticker[m.ticker] = (
                         self._crossing_count_by_ticker.get(m.ticker, 0) + 1
@@ -522,8 +532,8 @@ class CobyStrategy(Strategy):
             volatility=vol,
         )
 
-        # Crossings counted from 60-120 seconds are remembered, but the
-        # permanent skip cannot fire until two full minutes have elapsed.
+        # Only crossings AFTER the first 3 minutes count.
+        # Once two post-3-minute crossings occur, permanently skip the ticker.
         if (
             elapsed_seconds >= self.crossing_skip_enable_seconds
             and crossings >= self.maximum_target_crossings
