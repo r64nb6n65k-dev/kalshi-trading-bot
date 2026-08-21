@@ -36,8 +36,11 @@ class CobyStrategy(Strategy):
         )
         self.required_confirmations = int(params.get("required_confirmations", 3))
         self.minimum_distance = float(params.get("minimum_distance", 15.0))
+        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 30.0))
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
+        self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 60.0))
+        self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 120.0))
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
         self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
         self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
@@ -48,6 +51,15 @@ class CobyStrategy(Strategy):
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
+        # NEW ENTRY RULES
+        # Observe the first 5 minutes, then allow entries from 10:00 remaining
+        # down to the final 60-second no-entry window.
+        self.entry_window_seconds = int(params.get("entry_window_seconds", 600))
+
+        # Only allow an entry when the chosen YES/NO contract ask is 70c or higher.
+        # No additional maximum entry-price cap is imposed here.
+        self.min_entry_price = int(params.get("min_entry_price", 70))
+
         self.use_trading_hours = bool(params.get("use_trading_hours", False))
         self.trading_timezone = ZoneInfo(
             str(params.get("trading_timezone", "America/Chicago"))
@@ -55,13 +67,19 @@ class CobyStrategy(Strategy):
         self.trading_start_hour = int(params.get("trading_start_hour", 6))
         self.trading_end_hour = int(params.get("trading_end_hour", 19))
 
-        # For a triggered stop or final-minute exit, use an aggressively
-        # marketable limit. Kalshi's V2 order API is limit-order based; 1c
-        # prioritizes getting out. Neither trigger guarantees a fill.
         self.stop_exit_floor = int(params.get("stop_exit_floor", 1))
 
         self._traded_tickers: set[str] = set()
         self._closed_tickers: set[str] = set()
+
+        # If this market ever triggers CHOPPY_TARGET_CROSSINGS, it is
+        # disqualified from entry for the rest of that 15-minute ticker.
+        self._chop_disqualified_tickers: set[str] = set()
+
+        # Target-crossing state is tracked per 15-minute ticker.
+        self._crossing_count_by_ticker: dict[str, int] = {}
+        self._last_target_side_by_ticker: dict[str, int] = {}
+
         self._side_by_ticker: dict[str, Side] = {}
         self._entry_price_by_ticker: dict[str, int] = {}
         self._filled_count_by_ticker: dict[str, int] = {}
@@ -94,20 +112,9 @@ class CobyStrategy(Strategy):
     def _entry_count(self, limit_price: int) -> int:
         if limit_price <= 0:
             return 0
-        return max(
-            0,
-            min(self.max_contracts, self.max_notional_cents // limit_price),
-        )
+        return max(0, min(self.max_contracts, self.max_notional_cents // limit_price))
 
-    def _order(
-        self,
-        *,
-        ticker: str,
-        action: Action,
-        side: Side,
-        price: int,
-        count: int,
-    ) -> OrderRequest:
+    def _order(self, *, ticker: str, action: Action, side: Side, price: int, count: int) -> OrderRequest:
         kwargs: dict[str, Any] = {
             "ticker": ticker,
             "action": action,
@@ -175,11 +182,7 @@ class CobyStrategy(Strategy):
 
         fill_price = result.outcome_fill_price
         if fill_price is None:
-            fill_price = (
-                request.yes_price
-                if request.side is Side.YES
-                else request.no_price
-            )
+            fill_price = request.yes_price if request.side is Side.YES else request.no_price
 
         if fill_price is None:
             logger.error(
@@ -222,25 +225,18 @@ class CobyStrategy(Strategy):
             remaining = max(0, old_count - fill_count)
 
             self._exit_fill_value_by_ticker[ticker] = (
-                self._exit_fill_value_by_ticker.get(ticker, 0)
-                + fill_price * fill_count
+                self._exit_fill_value_by_ticker.get(ticker, 0) + fill_price * fill_count
             )
             self._exit_fill_count_by_ticker[ticker] = (
-                self._exit_fill_count_by_ticker.get(ticker, 0)
-                + fill_count
+                self._exit_fill_count_by_ticker.get(ticker, 0) + fill_count
             )
 
             if remaining > 0:
                 self._filled_count_by_ticker[ticker] = remaining
                 update_open_count(ticker, remaining)
                 logger.warning(
-                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | fill=%dc | "
-                    "filled=%d | remaining=%d",
-                    ticker,
-                    side.value,
-                    fill_price,
-                    fill_count,
-                    remaining,
+                    "LIVE EXIT PARTIAL | ticker=%s | side=%s | fill=%dc | filled=%d | remaining=%d",
+                    ticker, side.value, fill_price, fill_count, remaining,
                 )
                 return
 
@@ -252,10 +248,7 @@ class CobyStrategy(Strategy):
             total_exit_count = self._exit_fill_count_by_ticker.pop(ticker, 0)
             total_exit_value = self._exit_fill_value_by_ticker.pop(ticker, 0)
 
-            if total_exit_count > 0:
-                avg_exit = round(total_exit_value / total_exit_count)
-            else:
-                avg_exit = fill_price
+            avg_exit = round(total_exit_value / total_exit_count) if total_exit_count > 0 else fill_price
 
             if entry_price is not None:
                 pnl_cents = (avg_exit - entry_price) * total_exit_count
@@ -272,24 +265,15 @@ class CobyStrategy(Strategy):
                 )
             else:
                 logger.warning(
-                    "LIVE EXIT FILLED BUT ENTRY PRICE UNKNOWN | ticker=%s | "
-                    "side=%s | exit=%dc | count=%d",
-                    ticker,
-                    side.value,
-                    avg_exit,
-                    total_exit_count,
+                    "LIVE EXIT FILLED BUT ENTRY PRICE UNKNOWN | ticker=%s | side=%s | exit=%dc | count=%d",
+                    ticker, side.value, avg_exit, total_exit_count,
                 )
 
             self._side_by_ticker.pop(ticker, None)
 
             logger.warning(
-                "LIVE EXIT FILLED | ticker=%s | side=%s | avg_exit=%dc | "
-                "count=%d | reason=%s",
-                ticker,
-                side.value,
-                avg_exit,
-                total_exit_count,
-                reason,
+                "LIVE EXIT FILLED | ticker=%s | side=%s | avg_exit=%dc | count=%d | reason=%s",
+                ticker, side.value, avg_exit, total_exit_count, reason,
             )
 
     def _log_entry_check(
@@ -304,15 +288,10 @@ class CobyStrategy(Strategy):
         reason: str,
     ) -> None:
         logger.info(
-            "ENTRY CHECK | ticker=%s | seconds_left=%s | yes_bid=%s | "
-            "yes_ask=%s | no_bid=%s | no_ask=%s | reason=%s",
+            "ENTRY CHECK | ticker=%s | seconds_left=%s | yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s | reason=%s",
             ticker,
             "None" if seconds_left is None else f"{seconds_left:.1f}",
-            yes_bid,
-            yes_ask,
-            no_bid,
-            no_ask,
-            reason,
+            yes_bid, yes_ask, no_bid, no_ask, reason,
         )
 
     def on_market_data(self, ctx: StrategyContext) -> list[OrderRequest]:
@@ -333,8 +312,7 @@ class CobyStrategy(Strategy):
             if side is None:
                 logger.error(
                     "LIVE EXIT BLOCKED | ticker=%s | count=%d | reason=UNKNOWN_SIDE",
-                    m.ticker,
-                    count,
+                    m.ticker, count,
                 )
                 return []
 
@@ -346,17 +324,6 @@ class CobyStrategy(Strategy):
             if seconds_left <= self.final_exit_seconds:
                 self._pending_action[m.ticker] = Action.SELL
                 self._exit_reason[m.ticker] = "FINAL_60_SECOND_EXIT"
-                logger.warning(
-                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%s | "
-                    "limit=%dc | seconds_left=%.1f | "
-                    "reason=FINAL_60_SECOND_EXIT | count=%d",
-                    m.ticker,
-                    side.value,
-                    bid,
-                    self.stop_exit_floor,
-                    seconds_left,
-                    count,
-                )
                 return [
                     self._order(
                         ticker=m.ticker,
@@ -373,15 +340,6 @@ class CobyStrategy(Strategy):
             if bid >= self.take_profit:
                 self._pending_action[m.ticker] = Action.SELL
                 self._exit_reason[m.ticker] = "TAKE_PROFIT"
-                logger.warning(
-                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%dc | "
-                    "limit=%dc | reason=TAKE_PROFIT | count=%d",
-                    m.ticker,
-                    side.value,
-                    bid,
-                    self.take_profit,
-                    count,
-                )
                 return [
                     self._order(
                         ticker=m.ticker,
@@ -393,10 +351,6 @@ class CobyStrategy(Strategy):
                 ]
 
             entry_price = self._entry_price_by_ticker.get(m.ticker)
-            # If a live position is recovered after a container restart and the
-            # persistent dashboard record is unavailable, never fall back to a
-            # hard 79c stop that could instantly kill a legitimate sub-79c entry.
-            # Anchor a temporary stop to the current executable bid instead.
             dynamic_stop = (
                 max(1, min(self.legacy_stop_cap, entry_price - self.dynamic_stop_gap))
                 if entry_price is not None
@@ -405,15 +359,6 @@ class CobyStrategy(Strategy):
             if bid <= dynamic_stop:
                 self._pending_action[m.ticker] = Action.SELL
                 self._exit_reason[m.ticker] = "DYNAMIC_STOP"
-                logger.warning(
-                    "LIVE EXIT SIGNAL | ticker=%s | side=%s | bid=%dc | "
-                    "limit=%dc | reason=DYNAMIC_STOP | count=%d",
-                    m.ticker,
-                    side.value,
-                    bid,
-                    self.stop_exit_floor,
-                    count,
-                )
                 return [
                     self._order(
                         ticker=m.ticker,
@@ -428,29 +373,23 @@ class CobyStrategy(Strategy):
 
         if not self._within_trading_hours():
             self._log_entry_check(
-                ticker=m.ticker,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
                 reason="OUTSIDE_TRADING_HOURS_6AM_7PM_CENTRAL",
             )
             return []
 
         if m.ticker in self._traded_tickers:
             self._log_entry_check(
-                ticker=m.ticker,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
                 reason="ALREADY_TRADED",
             )
             return []
 
-        if self._pending_action.get(m.ticker) is Action.BUY:
+        if m.ticker in self._chop_disqualified_tickers:
             self._log_entry_check(
                 ticker=m.ticker,
                 seconds_left=seconds_left,
@@ -458,122 +397,285 @@ class CobyStrategy(Strategy):
                 yes_ask=m.yes_ask,
                 no_bid=m.no_bid,
                 no_ask=m.no_ask,
-                reason="ENTRY_PENDING",
+                reason="SKIP_MARKET_CHOP_DETECTED",
             )
+            return []
+
+        if self._pending_action.get(m.ticker) is Action.BUY:
             return []
 
         if seconds_left <= 60:
             self._log_entry_check(
-                ticker=m.ticker,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
                 reason="FINAL_60_SECONDS",
             )
             return []
 
         ticks = ctx.underlying_ticks
         if not ticks:
-            self._log_entry_check(ticker=m.ticker, seconds_left=seconds_left, yes_bid=m.yes_bid, yes_ask=m.yes_ask, no_bid=m.no_bid, no_ask=m.no_ask, reason="NO_BTC_DATA")
+            self._log_entry_check(
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
+                reason="NO_BTC_DATA",
+            )
             return []
+
         latest = ticks[-1]
         age = (datetime.now(timezone.utc) - latest.timestamp).total_seconds()
         if age > self.max_btc_age_seconds or m.floor_strike is None:
-            self._log_entry_check(ticker=m.ticker, seconds_left=seconds_left, yes_bid=m.yes_bid, yes_ask=m.yes_ask, no_bid=m.no_bid, no_ask=m.no_ask, reason="BTC_STALE_OR_NO_TARGET")
+            self._log_entry_check(
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
+                reason="BTC_STALE_OR_NO_TARGET",
+            )
             return []
+
         history = (latest.timestamp - ticks[0].timestamp).total_seconds()
         if history < self.min_history_seconds:
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
             return []
+
         def old_price(sec: float) -> float:
             cutoff = latest.timestamp.timestamp() - sec
             for tick in reversed(ticks):
                 if tick.timestamp.timestamp() <= cutoff:
                     return tick.price
             return ticks[0].price
+
         mom15 = latest.price - old_price(15)
         mom60 = latest.price - old_price(60)
-        recent = [x.price for x in ticks if (latest.timestamp-x.timestamp).total_seconds() <= 60]
-        diffs = [recent[i]-recent[i-1] for i in range(1, len(recent))]
+        recent = [x.price for x in ticks if (latest.timestamp - x.timestamp).total_seconds() <= 60]
+        diffs = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
         vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
-        drift = 0.65*mom15/15.0 + 0.35*mom60/60.0
-        projected = latest.price + drift*min(seconds_left,300)*0.35
-        sigma = max(5.0, max(vol,0.35)*math.sqrt(max(seconds_left,1)))
-        z = (projected-float(m.floor_strike))/sigma
-        model_yes = max(0.01,min(0.99,0.5*(1+math.erf(z/math.sqrt(2)))))
-        model_no = 1-model_yes
+        drift = 0.65 * mom15 / 15.0 + 0.35 * mom60 / 60.0
+        projected = latest.price + drift * min(seconds_left, 300) * 0.35
+        sigma = max(5.0, max(vol, 0.35) * math.sqrt(max(seconds_left, 1)))
+        z = (projected - float(m.floor_strike)) / sigma
+        model_yes = max(0.01, min(0.99, 0.5 * (1 + math.erf(z / math.sqrt(2)))))
+        model_no = 1 - model_yes
+
         target = float(m.floor_strike)
         separation = latest.price - target
         recent_ticks = [x for x in ticks if (latest.timestamp - x.timestamp).total_seconds() <= 60]
         path = [x.price for x in recent_ticks]
         travel = sum(abs(path[i] - path[i - 1]) for i in range(1, len(path)))
         efficiency = abs(path[-1] - path[0]) / travel if travel > 0 and len(path) > 1 else 1.0
-        crossings = 0
-        for i in range(1, len(path)):
-            a, b = path[i - 1] - target, path[i] - target
-            if a == 0 or b == 0 or (a < 0 < b) or (b < 0 < a):
-                crossings += 1
+
+        # Target-crossing logic:
+        # 0-60s elapsed: ignore/reset crossings.
+        # 60s+ elapsed: count only genuine above<->below sign changes.
+        # Touching the target exactly does not count.
+        # 120s+ elapsed: two counted crossings permanently skip the market.
+        elapsed_seconds = max(0.0, 900.0 - seconds_left)
+
+        if elapsed_seconds < self.crossing_ignore_seconds:
+            self._crossing_count_by_ticker[m.ticker] = 0
+            self._last_target_side_by_ticker.pop(m.ticker, None)
+        else:
+            if separation > 0:
+                current_target_side = 1
+            elif separation < 0:
+                current_target_side = -1
+            else:
+                current_target_side = 0
+
+            if current_target_side != 0:
+                previous_target_side = self._last_target_side_by_ticker.get(m.ticker)
+                if previous_target_side is None:
+                    self._last_target_side_by_ticker[m.ticker] = current_target_side
+                elif current_target_side != previous_target_side:
+                    self._crossing_count_by_ticker[m.ticker] = (
+                        self._crossing_count_by_ticker.get(m.ticker, 0) + 1
+                    )
+                    self._last_target_side_by_ticker[m.ticker] = current_target_side
+
+        crossings = self._crossing_count_by_ticker.get(m.ticker, 0)
+
         dynamic_distance = max(
             self.minimum_distance,
-            self.volatility_multiplier * max(vol, 0.35) * math.sqrt(max(1.0, min(seconds_left, 60.0))),
+            self.volatility_multiplier
+            * max(vol, 0.35)
+            * math.sqrt(max(1.0, min(seconds_left, 60.0))),
         )
-        common = dict(ticker=m.ticker, seconds_left=seconds_left, btc_price=latest.price, target_price=target, separation=separation, yes_bid=m.yes_bid, yes_ask=m.yes_ask, no_bid=m.no_bid, no_ask=m.no_ask, model_yes=model_yes*100, model_no=model_no*100, edge_yes=None if m.yes_ask is None else model_yes*100-m.yes_ask, edge_no=None if m.no_ask is None else model_no*100-m.no_ask, momentum_15=mom15, momentum_60=mom60, volatility=vol)
+
+        common = dict(
+            ticker=m.ticker,
+            seconds_left=seconds_left,
+            btc_price=latest.price,
+            target_price=target,
+            separation=separation,
+            yes_bid=m.yes_bid,
+            yes_ask=m.yes_ask,
+            no_bid=m.no_bid,
+            no_ask=m.no_ask,
+            model_yes=model_yes * 100,
+            model_no=model_no * 100,
+            edge_yes=None if m.yes_ask is None else model_yes * 100 - m.yes_ask,
+            edge_no=None if m.no_ask is None else model_no * 100 - m.no_ask,
+            momentum_15=mom15,
+            momentum_60=mom60,
+            volatility=vol,
+        )
+
+        # Crossings counted from 60-120 seconds are remembered, but the
+        # permanent skip cannot fire until two full minutes have elapsed.
+        if (
+            elapsed_seconds >= self.crossing_skip_enable_seconds
+            and crossings >= self.maximum_target_crossings
+        ):
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            self._chop_disqualified_tickers.add(m.ticker)
+            record_model_snapshot(
+                **common,
+                decision="SKIP_MARKET",
+                reason="SKIP_MARKET_2_PLUS_TARGET_CROSSINGS",
+            )
+            logger.warning(
+                "MODEL MARKET SKIP | ticker=%s | reason=2_PLUS_TARGET_CROSSINGS | "
+                "crossings=%d | elapsed_seconds=%.1f",
+                m.ticker,
+                crossings,
+                elapsed_seconds,
+            )
+            return []
+
+        # Observation-only period: no entries before 10:00 remaining.
+        if seconds_left > self.entry_window_seconds:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason="OBSERVATION_ONLY_OVER_10_MIN",
+            )
+            return []
+
+        # HARD ENTRY RULE: BTC must be at least $30 away from the target.
+        # This is an absolute minimum and cannot be relaxed by volatility logic.
+        if abs(separation) < self.hard_minimum_separation:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason="HARD_MINIMUM_SEPARATION_UNDER_30",
+            )
+            return []
+
         if abs(separation) < dynamic_distance:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="TOO_CLOSE_TO_TARGET"); return []
-        if crossings > self.maximum_target_crossings:
-            self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="CHOPPY_TARGET_CROSSINGS"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="TOO_CLOSE_TO_TARGET")
+            return []
+
         if efficiency < self.minimum_efficiency:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="LOW_DIRECTIONAL_EFFICIENCY"); return []
-        choices=[]
-        if m.yes_ask is not None: choices.append((model_yes*100-m.yes_ask, model_yes, Side.YES, m.yes_ask))
-        if m.no_ask is not None: choices.append((model_no*100-m.no_ask, model_no, Side.NO, m.no_ask))
+            record_model_snapshot(**common, decision="WAIT", reason="LOW_DIRECTIONAL_EFFICIENCY")
+            return []
+
+        choices = []
+        if m.yes_ask is not None:
+            choices.append((model_yes * 100 - m.yes_ask, model_yes, Side.YES, m.yes_ask))
+        if m.no_ask is not None:
+            choices.append((model_no * 100 - m.no_ask, model_no, Side.NO, m.no_ask))
+
         if not choices:
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
-            record_model_snapshot(**common, decision="WAIT", reason="NO_EXECUTABLE_ASK"); return []
-        edge, confidence, side, observed_ask = max(choices, key=lambda x:x[0])
+            record_model_snapshot(**common, decision="WAIT", reason="NO_EXECUTABLE_ASK")
+            return []
+
+        edge, confidence, side, observed_ask = max(choices, key=lambda x: x[0])
+
+        # New price floor: do not enter either side below 70c.
+        if observed_ask < self.min_entry_price:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason=f"ENTRY_PRICE_BELOW_{self.min_entry_price}C",
+            )
+            return []
+
         if confidence < self.min_confidence:
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
-            record_model_snapshot(**common, decision="WAIT", reason="MODEL_CONFIDENCE_LOW"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_CONFIDENCE_LOW")
+            return []
+
         if edge < self.min_edge_cents:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="EDGE_TOO_SMALL"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="EDGE_TOO_SMALL")
+            return []
+
         if side is Side.YES and separation <= 0:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT")
+            return []
+
         if side is Side.NO and separation >= 0:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT")
+            return []
+
         trend_change = mom15 - (mom60 / 4.0)
         if side is Side.YES and trend_change < self.minimum_trend_change and mom15 < 0:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING")
+            return []
+
         if side is Side.NO and -trend_change < self.minimum_trend_change and mom15 > 0:
             self._confirmation_count_by_ticker[m.ticker] = 0
-            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING"); return []
+            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING")
+            return []
 
         previous_side = self._confirmation_side_by_ticker.get(m.ticker)
         confirmations = self._confirmation_count_by_ticker.get(m.ticker, 0)
         confirmations = confirmations + 1 if previous_side is side else 1
         self._confirmation_side_by_ticker[m.ticker] = side
         self._confirmation_count_by_ticker[m.ticker] = confirmations
+
         if confirmations < self.required_confirmations:
             record_model_snapshot(
-                **common, decision="WAIT",
+                **common,
+                decision="WAIT",
                 reason=f"CONFIRMING_{confirmations}_OF_{self.required_confirmations}",
             )
             return []
 
         count = self._entry_count(observed_ask)
-        if count <= 0: return []
+        if count <= 0:
+            return []
+
         self._pending_action[m.ticker] = Action.BUY
-        record_model_snapshot(**common, decision="BUY_"+side.value.upper(), reason="MODEL_EDGE_CONFIRMED")
-        logger.warning("MODEL ENTRY | ticker=%s | side=%s | ask=%dc | confidence=%.1f%% | edge=%.1fc | confirmations=%d | seconds_left=%.1f", m.ticker, side.value, observed_ask, confidence*100, edge, confirmations, seconds_left)
-        return [self._order(ticker=m.ticker, action=Action.BUY, side=side, price=observed_ask, count=count)]
+        record_model_snapshot(
+            **common,
+            decision="BUY_" + side.value.upper(),
+            reason="MODEL_EDGE_CONFIRMED",
+        )
+        logger.warning(
+            "MODEL ENTRY | ticker=%s | side=%s | ask=%dc | confidence=%.1f%% | "
+            "edge=%.1fc | confirmations=%d | seconds_left=%.1f",
+            m.ticker,
+            side.value,
+            observed_ask,
+            confidence * 100,
+            edge,
+            confirmations,
+            seconds_left,
+        )
+        return [
+            self._order(
+                ticker=m.ticker,
+                action=Action.BUY,
+                side=side,
+                price=observed_ask,
+                count=count,
+            )
+        ]
