@@ -39,6 +39,8 @@ class CobyStrategy(Strategy):
         self.hard_minimum_separation = float(params.get("hard_minimum_separation", 30.0))
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
+        self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 60.0))
+        self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 120.0))
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
         self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
         self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
@@ -73,6 +75,10 @@ class CobyStrategy(Strategy):
         # If this market ever triggers CHOPPY_TARGET_CROSSINGS, it is
         # disqualified from entry for the rest of that 15-minute ticker.
         self._chop_disqualified_tickers: set[str] = set()
+
+        # Target-crossing state is tracked per 15-minute ticker.
+        self._crossing_count_by_ticker: dict[str, int] = {}
+        self._last_target_side_by_ticker: dict[str, int] = {}
 
         self._side_by_ticker: dict[str, Side] = {}
         self._entry_price_by_ticker: dict[str, int] = {}
@@ -460,11 +466,35 @@ class CobyStrategy(Strategy):
         travel = sum(abs(path[i] - path[i - 1]) for i in range(1, len(path)))
         efficiency = abs(path[-1] - path[0]) / travel if travel > 0 and len(path) > 1 else 1.0
 
-        crossings = 0
-        for i in range(1, len(path)):
-            a, b = path[i - 1] - target, path[i] - target
-            if a == 0 or b == 0 or (a < 0 < b) or (b < 0 < a):
-                crossings += 1
+        # Target-crossing logic:
+        # 0-60s elapsed: ignore/reset crossings.
+        # 60s+ elapsed: count only genuine above<->below sign changes.
+        # Touching the target exactly does not count.
+        # 120s+ elapsed: two counted crossings permanently skip the market.
+        elapsed_seconds = max(0.0, 900.0 - seconds_left)
+
+        if elapsed_seconds < self.crossing_ignore_seconds:
+            self._crossing_count_by_ticker[m.ticker] = 0
+            self._last_target_side_by_ticker.pop(m.ticker, None)
+        else:
+            if separation > 0:
+                current_target_side = 1
+            elif separation < 0:
+                current_target_side = -1
+            else:
+                current_target_side = 0
+
+            if current_target_side != 0:
+                previous_target_side = self._last_target_side_by_ticker.get(m.ticker)
+                if previous_target_side is None:
+                    self._last_target_side_by_ticker[m.ticker] = current_target_side
+                elif current_target_side != previous_target_side:
+                    self._crossing_count_by_ticker[m.ticker] = (
+                        self._crossing_count_by_ticker.get(m.ticker, 0) + 1
+                    )
+                    self._last_target_side_by_ticker[m.ticker] = current_target_side
+
+        crossings = self._crossing_count_by_ticker.get(m.ticker, 0)
 
         dynamic_distance = max(
             self.minimum_distance,
@@ -492,11 +522,12 @@ class CobyStrategy(Strategy):
             volatility=vol,
         )
 
-        # If BTC crosses the target line two or more times, permanently
-        # disqualify this 15-minute market. This check is active even during
-        # the first five-minute observation period, so obvious chop is rejected
-        # before the entry window opens.
-        if crossings >= 2:
+        # Crossings counted from 60-120 seconds are remembered, but the
+        # permanent skip cannot fire until two full minutes have elapsed.
+        if (
+            elapsed_seconds >= self.crossing_skip_enable_seconds
+            and crossings >= self.maximum_target_crossings
+        ):
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
             self._chop_disqualified_tickers.add(m.ticker)
@@ -506,9 +537,11 @@ class CobyStrategy(Strategy):
                 reason="SKIP_MARKET_2_PLUS_TARGET_CROSSINGS",
             )
             logger.warning(
-                "MODEL MARKET SKIP | ticker=%s | reason=2_PLUS_TARGET_CROSSINGS | crossings=%d",
+                "MODEL MARKET SKIP | ticker=%s | reason=2_PLUS_TARGET_CROSSINGS | "
+                "crossings=%d | elapsed_seconds=%.1f",
                 m.ticker,
                 crossings,
+                elapsed_seconds,
             )
             return []
 
