@@ -70,6 +70,12 @@ class CobyStrategy(Strategy):
         self.chaos_reversal_ratio = float(params.get("chaos_reversal_ratio", 0.45))
         self.chaos_min_travel = float(params.get("chaos_min_travel", 100.0))
 
+        # IMPORTANT: chaos is observed from market open, but it cannot permanently
+        # disqualify the market until entries themselves are allowed.
+        self.chaos_skip_enable_seconds_left = int(
+            params.get("chaos_skip_enable_seconds_left", self.entry_window_seconds)
+        )
+
         self.use_trading_hours = bool(params.get("use_trading_hours", False))
         self.trading_timezone = ZoneInfo(
             str(params.get("trading_timezone", "America/Chicago"))
@@ -383,7 +389,13 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        if m.ticker in self._chaos_disqualified_tickers:
+        # Do not return early for a chaos-disqualified ticker before its final
+        # history sample has been recorded. We still need to observe the market
+        # through its final minute so future markets can learn from it.
+        if (
+            m.ticker in self._chaos_disqualified_tickers
+            and seconds_left > self.final_exit_seconds
+        ):
             self._log_entry_check(
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
@@ -393,15 +405,6 @@ class CobyStrategy(Strategy):
             return []
 
         if self._pending_action.get(m.ticker) is Action.BUY:
-            return []
-
-        if seconds_left <= 60:
-            self._log_entry_check(
-                ticker=m.ticker, seconds_left=seconds_left,
-                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
-                no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="FINAL_60_SECONDS",
-            )
             return []
 
         ticks = ctx.underlying_ticks
@@ -461,8 +464,6 @@ class CobyStrategy(Strategy):
         net_move = path[-1] - path[0] if len(path) > 1 else 0.0
         efficiency = abs(net_move) / travel if travel > 0 and len(path) > 1 else 1.0
 
-        # Measure how much of the path fought against its final net direction.
-        # A strong one-way trend can have huge travel but a low reversal ratio.
         reversal_travel = 0.0
         if len(path) > 1 and net_move != 0:
             final_direction = 1 if net_move > 0 else -1
@@ -472,12 +473,18 @@ class CobyStrategy(Strategy):
                     reversal_travel += abs(step)
         reversal_ratio = reversal_travel / travel if travel > 0 else 0.0
 
-        # Track each ticker's peak 60-second travel. Near market end, store one
-        # summary value so later markets can compare themselves with recent history.
+        # Track each ticker continuously, including markets that may later be
+        # disqualified. This prevents the adaptive baseline from becoming blind
+        # to the exact markets it is supposed to learn from.
         self._peak_travel_by_ticker[m.ticker] = max(
-            self._peak_travel_by_ticker.get(m.ticker, 0.0), travel
+            self._peak_travel_by_ticker.get(m.ticker, 0.0),
+            travel,
         )
-        if seconds_left <= self.final_exit_seconds and m.ticker not in self._remembered_chaos_tickers:
+
+        if (
+            seconds_left <= self.final_exit_seconds
+            and m.ticker not in self._remembered_chaos_tickers
+        ):
             peak = self._peak_travel_by_ticker.get(m.ticker, 0.0)
             if peak > 0:
                 self._chaos_history.append(peak)
@@ -564,15 +571,39 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        # Adaptive chaos kill-switch:
-        # - movement must be abnormally large,
-        # - AND the path must be inefficient / heavily reversing.
-        # Strong high-volatility trends are explicitly allowed through.
+        # ============================================================
+        # CHAOS OBSERVATION / SKIP LOGIC
+        # ============================================================
+
         extreme_movement = travel >= adaptive_threshold
         chaotic_path = (
             efficiency <= self.chaos_efficiency_ceiling
             and reversal_ratio >= self.chaos_reversal_ratio
         )
+
+        # Before the entry window opens, chaos is observation only.
+        # We intentionally DO NOT permanently disqualify the ticker yet.
+        if seconds_left > self.chaos_skip_enable_seconds_left:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+
+            if extreme_movement and chaotic_path:
+                record_model_snapshot(
+                    **common,
+                    decision="WAIT",
+                    reason="OBSERVING_EXTREME_CHAOS_PRE_ENTRY",
+                )
+            else:
+                record_model_snapshot(
+                    **common,
+                    decision="WAIT",
+                    reason="OBSERVATION_ONLY_OVER_10_MIN",
+                )
+            return []
+
+        # Once the entry window opens, only then may chaos become a permanent
+        # market skip. A strong high-volatility trend still passes because the
+        # path must ALSO be inefficient and heavily reversing.
         if extreme_movement and chaotic_path:
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
@@ -585,7 +616,7 @@ class CobyStrategy(Strategy):
             logger.warning(
                 "MODEL MARKET SKIP | ticker=%s | reason=EXTREME_CHAOS | travel=%.2f | "
                 "efficiency=%.3f | reversal_ratio=%.3f | baseline=%s | threshold=%.2f | "
-                "history_markets=%d",
+                "history_markets=%d | seconds_left=%.1f",
                 m.ticker,
                 travel,
                 efficiency,
@@ -593,16 +624,19 @@ class CobyStrategy(Strategy):
                 "None" if baseline_travel is None else f"{baseline_travel:.2f}",
                 adaptive_threshold,
                 len(self._chaos_history),
+                seconds_left,
             )
             return []
 
-        if seconds_left > self.entry_window_seconds:
-            self._confirmation_count_by_ticker[m.ticker] = 0
-            self._confirmation_side_by_ticker.pop(m.ticker, None)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="OBSERVATION_ONLY_OVER_10_MIN",
+        # If we are here, the entry window is open and chaos did not disqualify
+        # the market. Continue through the original strategy rules unchanged.
+
+        if seconds_left <= 60:
+            self._log_entry_check(
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
+                reason="FINAL_60_SECONDS",
             )
             return []
 
