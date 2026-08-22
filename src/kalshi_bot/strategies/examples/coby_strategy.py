@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime, timezone
 import math
 import statistics
@@ -32,7 +33,7 @@ class CobyStrategy(Strategy):
         self.min_confidence = float(params.get("min_confidence", 0.72))
         self.min_edge_cents = float(params.get("min_edge_cents", 7.0))
         self.min_history_seconds = float(
-            params.get("minimum_history_seconds", params.get("min_history_seconds", 90))
+            params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
         )
         self.required_confirmations = int(params.get("required_confirmations", 3))
         self.minimum_distance = float(params.get("minimum_distance", 15.0))
@@ -40,29 +41,11 @@ class CobyStrategy(Strategy):
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
 
-        # Ignore ALL target crossings during the first 3 minutes.
-        # Crossing count begins from zero after 3 minutes have elapsed.
         self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 180.0))
         self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 180.0))
 
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
         self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
-
-        # Stability filters. These are designed to reject a market that looks
-        # strong for a few snapshots but has not shown durable directional behavior.
-        self.stability_lookback_seconds = float(params.get("stability_lookback_seconds", 90.0))
-        self.minimum_stability_efficiency = float(
-            params.get("minimum_stability_efficiency", 0.25)
-        )
-        self.minimum_same_side_ratio = float(params.get("minimum_same_side_ratio", 0.90))
-        self.minimum_stability_net_move = float(
-            params.get("minimum_stability_net_move", 10.0)
-        )
-        self.maximum_retracement_ratio = float(params.get("maximum_retracement_ratio", 0.35))
-        self.maximum_retracement_floor = float(
-            params.get("maximum_retracement_floor", 15.0)
-        )
-
         self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
         self.take_profit = int(params.get("take_profit", 98))
         self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
@@ -71,18 +54,21 @@ class CobyStrategy(Strategy):
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
-        # Observe the first 10 minutes, then allow entries from 5:00 remaining
-        # down to the final 60-second no-entry window.
-        self.entry_window_seconds = int(params.get("entry_window_seconds", 300))
-
-        # Only allow an entry when the chosen YES/NO contract ask is 70c or higher.
+        # Original entry behavior: observe first 5 minutes, then allow entry
+        # from 10:00 remaining down to the final 60-second no-entry window.
+        self.entry_window_seconds = int(params.get("entry_window_seconds", 600))
         self.min_entry_price = int(params.get("min_entry_price", 70))
 
-        # The selected contract must stay at/above the entry floor continuously
-        # before the normal 3-step confirmation sequence can begin.
-        self.minimum_entry_price_hold_seconds = float(
-            params.get("minimum_entry_price_hold_seconds", 30.0)
-        )
+        # Adaptive chaos filter.
+        # High movement is NOT rejected by itself. We reject abnormal movement
+        # only when the path is inefficient / whipsawing rather than trending.
+        self.chaos_window_seconds = float(params.get("chaos_window_seconds", 60.0))
+        self.chaos_history_size = int(params.get("chaos_history_size", 20))
+        self.chaos_min_baseline_markets = int(params.get("chaos_min_baseline_markets", 4))
+        self.chaos_travel_multiplier = float(params.get("chaos_travel_multiplier", 2.25))
+        self.chaos_efficiency_ceiling = float(params.get("chaos_efficiency_ceiling", 0.30))
+        self.chaos_reversal_ratio = float(params.get("chaos_reversal_ratio", 0.45))
+        self.chaos_min_travel = float(params.get("chaos_min_travel", 100.0))
 
         self.use_trading_hours = bool(params.get("use_trading_hours", False))
         self.trading_timezone = ZoneInfo(
@@ -95,14 +81,16 @@ class CobyStrategy(Strategy):
 
         self._traded_tickers: set[str] = set()
         self._closed_tickers: set[str] = set()
-
-        # If this market ever triggers CHOPPY_TARGET_CROSSINGS, it is
-        # disqualified from entry for the rest of that 15-minute ticker.
         self._chop_disqualified_tickers: set[str] = set()
+        self._chaos_disqualified_tickers: set[str] = set()
 
-        # Target-crossing state is tracked per 15-minute ticker.
         self._crossing_count_by_ticker: dict[str, int] = {}
         self._last_target_side_by_ticker: dict[str, int] = {}
+
+        # Rolling completed-market memory for adaptive chaos detection.
+        self._chaos_history: deque[float] = deque(maxlen=max(1, self.chaos_history_size))
+        self._peak_travel_by_ticker: dict[str, float] = {}
+        self._remembered_chaos_tickers: set[str] = set()
 
         self._side_by_ticker: dict[str, Side] = {}
         self._entry_price_by_ticker: dict[str, int] = {}
@@ -113,15 +101,8 @@ class CobyStrategy(Strategy):
         self._exit_fill_value_by_ticker: dict[str, int] = {}
         self._exit_fill_count_by_ticker: dict[str, int] = {}
         self._total_pnl_cents = 0
-
         self._confirmation_side_by_ticker: dict[str, Side] = {}
         self._confirmation_count_by_ticker: dict[str, int] = {}
-
-        # Timestamp of when the chosen contract first met the >=70c floor.
-        # Uses market-data timestamps rather than wall-clock time so dry/live
-        # behavior is measured consistently.
-        self._price_floor_side_by_ticker: dict[str, Side] = {}
-        self._price_floor_since_by_ticker: dict[str, datetime] = {}
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
@@ -145,15 +126,7 @@ class CobyStrategy(Strategy):
             return 0
         return max(0, min(self.max_contracts, self.max_notional_cents // limit_price))
 
-    def _order(
-        self,
-        *,
-        ticker: str,
-        action: Action,
-        side: Side,
-        price: int,
-        count: int,
-    ) -> OrderRequest:
+    def _order(self, *, ticker: str, action: Action, side: Side, price: int, count: int) -> OrderRequest:
         kwargs: dict[str, Any] = {
             "ticker": ticker,
             "action": action,
@@ -190,19 +163,9 @@ class CobyStrategy(Strategy):
             self._entry_price_by_ticker[ticker] = int(saved["entry_price"])
         logger.warning(
             "LIVE POSITION RECOVERED | ticker=%s | side=%s | count=%d",
-            ticker,
-            side.value,
-            abs(int(ctx_position)),
+            ticker, side.value, abs(int(ctx_position)),
         )
         return side
-
-    def _reset_confirmation(self, ticker: str) -> None:
-        self._confirmation_count_by_ticker[ticker] = 0
-        self._confirmation_side_by_ticker.pop(ticker, None)
-
-    def _reset_price_floor_timer(self, ticker: str) -> None:
-        self._price_floor_side_by_ticker.pop(ticker, None)
-        self._price_floor_since_by_ticker.pop(ticker, None)
 
     def on_order_result(
         self,
@@ -221,21 +184,17 @@ class CobyStrategy(Strategy):
         if fill_count <= 0:
             logger.warning(
                 "LIVE NO FILL | ticker=%s | action=%s | side=%s",
-                ticker,
-                request.action.value,
-                request.side.value,
+                ticker, request.action.value, request.side.value,
             )
             return
 
         fill_price = result.outcome_fill_price
         if fill_price is None:
             fill_price = request.yes_price if request.side is Side.YES else request.no_price
-
         if fill_price is None:
             logger.error(
                 "LIVE FILL WITHOUT PRICE | ticker=%s | action=%s",
-                ticker,
-                request.action.value,
+                ticker, request.action.value,
             )
             return
 
@@ -246,7 +205,6 @@ class CobyStrategy(Strategy):
             self._side_by_ticker[ticker] = request.side
             self._entry_price_by_ticker[ticker] = fill_price
             self._filled_count_by_ticker[ticker] = fill_count
-            self._reset_price_floor_timer(ticker)
 
             record_entry(
                 ticker=ticker,
@@ -260,10 +218,7 @@ class CobyStrategy(Strategy):
             )
             logger.warning(
                 "LIVE ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d",
-                ticker,
-                request.side.value,
-                fill_price,
-                fill_count,
+                ticker, request.side.value, fill_price, fill_count,
             )
             return
 
@@ -295,7 +250,6 @@ class CobyStrategy(Strategy):
             reason = self._exit_reason.pop(ticker, "EXIT")
             total_exit_count = self._exit_fill_count_by_ticker.pop(ticker, 0)
             total_exit_value = self._exit_fill_value_by_ticker.pop(ticker, 0)
-
             avg_exit = round(total_exit_value / total_exit_count) if total_exit_count > 0 else fill_price
 
             if entry_price is not None:
@@ -318,7 +272,6 @@ class CobyStrategy(Strategy):
                 )
 
             self._side_by_ticker.pop(ticker, None)
-
             logger.warning(
                 "LIVE EXIT FILLED | ticker=%s | side=%s | avg_exit=%dc | count=%d | reason=%s",
                 ticker, side.value, avg_exit, total_exit_count, reason,
@@ -339,11 +292,7 @@ class CobyStrategy(Strategy):
             "ENTRY CHECK | ticker=%s | seconds_left=%s | yes_bid=%s | yes_ask=%s | no_bid=%s | no_ask=%s | reason=%s",
             ticker,
             "None" if seconds_left is None else f"{seconds_left:.1f}",
-            yes_bid,
-            yes_ask,
-            no_bid,
-            no_ask,
-            reason,
+            yes_bid, yes_ask, no_bid, no_ask, reason,
         )
 
     def on_market_data(self, ctx: StrategyContext) -> list[OrderRequest]:
@@ -358,10 +307,6 @@ class CobyStrategy(Strategy):
             return []
 
         count = self._known_position_count(m.ticker, ctx_position)
-
-        # ============================================================
-        # OPEN POSITION MANAGEMENT
-        # ============================================================
 
         if count > 0:
             side = self._recover_side_from_position(m.ticker, ctx_position)
@@ -380,15 +325,10 @@ class CobyStrategy(Strategy):
             if seconds_left <= self.final_exit_seconds:
                 self._pending_action[m.ticker] = Action.SELL
                 self._exit_reason[m.ticker] = "FINAL_60_SECOND_EXIT"
-                return [
-                    self._order(
-                        ticker=m.ticker,
-                        action=Action.SELL,
-                        side=side,
-                        price=self.stop_exit_floor,
-                        count=count,
-                    )
-                ]
+                return [self._order(
+                    ticker=m.ticker, action=Action.SELL, side=side,
+                    price=self.stop_exit_floor, count=count,
+                )]
 
             if bid is None:
                 return []
@@ -396,15 +336,10 @@ class CobyStrategy(Strategy):
             if bid >= self.take_profit:
                 self._pending_action[m.ticker] = Action.SELL
                 self._exit_reason[m.ticker] = "TAKE_PROFIT"
-                return [
-                    self._order(
-                        ticker=m.ticker,
-                        action=Action.SELL,
-                        side=side,
-                        price=self.take_profit,
-                        count=count,
-                    )
-                ]
+                return [self._order(
+                    ticker=m.ticker, action=Action.SELL, side=side,
+                    price=self.take_profit, count=count,
+                )]
 
             entry_price = self._entry_price_by_ticker.get(m.ticker)
             dynamic_stop = (
@@ -415,21 +350,11 @@ class CobyStrategy(Strategy):
             if bid <= dynamic_stop:
                 self._pending_action[m.ticker] = Action.SELL
                 self._exit_reason[m.ticker] = "DYNAMIC_STOP"
-                return [
-                    self._order(
-                        ticker=m.ticker,
-                        action=Action.SELL,
-                        side=side,
-                        price=self.stop_exit_floor,
-                        count=count,
-                    )
-                ]
-
+                return [self._order(
+                    ticker=m.ticker, action=Action.SELL, side=side,
+                    price=self.stop_exit_floor, count=count,
+                )]
             return []
-
-        # ============================================================
-        # ENTRY FILTERS
-        # ============================================================
 
         if not self._within_trading_hours():
             self._log_entry_check(
@@ -451,13 +376,19 @@ class CobyStrategy(Strategy):
 
         if m.ticker in self._chop_disqualified_tickers:
             self._log_entry_check(
-                ticker=m.ticker,
-                seconds_left=seconds_left,
-                yes_bid=m.yes_bid,
-                yes_ask=m.yes_ask,
-                no_bid=m.no_bid,
-                no_ask=m.no_ask,
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
                 reason="SKIP_MARKET_CHOP_DETECTED",
+            )
+            return []
+
+        if m.ticker in self._chaos_disqualified_tickers:
+            self._log_entry_check(
+                ticker=m.ticker, seconds_left=seconds_left,
+                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
+                no_bid=m.no_bid, no_ask=m.no_ask,
+                reason="SKIP_MARKET_EXTREME_CHAOS",
             )
             return []
 
@@ -465,8 +396,6 @@ class CobyStrategy(Strategy):
             return []
 
         if seconds_left <= 60:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
             self._log_entry_check(
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
@@ -498,8 +427,8 @@ class CobyStrategy(Strategy):
 
         history = (latest.timestamp - ticks[0].timestamp).total_seconds()
         if history < self.min_history_seconds:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             return []
 
         def old_price(sec: float) -> float:
@@ -511,15 +440,9 @@ class CobyStrategy(Strategy):
 
         mom15 = latest.price - old_price(15)
         mom60 = latest.price - old_price(60)
-
-        recent = [
-            x.price
-            for x in ticks
-            if (latest.timestamp - x.timestamp).total_seconds() <= 60
-        ]
+        recent = [x.price for x in ticks if (latest.timestamp - x.timestamp).total_seconds() <= 60]
         diffs = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
         vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
-
         drift = 0.65 * mom15 / 15.0 + 0.35 * mom60 / 60.0
         projected = latest.price + drift * min(seconds_left, 300) * 0.35
         sigma = max(5.0, max(vol, 0.35) * math.sqrt(max(seconds_left, 1)))
@@ -529,19 +452,48 @@ class CobyStrategy(Strategy):
 
         target = float(m.floor_strike)
         separation = latest.price - target
-
         recent_ticks = [
-            x
-            for x in ticks
-            if (latest.timestamp - x.timestamp).total_seconds() <= 60
+            x for x in ticks
+            if (latest.timestamp - x.timestamp).total_seconds() <= self.chaos_window_seconds
         ]
         path = [x.price for x in recent_ticks]
         travel = sum(abs(path[i] - path[i - 1]) for i in range(1, len(path)))
-        efficiency = abs(path[-1] - path[0]) / travel if travel > 0 and len(path) > 1 else 1.0
+        net_move = path[-1] - path[0] if len(path) > 1 else 0.0
+        efficiency = abs(net_move) / travel if travel > 0 and len(path) > 1 else 1.0
 
-        # ============================================================
-        # TARGET-CROSSING LOGIC
-        # ============================================================
+        # Measure how much of the path fought against its final net direction.
+        # A strong one-way trend can have huge travel but a low reversal ratio.
+        reversal_travel = 0.0
+        if len(path) > 1 and net_move != 0:
+            final_direction = 1 if net_move > 0 else -1
+            for i in range(1, len(path)):
+                step = path[i] - path[i - 1]
+                if step * final_direction < 0:
+                    reversal_travel += abs(step)
+        reversal_ratio = reversal_travel / travel if travel > 0 else 0.0
+
+        # Track each ticker's peak 60-second travel. Near market end, store one
+        # summary value so later markets can compare themselves with recent history.
+        self._peak_travel_by_ticker[m.ticker] = max(
+            self._peak_travel_by_ticker.get(m.ticker, 0.0), travel
+        )
+        if seconds_left <= self.final_exit_seconds and m.ticker not in self._remembered_chaos_tickers:
+            peak = self._peak_travel_by_ticker.get(m.ticker, 0.0)
+            if peak > 0:
+                self._chaos_history.append(peak)
+            self._remembered_chaos_tickers.add(m.ticker)
+
+        baseline_travel = (
+            statistics.median(self._chaos_history)
+            if self._chaos_history
+            else None
+        )
+        enough_baseline = len(self._chaos_history) >= self.chaos_min_baseline_markets
+        adaptive_threshold = (
+            max(self.chaos_min_travel, baseline_travel * self.chaos_travel_multiplier)
+            if enough_baseline and baseline_travel is not None
+            else self.chaos_min_travel
+        )
 
         elapsed_seconds = max(0.0, 900.0 - seconds_left)
 
@@ -558,7 +510,6 @@ class CobyStrategy(Strategy):
 
             if current_target_side != 0:
                 previous_target_side = self._last_target_side_by_ticker.get(m.ticker)
-
                 if previous_target_side is None:
                     self._last_target_side_by_ticker[m.ticker] = current_target_side
                 elif current_target_side != previous_target_side:
@@ -599,8 +550,8 @@ class CobyStrategy(Strategy):
             elapsed_seconds >= self.crossing_skip_enable_seconds
             and crossings >= self.maximum_target_crossings
         ):
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             self._chop_disqualified_tickers.add(m.ticker)
             record_model_snapshot(
                 **common,
@@ -608,35 +559,56 @@ class CobyStrategy(Strategy):
                 reason="SKIP_MARKET_2_PLUS_TARGET_CROSSINGS",
             )
             logger.warning(
-                "MODEL MARKET SKIP | ticker=%s | reason=2_PLUS_TARGET_CROSSINGS | "
-                "crossings=%d | elapsed_seconds=%.1f",
-                m.ticker,
-                crossings,
-                elapsed_seconds,
+                "MODEL MARKET SKIP | ticker=%s | reason=2_PLUS_TARGET_CROSSINGS | crossings=%d | elapsed_seconds=%.1f",
+                m.ticker, crossings, elapsed_seconds,
             )
             return []
 
-        # ============================================================
-        # REVISED ENTRY WINDOW: FINAL FIVE MINUTES ONLY
-        # ============================================================
+        # Adaptive chaos kill-switch:
+        # - movement must be abnormally large,
+        # - AND the path must be inefficient / heavily reversing.
+        # Strong high-volatility trends are explicitly allowed through.
+        extreme_movement = travel >= adaptive_threshold
+        chaotic_path = (
+            efficiency <= self.chaos_efficiency_ceiling
+            and reversal_ratio >= self.chaos_reversal_ratio
+        )
+        if extreme_movement and chaotic_path:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            self._chaos_disqualified_tickers.add(m.ticker)
+            record_model_snapshot(
+                **common,
+                decision="SKIP_MARKET",
+                reason="SKIP_MARKET_EXTREME_CHAOS",
+            )
+            logger.warning(
+                "MODEL MARKET SKIP | ticker=%s | reason=EXTREME_CHAOS | travel=%.2f | "
+                "efficiency=%.3f | reversal_ratio=%.3f | baseline=%s | threshold=%.2f | "
+                "history_markets=%d",
+                m.ticker,
+                travel,
+                efficiency,
+                reversal_ratio,
+                "None" if baseline_travel is None else f"{baseline_travel:.2f}",
+                adaptive_threshold,
+                len(self._chaos_history),
+            )
+            return []
 
         if seconds_left > self.entry_window_seconds:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             record_model_snapshot(
                 **common,
                 decision="WAIT",
-                reason="OBSERVATION_ONLY_OVER_5_MIN",
+                reason="OBSERVATION_ONLY_OVER_10_MIN",
             )
             return []
 
-        # ============================================================
-        # SEPARATION FILTERS
-        # ============================================================
-
         if abs(separation) < self.hard_minimum_separation:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             record_model_snapshot(
                 **common,
                 decision="WAIT",
@@ -645,28 +617,14 @@ class CobyStrategy(Strategy):
             return []
 
         if abs(separation) < dynamic_distance:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="TOO_CLOSE_TO_TARGET",
-            )
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="TOO_CLOSE_TO_TARGET")
             return []
 
         if efficiency < self.minimum_efficiency:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="LOW_DIRECTIONAL_EFFICIENCY",
-            )
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="LOW_DIRECTIONAL_EFFICIENCY")
             return []
-
-        # ============================================================
-        # MODEL SIDE SELECTION
-        # ============================================================
 
         choices = []
         if m.yes_ask is not None:
@@ -675,220 +633,16 @@ class CobyStrategy(Strategy):
             choices.append((model_no * 100 - m.no_ask, model_no, Side.NO, m.no_ask))
 
         if not choices:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             record_model_snapshot(**common, decision="WAIT", reason="NO_EXECUTABLE_ASK")
             return []
 
         edge, confidence, side, observed_ask = max(choices, key=lambda x: x[0])
 
-        if side is Side.YES and separation <= 0:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MODEL_TARGET_DIRECTION_CONFLICT",
-            )
-            return []
-
-        if side is Side.NO and separation >= 0:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MODEL_TARGET_DIRECTION_CONFLICT",
-            )
-            return []
-
-        # ============================================================
-        # NEW 90-SECOND BTC STABILITY FILTER
-        # ============================================================
-
-        stability_ticks = [
-            x
-            for x in ticks
-            if (latest.timestamp - x.timestamp).total_seconds()
-            <= self.stability_lookback_seconds
-        ]
-
-        if len(stability_ticks) < 2:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="INSUFFICIENT_STABILITY_HISTORY",
-            )
-            return []
-
-        stability_span = (
-            stability_ticks[-1].timestamp - stability_ticks[0].timestamp
-        ).total_seconds()
-
-        if stability_span < self.stability_lookback_seconds * 0.90:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="INSUFFICIENT_STABILITY_HISTORY",
-            )
-            return []
-
-        stability_path = [x.price for x in stability_ticks]
-        stability_travel = sum(
-            abs(stability_path[i] - stability_path[i - 1])
-            for i in range(1, len(stability_path))
-        )
-        stability_efficiency = (
-            abs(stability_path[-1] - stability_path[0]) / stability_travel
-            if stability_travel > 0
-            else 1.0
-        )
-
-        if stability_efficiency < self.minimum_stability_efficiency:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="UNSTABLE_90_SECOND_PATH",
-            )
-            return []
-
-        if side is Side.YES:
-            correct_side_count = sum(1 for x in stability_ticks if x.price > target)
-            directional_distances = [x.price - target for x in stability_ticks]
-            directional_net_move = stability_path[-1] - stability_path[0]
-        else:
-            correct_side_count = sum(1 for x in stability_ticks if x.price < target)
-            directional_distances = [target - x.price for x in stability_ticks]
-            directional_net_move = stability_path[0] - stability_path[-1]
-
-        same_side_ratio = correct_side_count / len(stability_ticks)
-
-        if same_side_ratio < self.minimum_same_side_ratio:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="TARGET_SIDE_NOT_STABLE",
-            )
-            return []
-
-        if directional_net_move < self.minimum_stability_net_move:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="NO_SUSTAINED_DIRECTIONAL_PROGRESS",
-            )
-            return []
-
-        favorable_distances = [max(0.0, distance) for distance in directional_distances]
-        peak_favorable_distance = max(favorable_distances)
-        current_favorable_distance = max(0.0, directional_distances[-1])
-        recent_retracement = max(
-            0.0,
-            peak_favorable_distance - current_favorable_distance,
-        )
-        allowed_retracement = max(
-            self.maximum_retracement_floor,
-            peak_favorable_distance * self.maximum_retracement_ratio,
-        )
-
-        if recent_retracement > allowed_retracement:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="SEPARATION_RETRACING_TOO_FAST",
-            )
-            return []
-
-        # ============================================================
-        # MOMENTUM ALIGNMENT
-        # ============================================================
-
-        # Both 15-second and 60-second momentum must agree with the chosen side.
-        if side is Side.YES and (mom15 <= 0 or mom60 <= 0):
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MOMENTUM_DIRECTION_NOT_ALIGNED",
-            )
-            return []
-
-        if side is Side.NO and (mom15 >= 0 or mom60 >= 0):
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MOMENTUM_DIRECTION_NOT_ALIGNED",
-            )
-            return []
-
-        trend_change = mom15 - (mom60 / 4.0)
-
-        if side is Side.YES and trend_change < self.minimum_trend_change and mom15 < 0:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MOMENTUM_WEAKENING",
-            )
-            return []
-
-        if side is Side.NO and -trend_change < self.minimum_trend_change and mom15 > 0:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MOMENTUM_WEAKENING",
-            )
-            return []
-
-        # ============================================================
-        # MODEL CONFIDENCE / EDGE
-        # ============================================================
-
-        if confidence < self.min_confidence:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="MODEL_CONFIDENCE_LOW",
-            )
-            return []
-
-        if edge < self.min_edge_cents:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="EDGE_TOO_SMALL",
-            )
-            return []
-
-        # ============================================================
-        # CONTRACT PRICE FLOOR + 30-SECOND STABILITY
-        # ============================================================
-
         if observed_ask < self.min_entry_price:
-            self._reset_confirmation(m.ticker)
-            self._reset_price_floor_timer(m.ticker)
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
             record_model_snapshot(
                 **common,
                 decision="WAIT",
@@ -896,45 +650,37 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        tracked_floor_side = self._price_floor_side_by_ticker.get(m.ticker)
-
-        if tracked_floor_side is not side:
-            self._price_floor_side_by_ticker[m.ticker] = side
-            self._price_floor_since_by_ticker[m.ticker] = latest.timestamp
-            self._reset_confirmation(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="ENTRY_PRICE_STABILITY_TIMER_STARTED",
-            )
+        if confidence < self.min_confidence:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_CONFIDENCE_LOW")
             return []
 
-        floor_since = self._price_floor_since_by_ticker.get(m.ticker)
-
-        if floor_since is None:
-            self._price_floor_since_by_ticker[m.ticker] = latest.timestamp
-            self._reset_confirmation(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="ENTRY_PRICE_STABILITY_TIMER_STARTED",
-            )
+        if edge < self.min_edge_cents:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="EDGE_TOO_SMALL")
             return []
 
-        floor_hold_seconds = (latest.timestamp - floor_since).total_seconds()
-
-        if floor_hold_seconds < self.minimum_entry_price_hold_seconds:
-            self._reset_confirmation(m.ticker)
-            record_model_snapshot(
-                **common,
-                decision="WAIT",
-                reason="ENTRY_PRICE_NOT_STABLE_30_SECONDS",
-            )
+        if side is Side.YES and separation <= 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT")
             return []
 
-        # ============================================================
-        # FINAL THREE-STEP CONFIRMATION
-        # ============================================================
+        if side is Side.NO and separation >= 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT")
+            return []
+
+        trend_change = mom15 - (mom60 / 4.0)
+        if side is Side.YES and trend_change < self.minimum_trend_change and mom15 < 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING")
+            return []
+
+        if side is Side.NO and -trend_change < self.minimum_trend_change and mom15 > 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            record_model_snapshot(**common, decision="WAIT", reason="MOMENTUM_WEAKENING")
+            return []
 
         previous_side = self._confirmation_side_by_ticker.get(m.ticker)
         confirmations = self._confirmation_count_by_ticker.get(m.ticker, 0)
@@ -958,13 +704,11 @@ class CobyStrategy(Strategy):
         record_model_snapshot(
             **common,
             decision="BUY_" + side.value.upper(),
-            reason="MODEL_EDGE_CONFIRMED_STABLE",
+            reason="MODEL_EDGE_CONFIRMED",
         )
         logger.warning(
             "MODEL ENTRY | ticker=%s | side=%s | ask=%dc | confidence=%.1f%% | "
-            "edge=%.1fc | confirmations=%d | seconds_left=%.1f | "
-            "stability_efficiency=%.3f | same_side_ratio=%.3f | "
-            "directional_move=%.2f | retracement=%.2f | price_floor_hold=%.1fs",
+            "edge=%.1fc | confirmations=%d | seconds_left=%.1f",
             m.ticker,
             side.value,
             observed_ask,
@@ -972,11 +716,6 @@ class CobyStrategy(Strategy):
             edge,
             confirmations,
             seconds_left,
-            stability_efficiency,
-            same_side_ratio,
-            directional_net_move,
-            recent_retracement,
-            floor_hold_seconds,
         )
         return [
             self._order(
