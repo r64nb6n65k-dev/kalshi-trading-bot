@@ -47,25 +47,16 @@ class CobyStrategy(Strategy):
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
         self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
         self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
-
-        # Profit-taking behavior:
-        # 1. Take profit anytime the contract gains 12 cents from entry.
-        # 2. Once 4:00 or less remains, take any profit of 5 cents or more.
-        self.take_profit_gain_cents = int(params.get("take_profit_gain_cents", 12))
-        self.late_profit_exit_seconds = int(params.get("late_profit_exit_seconds", 240))
-        self.late_profit_min_gain_cents = int(
-            params.get("late_profit_min_gain_cents", 5)
-        )
-
+        self.take_profit = int(params.get("take_profit", 98))
         self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
         self.max_contracts = int(params.get("max_contracts", 200))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
-        # Observe first 6 minutes, then allow entry from 9:00 remaining
-        # down to the final 60-second no-entry window.
-        self.entry_window_seconds = int(params.get("entry_window_seconds", 540))
+        # Original entry behavior: observe first 5 minutes, then allow entry
+        # from 10:00 remaining down to the final 60-second no-entry window.
+        self.entry_window_seconds = int(params.get("entry_window_seconds", 600))
         self.min_entry_price = int(params.get("min_entry_price", 70))
 
         # Adaptive chaos filter.
@@ -229,8 +220,6 @@ class CobyStrategy(Strategy):
             self._entry_price_by_ticker[ticker] = fill_price
             self._filled_count_by_ticker[ticker] = fill_count
 
-            take_profit_price = min(99, fill_price + self.take_profit_gain_cents)
-
             record_entry(
                 ticker=ticker,
                 side=request.side.value,
@@ -238,16 +227,12 @@ class CobyStrategy(Strategy):
                 count=fill_count,
                 seconds_left=seconds_left,
                 stop_price=max(1, min(self.legacy_stop_cap, fill_price - self.dynamic_stop_gap)),
-                take_profit=take_profit_price,
+                take_profit=self.take_profit,
                 execution_mode="live" if is_live else "paper",
             )
             logger.warning(
-                "LIVE ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d | take_profit=%dc",
-                ticker,
-                request.side.value,
-                fill_price,
-                fill_count,
-                take_profit_price,
+                "LIVE ENTRY FILLED | ticker=%s | side=%s | fill=%dc | count=%d",
+                ticker, request.side.value, fill_price, fill_count,
             )
             return
 
@@ -362,39 +347,15 @@ class CobyStrategy(Strategy):
             if bid is None:
                 return []
 
+            if bid >= self.take_profit:
+                self._pending_action[m.ticker] = Action.SELL
+                self._exit_reason[m.ticker] = "TAKE_PROFIT"
+                return [self._order(
+                    ticker=m.ticker, action=Action.SELL, side=side,
+                    price=self.take_profit, count=count,
+                )]
+
             entry_price = self._entry_price_by_ticker.get(m.ticker)
-
-            if entry_price is not None:
-                take_profit_price = min(
-                    99,
-                    entry_price + self.take_profit_gain_cents,
-                )
-
-                if bid >= take_profit_price:
-                    self._pending_action[m.ticker] = Action.SELL
-                    self._exit_reason[m.ticker] = "TAKE_PROFIT_12C"
-                    return [self._order(
-                        ticker=m.ticker,
-                        action=Action.SELL,
-                        side=side,
-                        price=take_profit_price,
-                        count=count,
-                    )]
-
-                if (
-                    seconds_left <= self.late_profit_exit_seconds
-                    and bid >= entry_price + self.late_profit_min_gain_cents
-                ):
-                    self._pending_action[m.ticker] = Action.SELL
-                    self._exit_reason[m.ticker] = "LATE_4_MINUTE_PROFIT_EXIT"
-                    return [self._order(
-                        ticker=m.ticker,
-                        action=Action.SELL,
-                        side=side,
-                        price=int(bid),
-                        count=count,
-                    )]
-
             dynamic_stop = (
                 max(1, min(self.legacy_stop_cap, entry_price - self.dynamic_stop_gap))
                 if entry_price is not None
@@ -629,7 +590,7 @@ class CobyStrategy(Strategy):
                 record_model_snapshot(
                     **common,
                     decision="WAIT",
-                    reason="OBSERVATION_ONLY_OVER_9_MIN",
+                    reason="OBSERVATION_ONLY_OVER_10_MIN",
                 )
             return []
 
