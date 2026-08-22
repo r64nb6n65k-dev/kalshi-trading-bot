@@ -76,6 +76,13 @@ class CobyStrategy(Strategy):
             params.get("chaos_skip_enable_seconds_left", self.entry_window_seconds)
         )
 
+        # Chaos is a temporary entry block, not a lifetime sentence.
+        # After chaos subsides, require this many consecutive clean evaluations
+        # before allowing the ticker to become eligible again.
+        self.chaos_recovery_confirmations = int(
+            params.get("chaos_recovery_confirmations", 3)
+        )
+
         self.use_trading_hours = bool(params.get("use_trading_hours", False))
         self.trading_timezone = ZoneInfo(
             str(params.get("trading_timezone", "America/Chicago"))
@@ -97,6 +104,7 @@ class CobyStrategy(Strategy):
         self._chaos_history: deque[float] = deque(maxlen=max(1, self.chaos_history_size))
         self._peak_travel_by_ticker: dict[str, float] = {}
         self._remembered_chaos_tickers: set[str] = set()
+        self._chaos_clean_count_by_ticker: dict[str, int] = {}
 
         self._side_by_ticker: dict[str, Side] = {}
         self._entry_price_by_ticker: dict[str, int] = {}
@@ -389,21 +397,6 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        # Do not return early for a chaos-disqualified ticker before its final
-        # history sample has been recorded. We still need to observe the market
-        # through its final minute so future markets can learn from it.
-        if (
-            m.ticker in self._chaos_disqualified_tickers
-            and seconds_left > self.final_exit_seconds
-        ):
-            self._log_entry_check(
-                ticker=m.ticker, seconds_left=seconds_left,
-                yes_bid=m.yes_bid, yes_ask=m.yes_ask,
-                no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="SKIP_MARKET_EXTREME_CHAOS",
-            )
-            return []
-
         if self._pending_action.get(m.ticker) is Action.BUY:
             return []
 
@@ -601,21 +594,22 @@ class CobyStrategy(Strategy):
                 )
             return []
 
-        # Once the entry window opens, only then may chaos become a permanent
-        # market skip. A strong high-volatility trend still passes because the
-        # path must ALSO be inefficient and heavily reversing.
+        # Once the entry window opens, chaos becomes a TEMPORARY entry block.
+        # A strong high-volatility trend still passes because the path must ALSO
+        # be inefficient and heavily reversing.
         if extreme_movement and chaotic_path:
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
             self._chaos_disqualified_tickers.add(m.ticker)
+            self._chaos_clean_count_by_ticker[m.ticker] = 0
             record_model_snapshot(
                 **common,
-                decision="SKIP_MARKET",
-                reason="SKIP_MARKET_EXTREME_CHAOS",
+                decision="WAIT",
+                reason="EXTREME_CHAOS_TEMP_BLOCK",
             )
             logger.warning(
-                "MODEL MARKET SKIP | ticker=%s | reason=EXTREME_CHAOS | travel=%.2f | "
-                "efficiency=%.3f | reversal_ratio=%.3f | baseline=%s | threshold=%.2f | "
+                "MODEL CHAOS BLOCK | ticker=%s | travel=%.2f | efficiency=%.3f | "
+                "reversal_ratio=%.3f | baseline=%s | threshold=%.2f | "
                 "history_markets=%d | seconds_left=%.1f",
                 m.ticker,
                 travel,
@@ -628,8 +622,53 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        # If we are here, the entry window is open and chaos did not disqualify
-        # the market. Continue through the original strategy rules unchanged.
+        # If this ticker was previously chaos-blocked but conditions are now
+        # clean, require consecutive clean evaluations before releasing it.
+        if m.ticker in self._chaos_disqualified_tickers:
+            clean_count = self._chaos_clean_count_by_ticker.get(m.ticker, 0) + 1
+            self._chaos_clean_count_by_ticker[m.ticker] = clean_count
+
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+
+            if clean_count < self.chaos_recovery_confirmations:
+                record_model_snapshot(
+                    **common,
+                    decision="WAIT",
+                    reason=(
+                        f"CHAOS_RECOVERY_{clean_count}"
+                        f"_OF_{self.chaos_recovery_confirmations}"
+                    ),
+                )
+                return []
+
+            self._chaos_disqualified_tickers.discard(m.ticker)
+            self._chaos_clean_count_by_ticker.pop(m.ticker, None)
+
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason="CHAOS_RECOVERED",
+            )
+            logger.warning(
+                "MODEL CHAOS RECOVERED | ticker=%s | clean_checks=%d | "
+                "travel=%.2f | efficiency=%.3f | reversal_ratio=%.3f | "
+                "seconds_left=%.1f",
+                m.ticker,
+                clean_count,
+                travel,
+                efficiency,
+                reversal_ratio,
+                seconds_left,
+            )
+
+            # Do not enter on the exact recovery snapshot. Start the normal
+            # confirmation process fresh on the next evaluation.
+            return []
+
+        # If we are here, the entry window is open and either chaos never
+        # blocked the ticker or the ticker has already recovered. Continue
+        # through the original strategy rules unchanged.
 
         if seconds_left <= 60:
             self._log_entry_check(
