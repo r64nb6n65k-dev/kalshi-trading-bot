@@ -78,17 +78,17 @@ class Settings(BaseSettings):
         description="Seconds between market polls in the live engine.",
     )
 
-    btc_ws_url: str = Field(
+    bnb_ws_url: str = Field(
         default="wss://advanced-trade-ws.coinbase.com",
-        description="Public BTC/USD WebSocket used as a BRTI proxy.",
+        description="Public Coinbase BNB/USD WebSocket; Coinbase is a BNBUSD_RTI constituent.",
     )
 
-    btc_product_id: str = Field(default="BTC-USD")
+    bnb_product_id: str = Field(default="BNB-USD")
 
-    btc_max_age_seconds: float = Field(
+    bnb_max_age_seconds: float = Field(
         default=3.0,
         gt=0.0,
-        description="Reject entries when the BTC stream is older than this.",
+        description="Reject entries when the BNB proxy stream is older than this.",
     )
 
     risk: RiskSettings = Field(default_factory=RiskSettings)

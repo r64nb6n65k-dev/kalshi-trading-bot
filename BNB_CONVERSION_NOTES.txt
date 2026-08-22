@@ -1,0 +1,49 @@
+BNB DRY-RUN CONVERSION - TRIPLE CHECKED
+
+Core market
+- Kalshi series: KXBNB15M
+- Dry-run command: python -m kalshi_bot.cli run coby_strategy KXBNB15M
+- DO NOT add --live during testing.
+
+Underlying feed
+- Coinbase Advanced Trade public WebSocket
+- Product: BNB-USD
+- Coinbase is one of the CF Benchmarks BNBUSD_RTI constituent exchanges.
+- This feed is still only one constituent, not the licensed BNBUSD_RTI itself.
+- Stale/missing feed data blocks entries.
+
+Strategy kept from the original BTC baseline
+- Entry window opens at 10:00 remaining
+- Minimum contract ask: 70c
+- Take profit: 98c
+- Dynamic stop gap: 13c
+- Legacy stop cap: 79c
+- Final exit: 60 seconds
+- Maximum target crossings: 2
+- Ignore/reset crossings for first 180 seconds
+- Required confirmations: 3
+- Max 200 contracts / $200 strategy notional
+
+BNB-specific calibration
+- Low-activity minimum separation: $0.50
+- Normal minimum separation: $1.00
+- High-activity minimum separation: $1.50
+- Low-volume ratio: < 0.75 of preceding 5-minute per-minute baseline
+- High-volume ratio: >= 1.50 of baseline
+- No adequate baseline: use normal $1.00 minimum
+- minimum_distance: $0.50
+- minimum_trend_change: -$0.05
+- chaos_min_travel: $1.00
+- model sigma floor: $0.05
+- per-tick volatility floor: $0.005
+
+Telemetry
+- Separate default DB: coby_bnb_dashboard.db
+- Model snapshots record bnb_price
+- BNB feed source label: COINBASE_BNBUSD_CONSTITUENT
+
+Verification
+- Python source and tests compile.
+- Unit suite passes with PYTHONPATH=src.
+- Live network smoke test cannot be performed in the build sandbox because outbound DNS/network is restricted.
+- First Railway log to verify: BNB FEED CONNECTED | source=COINBASE_BNBUSD_CONSTITUENT | product=BNB-USD

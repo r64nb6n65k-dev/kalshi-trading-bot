@@ -68,7 +68,7 @@ def test_balance_dollars() -> None:
 def test_market_preserves_btc_target_and_liquidity() -> None:
     market = Market.model_validate(
         {
-            "ticker": "KXBTC15M-TEST",
+            "ticker": "KXBNB15M-TEST",
             "floor_strike": 69_588.09,
             "yes_bid_size_fp": "7442.90",
             "yes_ask_size_fp": "6247.70",

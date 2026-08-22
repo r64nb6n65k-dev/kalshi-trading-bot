@@ -36,8 +36,13 @@ class CobyStrategy(Strategy):
             params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
         )
         self.required_confirmations = int(params.get("required_confirmations", 3))
-        self.minimum_distance = float(params.get("minimum_distance", 15.0))
-        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 30.0))
+        self.minimum_distance = float(params.get("minimum_distance", 0.50))
+        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 0.50))
+        self.normal_minimum_separation = float(params.get("normal_minimum_separation", 1.00))
+        self.high_volume_minimum_separation = float(params.get("high_volume_minimum_separation", 1.50))
+        self.low_volume_ratio = float(params.get("low_volume_ratio", 0.75))
+        self.high_volume_ratio = float(params.get("high_volume_ratio", 1.50))
+        self.volume_baseline_seconds = float(params.get("volume_baseline_seconds", 300.0))
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
 
@@ -45,8 +50,8 @@ class CobyStrategy(Strategy):
         self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 180.0))
 
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
-        self.minimum_trend_change = float(params.get("minimum_trend_change", -5.0))
-        self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
+        self.minimum_trend_change = float(params.get("minimum_trend_change", -0.05))
+        self.max_bnb_age_seconds = float(params.get("max_bnb_age_seconds", 5))
         self.take_profit = int(params.get("take_profit", 98))
         self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
@@ -68,7 +73,7 @@ class CobyStrategy(Strategy):
         self.chaos_travel_multiplier = float(params.get("chaos_travel_multiplier", 2.25))
         self.chaos_efficiency_ceiling = float(params.get("chaos_efficiency_ceiling", 0.30))
         self.chaos_reversal_ratio = float(params.get("chaos_reversal_ratio", 0.45))
-        self.chaos_min_travel = float(params.get("chaos_min_travel", 100.0))
+        self.chaos_min_travel = float(params.get("chaos_min_travel", 1.00))
 
         # IMPORTANT: chaos is observed from market open, but it cannot permanently
         # disqualify the market until entries themselves are allowed.
@@ -406,18 +411,18 @@ class CobyStrategy(Strategy):
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
                 no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="NO_BTC_DATA",
+                reason="NO_BNB_DATA",
             )
             return []
 
         latest = ticks[-1]
         age = (datetime.now(timezone.utc) - latest.timestamp).total_seconds()
-        if age > self.max_btc_age_seconds or m.floor_strike is None:
+        if age > self.max_bnb_age_seconds or m.floor_strike is None:
             self._log_entry_check(
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
                 no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="BTC_STALE_OR_NO_TARGET",
+                reason="BNB_STALE_OR_NO_TARGET",
             )
             return []
 
@@ -441,7 +446,7 @@ class CobyStrategy(Strategy):
         vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
         drift = 0.65 * mom15 / 15.0 + 0.35 * mom60 / 60.0
         projected = latest.price + drift * min(seconds_left, 300) * 0.35
-        sigma = max(5.0, max(vol, 0.35) * math.sqrt(max(seconds_left, 1)))
+        sigma = max(0.05, max(vol, 0.005) * math.sqrt(max(seconds_left, 1)))
         z = (projected - float(m.floor_strike)) / sigma
         model_yes = max(0.01, min(0.99, 0.5 * (1 + math.erf(z / math.sqrt(2)))))
         model_no = 1 - model_yes
@@ -523,14 +528,51 @@ class CobyStrategy(Strategy):
         dynamic_distance = max(
             self.minimum_distance,
             self.volatility_multiplier
-            * max(vol, 0.35)
+            * max(vol, 0.005)
             * math.sqrt(max(1.0, min(seconds_left, 60.0))),
         )
+
+        # Adaptive BNB separation based on underlying trade activity. Compare
+        # the last 60 seconds of BNB notional volume with the preceding rolling
+        # baseline. Quiet markets may use $0.50; normal markets $1.00; elevated
+        # volume requires $1.50. If baseline history is insufficient, default
+        # conservatively to the normal $1.00 bucket.
+        recent_volume = sum(
+            x.price * x.size for x in ticks
+            if (latest.timestamp - x.timestamp).total_seconds() <= 60
+        )
+        baseline_ticks = [
+            x for x in ticks
+            if 60 < (latest.timestamp - x.timestamp).total_seconds() <= self.volume_baseline_seconds + 60
+        ]
+        baseline_span = max(0.0, self.volume_baseline_seconds)
+        baseline_volume_per_minute = (
+            sum(x.price * x.size for x in baseline_ticks) / (baseline_span / 60.0)
+            if baseline_ticks and baseline_span >= 60
+            else None
+        )
+        volume_ratio = (
+            recent_volume / baseline_volume_per_minute
+            if baseline_volume_per_minute and baseline_volume_per_minute > 0
+            else None
+        )
+        if volume_ratio is None:
+            adaptive_minimum_separation = self.normal_minimum_separation
+            volume_regime = "NORMAL_NO_BASELINE"
+        elif volume_ratio < self.low_volume_ratio:
+            adaptive_minimum_separation = self.hard_minimum_separation
+            volume_regime = "LOW"
+        elif volume_ratio >= self.high_volume_ratio:
+            adaptive_minimum_separation = self.high_volume_minimum_separation
+            volume_regime = "HIGH"
+        else:
+            adaptive_minimum_separation = self.normal_minimum_separation
+            volume_regime = "NORMAL"
 
         common = dict(
             ticker=m.ticker,
             seconds_left=seconds_left,
-            btc_price=latest.price,
+            bnb_price=latest.price,
             target_price=target,
             separation=separation,
             yes_bid=m.yes_bid,
@@ -679,13 +721,16 @@ class CobyStrategy(Strategy):
             )
             return []
 
-        if abs(separation) < self.hard_minimum_separation:
+        if abs(separation) < adaptive_minimum_separation:
             self._confirmation_count_by_ticker[m.ticker] = 0
             self._confirmation_side_by_ticker.pop(m.ticker, None)
             record_model_snapshot(
                 **common,
                 decision="WAIT",
-                reason="HARD_MINIMUM_SEPARATION_UNDER_30",
+                reason=(
+                    f"BNB_SEPARATION_UNDER_{adaptive_minimum_separation:.2f}_"
+                    f"VOLUME_{volume_regime}"
+                ),
             )
             return []
 

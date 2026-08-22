@@ -24,7 +24,7 @@ def _ctx(prices: list[float], *, target: float = 100.0) -> StrategyContext:
         for index, price in enumerate(prices)
     )
     market = Market(
-        ticker="KXBTC15M-TEST",
+        ticker="KXBNB15M-TEST",
         close_time=_close_time(),
         floor_strike=target,
         yes_bid=91,
@@ -73,11 +73,12 @@ def test_choppy_target_crossings_block_entry() -> None:
     assert strategy.on_market_data(_ctx(prices)) == []
 
 
-def test_exit_does_not_require_btc_feed() -> None:
+def test_exit_does_not_require_bnb_feed() -> None:
     strategy = CobyStrategy()
-    ticker = "KXBTC15M-TEST"
+    ticker = "KXBNB15M-TEST"
     strategy._side_by_ticker[ticker] = Side.YES
     strategy._filled_count_by_ticker[ticker] = 10
+    strategy._entry_price_by_ticker[ticker] = 92
     market = Market(
         ticker=ticker,
         close_time=_close_time(),

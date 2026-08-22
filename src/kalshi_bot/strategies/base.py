@@ -19,7 +19,7 @@ from kalshi_bot.exchange.models import Market, OrderRequest, Position
 
 @dataclass(frozen=True)
 class UnderlyingTick:
-    """One trade from the external BTC reference feed."""
+    """One trade from the external underlying reference feed."""
 
     price: float
     size: float

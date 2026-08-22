@@ -18,7 +18,7 @@ async def test_paper_orders_fill_and_update_strategy_state() -> None:
         dry_run=True,
     )
     market = Market(
-        ticker="KXBTC15M-TEST",
+        ticker="KXBNB15M-TEST",
         yes_bid=91,
         yes_ask=92,
         no_bid=8,
