@@ -30,7 +30,7 @@ class ScalpConfig:
     max_seconds_left: int = 720
     min_seconds_left: int = 120
     reprice_seconds: float = 5.0
-    output_csv: str = "btc_orderbook_data.csv"
+    output_csv: str = "btc_orderbook_data_v2.csv"
 
 
 class BtcOrderBookScalpingEngine:
@@ -90,7 +90,8 @@ class BtcOrderBookScalpingEngine:
         fields = [
             "timestamp", "ticker", "seconds_left", "yes_bid", "yes_ask",
             "yes_bid_size", "yes_ask_size", "spread", "yes_inventory",
-            "no_inventory", "realized_cents", "event", "detail",
+            "no_inventory", "realized_cents", "marked_total_cents", "event",
+            "detail",
         ]
         self._writer = csv.DictWriter(self._file, fieldnames=fields)
         if not exists:
@@ -116,6 +117,7 @@ class BtcOrderBookScalpingEngine:
             "yes_inventory": self.inventory["yes"],
             "no_inventory": self.inventory["no"],
             "realized_cents": self.realized_cents,
+            "marked_total_cents": self._marked_total_cents(book),
             "event": event,
             "detail": detail,
         })
@@ -212,6 +214,19 @@ class BtcOrderBookScalpingEngine:
             self._quote_ids.pop(key, None)
             self._quote_time.pop(key, None)
 
+    def _marked_total_cents(self, book: BinaryOrderBook) -> int:
+        """Return realized P&L plus executable bid value of open inventory."""
+        total = self.realized_cents
+        for outcome in ("yes", "no"):
+            held = self.inventory[outcome]
+            if held <= 0:
+                continue
+            exit_bid = book.bid(outcome)
+            if exit_bid is None:
+                exit_bid = 0
+            total += (exit_bid * held) - self.cost_cents[outcome]
+        return total
+
     async def run(self, max_events: int | None = None) -> None:
         market = await self.resolve_market()
         book = BinaryOrderBook(market.ticker)
@@ -263,11 +278,20 @@ class BtcOrderBookScalpingEngine:
                     break
         finally:
             self._cancel_all()
+            marked_total_cents = self._marked_total_cents(book)
             if self._file is not None:
+                self._record(
+                    book,
+                    self.seconds_left(market),
+                    "FINAL_MARK",
+                    f"marked_total_cents={marked_total_cents}",
+                )
                 self._file.close()
             logger.warning(
-                "BTC SCALPER STOPPED | realized=$%.2f | YES=%d | NO=%d | events=%d",
+                "BTC SCALPER STOPPED | realized=$%.2f | marked_total=$%.2f | "
+                "YES=%d | NO=%d | events=%d",
                 self.realized_cents / 100.0,
+                marked_total_cents / 100.0,
                 self.inventory["yes"],
                 self.inventory["no"],
                 events,
