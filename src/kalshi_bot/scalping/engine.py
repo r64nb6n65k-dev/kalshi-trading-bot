@@ -24,8 +24,8 @@ logger = get_logger(__name__)
 class ScalpConfig:
     quote_size: int = 10
     max_inventory: int = 20
-    min_spread_cents: int = 3
-    profit_cents: int = 2
+    min_spread_cents: int = 1
+    profit_cents: int = 1
     min_top_depth: int = 20
     max_seconds_left: int = 720
     min_seconds_left: int = 120
