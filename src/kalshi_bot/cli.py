@@ -23,6 +23,7 @@ from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.data.bnb import BnbPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.risk.manager import RiskManager
+from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
 from kalshi_bot.strategies.base import Strategy
 from kalshi_bot.strategies.examples.arbitrage import ArbitrageYesNo
 from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
@@ -229,6 +230,41 @@ def run(
                 ticker,
                 max_ticks=None if ticks == 0 else ticks,
             )
+
+    asyncio.run(_run())
+
+
+@app.command("btc-scalper")
+def btc_scalper(
+    events: int = typer.Option(
+        0,
+        help="Order-book deltas to record before stopping (0 runs continuously).",
+    ),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Reserved for the validated live build; currently safety-locked.",
+    ),
+) -> None:
+    """Record and queue-simulate the KXBTC15M order book."""
+
+    async def _run() -> None:
+        settings = load_settings()
+        if live:
+            console.print(
+                "[red]Live maker trading is safety-locked until dry-run queue validation passes.[/]"
+            )
+            raise typer.Exit(code=2)
+        async with KalshiClient.from_settings(settings) as client:
+            from kalshi_bot.exchange.websocket import KalshiWebSocket
+
+            websocket = KalshiWebSocket.from_settings(settings)
+            engine = BtcOrderBookScalpingEngine(
+                client=client,
+                websocket=websocket,
+                dry_run=True,
+            )
+            await engine.run(max_events=None if events == 0 else events)
 
     asyncio.run(_run())
 

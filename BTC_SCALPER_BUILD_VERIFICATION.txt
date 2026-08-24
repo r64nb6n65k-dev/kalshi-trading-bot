@@ -1,0 +1,42 @@
+BTC ORDER-BOOK SCALPER BUILD VERIFICATION
+=========================================
+
+Build type
+----------
+- Separate KXBTC15M order-book recorder and queue-aware paper scalper.
+- Existing BNB CobyStrategy preserved without modification.
+- Existing BNB TradingEngine preserved without modification.
+- Live BTC maker execution deliberately safety-locked pending dry-run evidence.
+
+Implemented
+-----------
+- Authenticated Kalshi WebSocket orderbook_snapshot subscription.
+- Incremental orderbook_delta maintenance for YES and NO bid books.
+- Public trade stream processing.
+- Binary ask derivation from complementary bids.
+- Displayed depth and spread filters.
+- Queue-ahead tracking for resting paper orders.
+- Fill simulation based only on public trade volume at the exact order price.
+- Paired YES/NO fill accounting.
+- Passive two-cent exit targets.
+- Quote aging/cancellation, inventory caps, and final-two-minute cutoff.
+- Append-only btc_orderbook_data.csv data capture.
+- Dedicated CLI command: python -m kalshi_bot.cli btc-scalper
+
+Verification performed
+----------------------
+- Safe archive path audit: passed.
+- Credential/private-key scan: no uploaded credentials found.
+- Python compilation of src and tests: passed.
+- Order-book price/size derivation checks: passed.
+- Incremental delta application checks: passed.
+- Queue-ahead and exact-price public-trade fill checks: passed.
+- Wrong-taker-side non-fill check: passed.
+- Existing BNB strategy SHA-256 matches uploaded original: passed.
+- Existing BNB engine SHA-256 matches uploaded original: passed.
+
+Environment limitation
+----------------------
+The complete pytest dependency set was not available in the isolated build
+environment and could not be downloaded. The new core components were executed
+directly with deterministic assertions in addition to Python compilation.

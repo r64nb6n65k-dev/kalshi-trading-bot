@@ -57,6 +57,7 @@ class KalshiWebSocket:
         self,
         channels: list[str],
         market_tickers: list[str] | None = None,
+        subscription_params: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Connect, subscribe, and yield each decoded message.
 
@@ -73,6 +74,8 @@ class KalshiWebSocket:
             params: dict[str, Any] = {"channels": channels}
             if market_tickers:
                 params["market_tickers"] = market_tickers
+            if subscription_params:
+                params.update(subscription_params)
             subscribe = {
                 "id": next(self._id_counter),
                 "cmd": "subscribe",
