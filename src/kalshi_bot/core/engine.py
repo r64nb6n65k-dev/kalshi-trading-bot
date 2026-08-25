@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from kalshi_bot.data.bnb import BnbPriceFeed
+from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Market, Order, OrderRequest, Position, Side
 from kalshi_bot.risk.manager import RiskManager
@@ -27,25 +27,25 @@ class TradingEngine:
         risk: RiskManager,
         dry_run: bool = True,
         poll_interval: float = 1.0,
-        bnb_feed: BnbPriceFeed | None = None,
+        underlying_feed: GoldPriceFeed | None = None,
     ) -> None:
         self.client = client
         self.strategy = strategy
         self.risk = risk
         self.dry_run = dry_run
         self.poll_interval = poll_interval
-        self.bnb_feed = bnb_feed
+        self.underlying_feed = underlying_feed
         self._running = False
 
     async def _snapshot(self, ticker: str) -> StrategyContext:
-        if ticker == "KXBNB15M":
+        if ticker == "KXGOLD15M":
             markets = await self.client.get_markets(
                 status="open",
-                series_ticker="KXBNB15M",
+                series_ticker="KXGOLD15M",
                 limit=100,
             )
             if not markets:
-                raise RuntimeError("No open KXBNB15M market found")
+                raise RuntimeError("No open KXGOLD15M market found")
             market = min(markets, key=lambda m: m.close_time or "")
         else:
             market = await self.client.get_market(ticker)
@@ -57,7 +57,9 @@ class TradingEngine:
                 positions[pos.ticker] = pos
             balance = (await self.client.get_balance()).balance
 
-        underlying_ticks = self.bnb_feed.snapshot() if self.bnb_feed is not None else ()
+        underlying_ticks = (
+            self.underlying_feed.snapshot() if self.underlying_feed is not None else ()
+        )
         return StrategyContext(
             market=market,
             positions=positions,
@@ -145,8 +147,8 @@ class TradingEngine:
 
     async def run(self, ticker: str, max_ticks: int | None = None) -> None:
         self._running = True
-        if self.bnb_feed is not None:
-            await self.bnb_feed.start()
+        if self.underlying_feed is not None:
+            await self.underlying_feed.start()
         self.strategy.on_start()
         logger.info(
             "Engine started | strategy=%s | ticker=%s | dry_run=%s",
@@ -177,8 +179,8 @@ class TradingEngine:
                     break
                 await asyncio.sleep(self.poll_interval)
         finally:
-            if self.bnb_feed is not None:
-                await self.bnb_feed.stop()
+            if self.underlying_feed is not None:
+                await self.underlying_feed.stop()
             self.strategy.on_stop()
             self._running = False
             logger.info("Engine stopped after %d tick(s)", tick)

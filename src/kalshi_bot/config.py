@@ -78,17 +78,15 @@ class Settings(BaseSettings):
         description="Seconds between market polls in the live engine.",
     )
 
-    bnb_ws_url: str = Field(
-        default="wss://advanced-trade-ws.coinbase.com",
-        description="Public Coinbase BNB/USD WebSocket; Coinbase is a BNBUSD_RTI constituent.",
+    gold_price_url: str = Field(default="https://hermes.pyth.network")
+    gold_price_feed_id: str = Field(
+        default="765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
     )
-
-    bnb_product_id: str = Field(default="BNB-USD")
-
-    bnb_max_age_seconds: float = Field(
+    pyth_api_key: str = Field(default="")
+    gold_max_age_seconds: float = Field(
         default=3.0,
         gt=0.0,
-        description="Reject entries when the BNB proxy stream is older than this.",
+        description="Reject entries when the Pyth XAU/USD feed is older than this.",
     )
 
     risk: RiskSettings = Field(default_factory=RiskSettings)

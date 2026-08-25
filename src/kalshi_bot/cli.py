@@ -20,7 +20,7 @@ from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
-from kalshi_bot.data.bnb import BnbPriceFeed
+from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
@@ -69,7 +69,7 @@ def strategies() -> None:
         "mean_reversion": "Fade moves beyond N standard deviations from the mean.",
         "arbitrage": "Buy YES+NO when their combined ask is below 100c.",
         "fair_value": "Buy YES below your fair probability, Kelly-sized.",
-        "coby_strategy": "Coby's 15-minute BNB strategy.",
+        "coby_strategy": "Coby's 15-minute gold strategy.",
     }
 
     for name, cls in STRATEGIES.items():
@@ -209,21 +209,22 @@ def run(
         dry_run = not live
 
         async with KalshiClient.from_settings(settings) as client:
-            bnb_feed = None
+            gold_feed = None
             strategy_params = {}
             if strategy == "coby_strategy":
-                bnb_feed = BnbPriceFeed(
-                    ws_url=settings.bnb_ws_url,
-                    product_id=settings.bnb_product_id,
+                gold_feed = GoldPriceFeed(
+                    base_url=settings.gold_price_url,
+                    price_feed_id=settings.gold_price_feed_id,
+                    api_key=settings.pyth_api_key,
                 )
-                strategy_params["max_bnb_age_seconds"] = settings.bnb_max_age_seconds
+                strategy_params["max_gold_age_seconds"] = settings.gold_max_age_seconds
             engine = TradingEngine(
                 client=client,
                 strategy=STRATEGIES[strategy](**strategy_params),
                 risk=RiskManager.from_settings(settings.risk),
                 dry_run=dry_run,
                 poll_interval=settings.poll_interval,
-                bnb_feed=bnb_feed,
+                underlying_feed=gold_feed,
             )
 
             await engine.run(

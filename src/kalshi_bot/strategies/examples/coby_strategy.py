@@ -36,10 +36,10 @@ class CobyStrategy(Strategy):
             params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
         )
         self.required_confirmations = int(params.get("required_confirmations", 3))
-        self.minimum_distance = float(params.get("minimum_distance", 0.50))
-        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 0.50))
-        self.normal_minimum_separation = float(params.get("normal_minimum_separation", 1.00))
-        self.high_volume_minimum_separation = float(params.get("high_volume_minimum_separation", 1.50))
+        self.minimum_distance = float(params.get("minimum_distance", 3.00))
+        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 3.00))
+        self.normal_minimum_separation = float(params.get("normal_minimum_separation", 3.00))
+        self.high_volume_minimum_separation = float(params.get("high_volume_minimum_separation", 3.00))
         self.low_volume_ratio = float(params.get("low_volume_ratio", 0.75))
         self.high_volume_ratio = float(params.get("high_volume_ratio", 1.50))
         self.volume_baseline_seconds = float(params.get("volume_baseline_seconds", 300.0))
@@ -50,12 +50,12 @@ class CobyStrategy(Strategy):
         self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 180.0))
 
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
-        self.minimum_trend_change = float(params.get("minimum_trend_change", -0.05))
-        self.max_bnb_age_seconds = float(params.get("max_bnb_age_seconds", 5))
+        self.minimum_trend_change = float(params.get("minimum_trend_change", -0.10))
+        self.max_gold_age_seconds = float(params.get("max_gold_age_seconds", 5))
         self.take_profit = int(params.get("take_profit", 98))
         self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
-        self.max_contracts = int(params.get("max_contracts", 100))
+        self.max_contracts = int(params.get("max_contracts", 200))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
@@ -73,7 +73,12 @@ class CobyStrategy(Strategy):
         self.chaos_travel_multiplier = float(params.get("chaos_travel_multiplier", 2.25))
         self.chaos_efficiency_ceiling = float(params.get("chaos_efficiency_ceiling", 0.30))
         self.chaos_reversal_ratio = float(params.get("chaos_reversal_ratio", 0.45))
-        self.chaos_min_travel = float(params.get("chaos_min_travel", 1.00))
+        self.chaos_min_travel = float(params.get("chaos_min_travel", 8.00))
+
+        # A gold contract-price stop must persist and be confirmed by adverse
+        # movement in XAU/USD. One thin Kalshi bid is not enough to dump a trade.
+        self.stop_confirmations = int(params.get("stop_confirmations", 3))
+        self.stop_adverse_move = float(params.get("stop_adverse_move", 1.00))
 
         # IMPORTANT: chaos is observed from market open, but it cannot permanently
         # disqualify the market until entries themselves are allowed.
@@ -122,6 +127,7 @@ class CobyStrategy(Strategy):
         self._total_pnl_cents = 0
         self._confirmation_side_by_ticker: dict[str, Side] = {}
         self._confirmation_count_by_ticker: dict[str, int] = {}
+        self._stop_confirmation_count_by_ticker: dict[str, int] = {}
 
     def _seconds_to_close(self, close_time: str | None) -> float | None:
         if not close_time:
@@ -366,9 +372,32 @@ class CobyStrategy(Strategy):
                 if entry_price is not None
                 else max(1, int(bid) - self.dynamic_stop_gap)
             )
-            if bid <= dynamic_stop:
+            ticks = ctx.underlying_ticks
+            adverse_underlying = False
+            if ticks and m.floor_strike is not None:
+                latest_tick = ticks[-1]
+                cutoff = latest_tick.timestamp.timestamp() - 15.0
+                old_tick = next(
+                    (tick for tick in reversed(ticks) if tick.timestamp.timestamp() <= cutoff),
+                    ticks[0],
+                )
+                momentum_15 = latest_tick.price - old_tick.price
+                target = float(m.floor_strike)
+                adverse_underlying = (
+                    latest_tick.price <= target or momentum_15 <= -self.stop_adverse_move
+                    if side is Side.YES
+                    else latest_tick.price >= target or momentum_15 >= self.stop_adverse_move
+                )
+
+            if bid <= dynamic_stop and adverse_underlying:
+                stop_checks = self._stop_confirmation_count_by_ticker.get(m.ticker, 0) + 1
+                self._stop_confirmation_count_by_ticker[m.ticker] = stop_checks
+            else:
+                self._stop_confirmation_count_by_ticker[m.ticker] = 0
+
+            if self._stop_confirmation_count_by_ticker[m.ticker] >= self.stop_confirmations:
                 self._pending_action[m.ticker] = Action.SELL
-                self._exit_reason[m.ticker] = "DYNAMIC_STOP"
+                self._exit_reason[m.ticker] = "CONFIRMED_GOLD_DYNAMIC_STOP"
                 return [self._order(
                     ticker=m.ticker, action=Action.SELL, side=side,
                     price=self.stop_exit_floor, count=count,
@@ -411,18 +440,18 @@ class CobyStrategy(Strategy):
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
                 no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="NO_BNB_DATA",
+                reason="NO_GOLD_DATA",
             )
             return []
 
         latest = ticks[-1]
         age = (datetime.now(timezone.utc) - latest.timestamp).total_seconds()
-        if age > self.max_bnb_age_seconds or m.floor_strike is None:
+        if age > self.max_gold_age_seconds or m.floor_strike is None:
             self._log_entry_check(
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
                 no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="BNB_STALE_OR_NO_TARGET",
+                reason="GOLD_STALE_OR_NO_TARGET",
             )
             return []
 
@@ -532,11 +561,8 @@ class CobyStrategy(Strategy):
             * math.sqrt(max(1.0, min(seconds_left, 60.0))),
         )
 
-        # Adaptive BNB separation based on underlying trade activity. Compare
-        # the last 60 seconds of BNB notional volume with the preceding rolling
-        # baseline. Quiet markets may use $0.50; normal markets $1.00; elevated
-        # volume requires $1.50. If baseline history is insufficient, default
-        # conservatively to the normal $1.00 bucket.
+        # Pyth publishes price updates rather than exchange trade size, so all
+        # volume regimes intentionally resolve to the same $3 gold separation.
         recent_volume = sum(
             x.price * x.size for x in ticks
             if (latest.timestamp - x.timestamp).total_seconds() <= 60
@@ -572,7 +598,7 @@ class CobyStrategy(Strategy):
         common = dict(
             ticker=m.ticker,
             seconds_left=seconds_left,
-            bnb_price=latest.price,
+            gold_price=latest.price,
             target_price=target,
             separation=separation,
             yes_bid=m.yes_bid,
@@ -728,7 +754,7 @@ class CobyStrategy(Strategy):
                 **common,
                 decision="WAIT",
                 reason=(
-                    f"BNB_SEPARATION_UNDER_{adaptive_minimum_separation:.2f}_"
+                    f"GOLD_SEPARATION_UNDER_{adaptive_minimum_separation:.2f}_"
                     f"VOLUME_{volume_regime}"
                 ),
             )
