@@ -1,4 +1,4 @@
-"""Resilient Pyth XAU/USD price feed for Kalshi gold markets."""
+"""Resilient XAU/USD price feed for Kalshi gold markets."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 
 
 class GoldPriceFeed:
-    """Maintain a rolling history of the Pyth XAU/USD settlement feed."""
+    """Maintain a rolling history of the Gold-API XAU/USD spot feed."""
 
     def __init__(
         self,
@@ -27,9 +27,10 @@ class GoldPriceFeed:
         poll_interval: float = 1.0,
         history_minutes: int = 20,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.price_feed_id = price_feed_id.removeprefix("0x")
-        self.api_key = api_key.strip()
+        # Preserve compatibility with the existing CLI configuration.
+        del base_url, price_feed_id, api_key
+
+        self.base_url = "https://api.gold-api.com"
         self.poll_interval = poll_interval
         self._history = timedelta(minutes=history_minutes)
         self._ticks: deque[UnderlyingTick] = deque()
@@ -39,7 +40,10 @@ class GoldPriceFeed:
     async def start(self) -> None:
         if self._task is None or self._task.done():
             self._stopping = False
-            self._task = asyncio.create_task(self._run(), name="gold-price-feed")
+            self._task = asyncio.create_task(
+                self._run(),
+                name="gold-price-feed",
+            )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -55,50 +59,73 @@ class GoldPriceFeed:
     def _append(self, tick: UnderlyingTick) -> None:
         if self._ticks and tick.timestamp < self._ticks[-1].timestamp:
             return
+
         if self._ticks and tick.timestamp == self._ticks[-1].timestamp:
             self._ticks[-1] = tick
             return
+
         self._ticks.append(tick)
         cutoff = tick.timestamp - self._history
+
         while self._ticks and self._ticks[0].timestamp < cutoff:
             self._ticks.popleft()
 
     def _parse(self, payload: dict[str, Any]) -> UnderlyingTick:
-        parsed = payload.get("parsed")
-        if not isinstance(parsed, list) or not parsed:
-            raise ValueError("Pyth response did not contain a parsed price")
-        price_data = parsed[0].get("price")
-        if not isinstance(price_data, dict):
-            raise ValueError("Pyth response did not contain price data")
-        price = float(price_data["price"]) * (10.0 ** int(price_data["expo"]))
-        timestamp = datetime.fromtimestamp(int(price_data["publish_time"]), tz=UTC)
+        if payload.get("symbol") != "XAU":
+            raise ValueError("Gold API response was not XAU")
+
+        if payload.get("currency") != "USD":
+            raise ValueError("Gold API response was not denominated in USD")
+
+        price = float(payload["price"])
+        if price <= 0:
+            raise ValueError("Gold API returned a non-positive price")
+
+        updated_at = payload.get("updatedAt")
+        if not isinstance(updated_at, str):
+            raise ValueError(
+                "Gold API response did not contain an update timestamp"
+            )
+
+        timestamp = datetime.fromisoformat(
+            updated_at.replace("Z", "+00:00")
+        )
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+
         return UnderlyingTick(
             price=price,
             size=1.0,
             timestamp=timestamp,
-            source="PYTH_XAUUSD_SETTLEMENT_SOURCE",
+            source="GOLD_API_XAUUSD_SPOT",
         )
 
     async def _run(self) -> None:
         delay = 1.0
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        url = f"{self.base_url}/v2/updates/price/latest"
-        params = [("ids[]", self.price_feed_id)]
+        url = f"{self.base_url}/price/XAU"
+
         async with httpx.AsyncClient(
             timeout=10.0,
-            headers=headers,
             trust_env=False,
         ) as client:
             while not self._stopping:
                 try:
-                    response = await client.get(url, params=params)
+                    response = await client.get(url)
                     response.raise_for_status()
-                    self._append(self._parse(response.json()))
+
+                    tick = self._parse(response.json())
+                    self._append(tick)
+
                     delay = 1.0
                     await asyncio.sleep(self.poll_interval)
+
                 except asyncio.CancelledError:
                     raise
+
                 except Exception:
-                    logger.exception("GOLD FEED ERROR | retry_seconds=%.1f", delay)
+                    logger.exception(
+                        "GOLD FEED ERROR | retry_seconds=%.1f",
+                        delay,
+                    )
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 30.0)
