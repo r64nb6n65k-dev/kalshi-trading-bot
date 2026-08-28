@@ -7,6 +7,8 @@ path to the RSA private key) come from the environment -- never hard-code them.
 from __future__ import annotations
 
 from enum import Enum
+import os
+from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -109,5 +111,22 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    """Load and validate settings from the environment."""
-    return Settings()
+    """Load and validate settings from the environment.
+
+    Railway can provide the Kalshi RSA private key directly through
+    ``KALSHI_PRIVATE_KEY``. When present, write it to a private temporary PEM
+    file and point the existing authentication code at that file. This keeps
+    the REST and WebSocket authentication paths unchanged.
+    """
+    settings = Settings()
+
+    private_key_pem = os.getenv("KALSHI_PRIVATE_KEY", "").strip()
+    if private_key_pem:
+        # Also tolerate a value pasted with literal \n sequences.
+        private_key_pem = private_key_pem.replace("\\n", "\n")
+        key_path = Path("/tmp/kalshi_private_key.pem")
+        key_path.write_text(private_key_pem + "\n", encoding="utf-8")
+        key_path.chmod(0o600)
+        settings.private_key_path = str(key_path)
+
+    return settings
