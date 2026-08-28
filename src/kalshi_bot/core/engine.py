@@ -40,34 +40,58 @@ class TradingEngine:
 
     async def _snapshot(self, ticker: str) -> StrategyContext:
         if ticker == "KXBTC15M":
-            markets = await self.client.get_markets(
-                status="open",
-                series_ticker="KXBTC15M",
-                limit=100,
-            )
-            if not markets:
-                raise RuntimeError("No open KXBTC15M market found")
+            market = None
 
-            now = datetime.now(timezone.utc)
-            active_markets = []
-            for candidate in markets:
-                if not candidate.close_time:
-                    continue
-                try:
-                    close_dt = datetime.fromisoformat(
-                        candidate.close_time.replace("Z", "+00:00")
+            while self._running and market is None:
+                now = datetime.now(timezone.utc)
+
+                # First use Kalshi's open-market view. If that view lags during a
+                # 15-minute rollover, fall back to the full series instead of
+                # selecting an expired contract or crashing the Railway process.
+                markets = await self.client.get_markets(
+                    status="open",
+                    series_ticker="KXBTC15M",
+                    limit=100,
+                )
+
+                def future_candidates(items: list[Market]) -> list[tuple[datetime, Market]]:
+                    candidates: list[tuple[datetime, Market]] = []
+                    for candidate in items:
+                        if not candidate.close_time:
+                            continue
+                        try:
+                            close_dt = datetime.fromisoformat(
+                                candidate.close_time.replace("Z", "+00:00")
+                            )
+                            if close_dt.tzinfo is None:
+                                close_dt = close_dt.replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            continue
+                        if close_dt > now:
+                            candidates.append((close_dt, candidate))
+                    return candidates
+
+                active_markets = future_candidates(markets)
+
+                if not active_markets:
+                    all_series_markets = await self.client.get_markets(
+                        series_ticker="KXBTC15M",
+                        limit=100,
                     )
-                    if close_dt.tzinfo is None:
-                        close_dt = close_dt.replace(tzinfo=timezone.utc)
-                except ValueError:
-                    continue
-                if close_dt > now:
-                    active_markets.append((close_dt, candidate))
+                    active_markets = future_candidates(all_series_markets)
 
-            if not active_markets:
-                raise RuntimeError("No active KXBTC15M market with a future close time found")
+                if active_markets:
+                    market = min(active_markets, key=lambda item: item[0])[1]
+                    break
 
-            market = min(active_markets, key=lambda item: item[0])[1]
+                logger.warning(
+                    "No current KXBTC15M market returned yet; retrying in %.1fs",
+                    self.poll_interval,
+                )
+                await asyncio.sleep(self.poll_interval)
+
+            if market is None:
+                raise RuntimeError("Trading engine stopped before a KXBTC15M market was found")
         else:
             market = await self.client.get_market(ticker)
 
