@@ -211,9 +211,20 @@ class KalshiClient:
 
         client_order_id = order.client_order_id or str(uuid.uuid4())
 
+        # Crypto markets were moved off exchange shard 0 in August 2026.
+        # Do not rely on implicit routing: read the market's exchange_index and
+        # send the order explicitly to the matching engine that hosts it.
+        market = await self.get_market(order.ticker)
+        if market.exchange_index is None:
+            raise RuntimeError(
+                f"Kalshi market {order.ticker} did not provide exchange_index; "
+                "refusing to submit an ambiguously routed live order"
+            )
+
         payload: dict[str, Any] = {
             "ticker": order.ticker,
             "client_order_id": client_order_id,
+            "exchange_index": market.exchange_index,
             "side": book_side,
             "count": f"{order.count:.2f}",
             "price": f"{yes_price_cents / 100:.4f}",
@@ -275,7 +286,7 @@ class KalshiClient:
 
         logger.warning(
             "LIVE ORDER RESULT | ticker=%s | order_id=%s | "
-            "action=%s | outcome=%s | book_side=%s | "
+            "action=%s | outcome=%s | book_side=%s | exchange_index=%s | "
             "reduce_only=%s | requested=%d | fill_count=%d | "
             "remaining=%d | limit_yes=%dc | "
             "average_fill_price=%s | outcome_fill=%s",
@@ -284,6 +295,7 @@ class KalshiClient:
             action,
             outcome,
             book_side,
+            market.exchange_index,
             action == "sell",
             order.count,
             fill_count,
