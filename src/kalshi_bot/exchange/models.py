@@ -72,9 +72,9 @@ class Market(BaseModel):
     close_time: str | None = None
     floor_strike: float | None = None
     rules_primary: str | None = None
-    exchange_index: int | None = None
     yes_bid_size: int | None = None
     yes_ask_size: int | None = None
+    exchange_index: int | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -123,6 +123,7 @@ class OrderRequest(BaseModel):
     time_in_force: TimeInForce | None = None
     client_order_id: str | None = None
     post_only: bool | None = None
+    exchange_index: int | None = None
 
     def to_payload(self) -> dict[str, object]:
         return self.model_dump(exclude_none=True, mode="json")
