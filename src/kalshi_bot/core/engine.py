@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import time
 
 from kalshi_bot.data.bitcoin import BitcoinPriceFeed
@@ -46,7 +47,27 @@ class TradingEngine:
             )
             if not markets:
                 raise RuntimeError("No open KXBTC15M market found")
-            market = min(markets, key=lambda m: m.close_time or "")
+
+            now = datetime.now(timezone.utc)
+            active_markets = []
+            for candidate in markets:
+                if not candidate.close_time:
+                    continue
+                try:
+                    close_dt = datetime.fromisoformat(
+                        candidate.close_time.replace("Z", "+00:00")
+                    )
+                    if close_dt.tzinfo is None:
+                        close_dt = close_dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                if close_dt > now:
+                    active_markets.append((close_dt, candidate))
+
+            if not active_markets:
+                raise RuntimeError("No active KXBTC15M market with a future close time found")
+
+            market = min(active_markets, key=lambda item: item[0])[1]
         else:
             market = await self.client.get_market(ticker)
 
