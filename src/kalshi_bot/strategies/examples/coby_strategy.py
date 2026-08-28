@@ -56,6 +56,7 @@ class CobyStrategy(Strategy):
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
         self.max_contracts = int(params.get("max_contracts", 30))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
+        self.live_ioc_slippage_cents = int(params.get("live_ioc_slippage_cents", 2))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
         # Original entry behavior: observe first 5 minutes, then allow entry
@@ -150,7 +151,24 @@ class CobyStrategy(Strategy):
             return 0
         return max(0, min(self.max_contracts, self.max_notional_cents // limit_price))
 
-    def _order(self, *, ticker: str, action: Action, side: Side, price: int, count: int) -> OrderRequest:
+    def _order(
+        self,
+        *,
+        ticker: str,
+        action: Action,
+        side: Side,
+        price: int,
+        count: int,
+        exchange_index: int | None = None,
+    ) -> OrderRequest:
+        # IOC at the exact displayed quote misses whenever the book moves between
+        # snapshot and POST. Give live orders a small, capped marketable tolerance.
+        slippage = max(0, self.live_ioc_slippage_cents)
+        if action is Action.BUY:
+            execution_price = min(99, int(price) + slippage)
+        else:
+            execution_price = max(1, int(price) - slippage)
+
         kwargs: dict[str, Any] = {
             "ticker": ticker,
             "action": action,
@@ -158,11 +176,12 @@ class CobyStrategy(Strategy):
             "count": count,
             "type": OrderType.LIMIT,
             "time_in_force": TimeInForce.IMMEDIATE_OR_CANCEL,
+            "exchange_index": exchange_index,
         }
         if side is Side.YES:
-            kwargs["yes_price"] = price
+            kwargs["yes_price"] = execution_price
         else:
-            kwargs["no_price"] = price
+            kwargs["no_price"] = execution_price
         return OrderRequest(**kwargs)
 
     def _known_position_count(self, ticker: str, ctx_position: int) -> int:
@@ -352,6 +371,7 @@ class CobyStrategy(Strategy):
                 return [self._order(
                     ticker=m.ticker, action=Action.SELL, side=side,
                     price=self.stop_exit_floor, count=count,
+                    exchange_index=m.exchange_index,
                 )]
 
             if bid is None:
@@ -363,6 +383,7 @@ class CobyStrategy(Strategy):
                 return [self._order(
                     ticker=m.ticker, action=Action.SELL, side=side,
                     price=self.take_profit, count=count,
+                    exchange_index=m.exchange_index,
                 )]
 
             entry_price = self._entry_price_by_ticker.get(m.ticker)
@@ -400,6 +421,7 @@ class CobyStrategy(Strategy):
                 return [self._order(
                     ticker=m.ticker, action=Action.SELL, side=side,
                     price=self.stop_exit_floor, count=count,
+                    exchange_index=m.exchange_index,
                 )]
             return []
 
@@ -867,5 +889,6 @@ class CobyStrategy(Strategy):
                 side=side,
                 price=observed_ask,
                 count=count,
+                exchange_index=m.exchange_index,
             )
         ]
