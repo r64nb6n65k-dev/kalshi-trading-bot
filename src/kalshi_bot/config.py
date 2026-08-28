@@ -22,7 +22,7 @@ class Environment(str, Enum):
 
 
 REST_BASE_URLS: dict[Environment, str] = {
-    Environment.PROD: "https://api.elections.kalshi.com/trade-api/v2",
+    Environment.PROD: "https://external-api.kalshi.com/trade-api/v2",
     Environment.DEMO: "https://external-api.demo.kalshi.co/trade-api/v2",
 }
 
