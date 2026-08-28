@@ -20,7 +20,7 @@ from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
-from kalshi_bot.data.gold import GoldPriceFeed
+from kalshi_bot.data.bitcoin import BitcoinPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
@@ -34,7 +34,7 @@ from kalshi_bot.strategies.examples.momentum import Momentum
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot â open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot Ã¢ÂÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -52,7 +52,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] Ã¢ÂÂ by Viprasol Tech")
 
 
 @app.command()
@@ -69,7 +69,7 @@ def strategies() -> None:
         "mean_reversion": "Fade moves beyond N standard deviations from the mean.",
         "arbitrage": "Buy YES+NO when their combined ask is below 100c.",
         "fair_value": "Buy YES below your fair probability, Kelly-sized.",
-        "coby_strategy": "Coby's 15-minute gold strategy.",
+        "coby_strategy": "Coby's 15-minute Bitcoin strategy.",
     }
 
     for name, cls in STRATEGIES.items():
@@ -209,22 +209,21 @@ def run(
         dry_run = not live
 
         async with KalshiClient.from_settings(settings) as client:
-            gold_feed = None
+            bitcoin_feed = None
             strategy_params = {}
             if strategy == "coby_strategy":
-                gold_feed = GoldPriceFeed(
-                    base_url=settings.gold_price_url,
-                    price_feed_id=settings.gold_price_feed_id,
-                    api_key=settings.pyth_api_key,
+                bitcoin_feed = BitcoinPriceFeed(
+                    ws_url=settings.btc_ws_url,
+                    product_id=settings.btc_product_id,
                 )
-                strategy_params["max_gold_age_seconds"] = settings.gold_max_age_seconds
+                strategy_params["max_btc_age_seconds"] = settings.btc_max_age_seconds
             engine = TradingEngine(
                 client=client,
                 strategy=STRATEGIES[strategy](**strategy_params),
                 risk=RiskManager.from_settings(settings.risk),
                 dry_run=dry_run,
                 poll_interval=settings.poll_interval,
-                underlying_feed=gold_feed,
+                underlying_feed=bitcoin_feed,
             )
 
             await engine.run(
