@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from kalshi_bot.data.gold import GoldPriceFeed
+from kalshi_bot.data.bitcoin import BitcoinPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Market, Order, OrderRequest, Position, Side
 from kalshi_bot.risk.manager import RiskManager
@@ -27,7 +27,7 @@ class TradingEngine:
         risk: RiskManager,
         dry_run: bool = True,
         poll_interval: float = 1.0,
-        underlying_feed: GoldPriceFeed | None = None,
+        underlying_feed: BitcoinPriceFeed | None = None,
     ) -> None:
         self.client = client
         self.strategy = strategy
@@ -38,14 +38,14 @@ class TradingEngine:
         self._running = False
 
     async def _snapshot(self, ticker: str) -> StrategyContext:
-        if ticker == "KXGOLD15M":
+        if ticker == "KXBTC15M":
             markets = await self.client.get_markets(
                 status="open",
-                series_ticker="KXGOLD15M",
+                series_ticker="KXBTC15M",
                 limit=100,
             )
             if not markets:
-                raise RuntimeError("No open KXGOLD15M market found")
+                raise RuntimeError("No open KXBTC15M market found")
             market = min(markets, key=lambda m: m.close_time or "")
         else:
             market = await self.client.get_market(ticker)
