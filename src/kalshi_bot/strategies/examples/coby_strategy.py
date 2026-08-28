@@ -45,7 +45,7 @@ class CobyStrategy(Strategy):
         self.volatility_multiplier = float(params.get("volatility_multiplier", 0.35))
         self.maximum_target_crossings = int(params.get("maximum_target_crossings", 2))
 
-        self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 180.0))
+        self.crossing_ignore_seconds = float(params.get("crossing_ignore_seconds", 300.0))
         self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 180.0))
 
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
