@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 _VOLUME = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
-_DEFAULT_DB = str(Path(_VOLUME) / "coby_gold_dashboard.db") if _VOLUME else "/tmp/coby_gold_dashboard.db"
+_DEFAULT_DB = str(Path(_VOLUME) / "coby_btc_dashboard.db") if _VOLUME else "/tmp/coby_btc_dashboard.db"
 DB_PATH = Path(os.getenv("COBY_DASHBOARD_DB", _DEFAULT_DB))
 _db_lock = threading.RLock()
 _server_started = False
@@ -74,7 +74,7 @@ def _init_db() -> None:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS model_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ticker TEXT,
-            seconds_left REAL, bnb_price REAL, gold_price REAL, target_price REAL,
+            seconds_left REAL, bnb_price REAL, gold_price REAL, btc_price REAL, target_price REAL,
             separation REAL, yes_bid INTEGER, yes_ask INTEGER,
             no_bid INTEGER, no_ask INTEGER, model_yes REAL, model_no REAL,
             edge_yes REAL, edge_no REAL, momentum_15 REAL,
@@ -85,6 +85,8 @@ def _init_db() -> None:
             conn.execute("ALTER TABLE model_snapshots ADD COLUMN bnb_price REAL")
         if "gold_price" not in model_cols:
             conn.execute("ALTER TABLE model_snapshots ADD COLUMN gold_price REAL")
+        if "btc_price" not in model_cols:
+            conn.execute("ALTER TABLE model_snapshots ADD COLUMN btc_price REAL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_model_snapshots_id ON model_snapshots(id)")
 
 
@@ -92,7 +94,7 @@ def record_model_snapshot(**x: Any) -> None:
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
     keys = [
-        "ticker", "seconds_left", "gold_price", "target_price", "separation",
+        "ticker", "seconds_left", "btc_price", "target_price", "separation",
         "yes_bid", "yes_ask", "no_bid", "no_ask", "model_yes", "model_no",
         "edge_yes", "edge_no", "momentum_15", "momentum_60", "volatility",
         "decision", "reason",
@@ -235,7 +237,7 @@ def _csv(table: str) -> bytes:
     return out.getvalue().encode()
 
 
-HTML = '''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coby Gold Bot</title><style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;margin:18px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:12px;margin-bottom:8px}.v{font-size:24px;font-weight:700}.s{color:#8b949e;font-size:12px}a{color:#58a6ff}.green{color:#3fb950}.red{color:#f85149}table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #30363d;text-align:left}</style><h1>Coby Gold Bot</h1><div><a href="/download/trades.csv">Download trades CSV</a> · <a href="/download/model.csv">Download model data CSV</a></div><h2>Live Model</h2><div class=g id=live></div><h2>Performance</h2><div class=g id=stats></div><h2>Open Position</h2><div id=open></div><h2>Recent Model Decisions</h2><div id=decisions></div><h2>Recent Trades</h2><div id=trades></div><script>const f=(x,n=1)=>x==null?'—':Number(x).toFixed(n),card=(k,v)=>`<div class=c><div class=s>${k}</div><div class=v>${v}</div></div>`;async function r(){try{let d=await(await fetch('/api/data',{cache:'no-store'})).json(),x=d.latest||{},s=d.stats;live.innerHTML=card('Decision',x.decision||'WAIT')+card('Reason',x.reason||'—')+card('Gold','$'+f(x.gold_price,2))+card('Target','$'+f(x.target_price,2))+card('Separation','$'+f(x.separation,2))+card('Seconds left',f(x.seconds_left,0))+card('Model YES',f(x.model_yes,1)+'%')+card('Model NO',f(x.model_no,1)+'%')+card('YES edge',f(x.edge_yes,1)+'¢')+card('NO edge',f(x.edge_no,1)+'¢')+card('15s momentum','$'+f(x.momentum_15,2))+card('60s momentum','$'+f(x.momentum_60,2))+card('Volatility',f(x.volatility,3));stats.innerHTML=card('P&L',(s.total_pnl_cents>=0?'+':'')+'$'+f(s.total_pnl_cents/100,2))+card('Win rate',f(s.win_rate,1)+'%')+card('Trades',s.total_trades)+card('Record',s.wins+'-'+s.losses);open.innerHTML=d.open_positions.length?d.open_positions.map(p=>`<div class=c>${p.side.toUpperCase()} @ ${p.entry_price}¢ · ${p.count} contracts · ${p.execution_mode||'unknown'}<br><span class=s>Stop ${p.stop_price}¢ · TP ${p.take_profit}¢ · ${p.ticker}</span></div>`).join(''):'<div class=c>No open position</div>';decisions.innerHTML=d.snapshots.slice(0,12).map(q=>`<div class=c><b>${q.decision||'WAIT'}</b> · ${q.reason||'—'}<br><span class=s>Gold $${f(q.gold_price,2)} / target $${f(q.target_price,2)} · sep $${f(q.separation,2)} · ${f(q.seconds_left,0)}s · YES ${f(q.model_yes,1)}% · edge ${f(q.edge_yes,1)}¢</span></div>`).join('');trades.innerHTML='<table><tr><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>'+d.trades.slice(0,25).map(t=>`<tr><td>${t.side}</td><td>${t.entry_price}¢</td><td>${t.exit_price}¢</td><td>${(t.pnl_cents/100).toFixed(2)}</td><td>${t.reason}<br><span class=s>${t.execution_mode||'unknown'} · stop ${t.stop_price??'—'}¢ · TP ${t.take_profit??'—'}¢</span></td></tr>`).join('')+'</table>'}catch(e){console.error(e)}}r();setInterval(r,2000)</script>'''
+HTML = '''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coby Bitcoin Bot</title><style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;margin:18px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:12px;margin-bottom:8px}.v{font-size:24px;font-weight:700}.s{color:#8b949e;font-size:12px}a{color:#58a6ff}.green{color:#3fb950}.red{color:#f85149}table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #30363d;text-align:left}</style><h1>Coby Bitcoin Bot</h1><div><a href="/download/trades.csv">Download trades CSV</a> Â· <a href="/download/model.csv">Download model data CSV</a></div><h2>Live Model</h2><div class=g id=live></div><h2>Performance</h2><div class=g id=stats></div><h2>Open Position</h2><div id=open></div><h2>Recent Model Decisions</h2><div id=decisions></div><h2>Recent Trades</h2><div id=trades></div><script>const f=(x,n=1)=>x==null?'â':Number(x).toFixed(n),card=(k,v)=>`<div class=c><div class=s>${k}</div><div class=v>${v}</div></div>`;async function r(){try{let d=await(await fetch('/api/data',{cache:'no-store'})).json(),x=d.latest||{},s=d.stats;live.innerHTML=card('Decision',x.decision||'WAIT')+card('Reason',x.reason||'â')+card('Bitcoin','$'+f(x.btc_price,2))+card('Target','$'+f(x.target_price,2))+card('Separation','$'+f(x.separation,2))+card('Seconds left',f(x.seconds_left,0))+card('Model YES',f(x.model_yes,1)+'%')+card('Model NO',f(x.model_no,1)+'%')+card('YES edge',f(x.edge_yes,1)+'Â¢')+card('NO edge',f(x.edge_no,1)+'Â¢')+card('15s momentum','$'+f(x.momentum_15,2))+card('60s momentum','$'+f(x.momentum_60,2))+card('Volatility',f(x.volatility,3));stats.innerHTML=card('P&L',(s.total_pnl_cents>=0?'+':'')+'$'+f(s.total_pnl_cents/100,2))+card('Win rate',f(s.win_rate,1)+'%')+card('Trades',s.total_trades)+card('Record',s.wins+'-'+s.losses);open.innerHTML=d.open_positions.length?d.open_positions.map(p=>`<div class=c>${p.side.toUpperCase()} @ ${p.entry_price}Â¢ Â· ${p.count} contracts Â· ${p.execution_mode||'unknown'}<br><span class=s>Stop ${p.stop_price}Â¢ Â· TP ${p.take_profit}Â¢ Â· ${p.ticker}</span></div>`).join(''):'<div class=c>No open position</div>';decisions.innerHTML=d.snapshots.slice(0,12).map(q=>`<div class=c><b>${q.decision||'WAIT'}</b> Â· ${q.reason||'â'}<br><span class=s>BTC $${f(q.btc_price,2)} / target $${f(q.target_price,2)} Â· sep $${f(q.separation,2)} Â· ${f(q.seconds_left,0)}s Â· YES ${f(q.model_yes,1)}% Â· edge ${f(q.edge_yes,1)}Â¢</span></div>`).join('');trades.innerHTML='<table><tr><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>'+d.trades.slice(0,25).map(t=>`<tr><td>${t.side}</td><td>${t.entry_price}Â¢</td><td>${t.exit_price}Â¢</td><td>${(t.pnl_cents/100).toFixed(2)}</td><td>${t.reason}<br><span class=s>${t.execution_mode||'unknown'} Â· stop ${t.stop_price??'â'}Â¢ Â· TP ${t.take_profit??'â'}Â¢</span></td></tr>`).join('')+'</table>'}catch(e){console.error(e)}}r();setInterval(r,2000)</script>'''
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
