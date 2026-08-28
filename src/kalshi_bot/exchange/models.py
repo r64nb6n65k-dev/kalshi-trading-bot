@@ -72,6 +72,7 @@ class Market(BaseModel):
     close_time: str | None = None
     floor_strike: float | None = None
     rules_primary: str | None = None
+    exchange_index: int | None = None
     yes_bid_size: int | None = None
     yes_ask_size: int | None = None
 
