@@ -149,55 +149,148 @@ class KalshiClient:
         ]
 
     async def create_order(self, order: OrderRequest) -> Order:
-        """Create an order through the standard Predictions order endpoint.
+        """Create a V2 event order.
 
-        The bot intentionally uses /portfolio/orders here instead of the newer
-        /portfolio/events/orders exchange-sharded endpoint.  The standard
-        endpoint is the documented Predictions quick-start path and matches
-        this account/API-key flow.
+        BUY orders may open/increase a position.
+        SELL orders are always reduce-only so an exit can never cross flat
+        and create exposure on the opposite side.
         """
+
+        action = order.action.value
+        outcome = order.side.value
+
+        if action == "buy" and outcome == "yes":
+            book_side = "bid"
+            yes_price_cents = order.yes_price
+        elif action == "sell" and outcome == "yes":
+            book_side = "ask"
+            yes_price_cents = order.yes_price
+        elif action == "buy" and outcome == "no":
+            book_side = "ask"
+            yes_price_cents = (
+                None if order.no_price is None
+                else 100 - order.no_price
+            )
+        elif action == "sell" and outcome == "no":
+            book_side = "bid"
+            yes_price_cents = (
+                None if order.no_price is None
+                else 100 - order.no_price
+            )
+        else:
+            raise ValueError(
+                f"Unsupported order direction: action={action}, side={outcome}"
+            )
+
+        if yes_price_cents is None:
+            raise ValueError("Order price is required")
+
+        if not 0 < yes_price_cents < 100:
+            raise ValueError(
+                f"Order price must be between 1 and 99 cents: {yes_price_cents}"
+            )
+
+        raw_tif = (
+            order.time_in_force.value
+            if order.time_in_force is not None
+            else "good_till_canceled"
+        )
+
+        tif_map = {
+            "ioc": "immediate_or_cancel",
+            "immediate_or_cancel": "immediate_or_cancel",
+            "gtc": "good_till_canceled",
+            "good_till_canceled": "good_till_canceled",
+            "fok": "fill_or_kill",
+            "fill_or_kill": "fill_or_kill",
+        }
+
+        time_in_force = tif_map.get(raw_tif)
+        if time_in_force is None:
+            raise ValueError(f"Unsupported time_in_force: {raw_tif}")
 
         client_order_id = order.client_order_id or str(uuid.uuid4())
 
-        payload = order.to_payload()
-        payload["client_order_id"] = client_order_id
+        payload: dict[str, Any] = {
+            "ticker": order.ticker,
+            "client_order_id": client_order_id,
+            "side": book_side,
+            "count": f"{order.count:.2f}",
+            "price": f"{yes_price_cents / 100:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": (
+                bool(order.post_only)
+                if order.post_only is not None
+                else False
+            ),
+            "reduce_only": action == "sell",
+        }
 
-        data = await self._request(
+        created = await self._request(
             "POST",
-            "/portfolio/orders",
+            "/portfolio/events/orders",
             json=payload,
         )
 
-        created = data.get("order", data)
-        result = Order.model_validate(created)
+        fill_count = int(Decimal(str(created.get("fill_count", "0"))))
+        remaining_count = int(Decimal(str(created.get("remaining_count", "0"))))
+        average_fill_price = created.get("average_fill_price")
 
-        # Preserve the bot's requested values when the API response omits
-        # legacy compatibility fields.
-        result.ticker = result.ticker or order.ticker
-        result.side = result.side or order.side
-        result.action = result.action or order.action
-        result.client_order_id = result.client_order_id or client_order_id
-        result.count = result.count if result.count is not None else order.count
-
-        # The strategy already falls back to the requested limit price if an
-        # immediate fill response does not contain an explicit average price.
-        if result.fill_count > 0 and result.outcome_fill_price is None:
-            result.outcome_fill_price = (
-                order.yes_price if order.side is Side.YES else order.no_price
+        outcome_fill_price: int | None = None
+        if fill_count > 0 and average_fill_price is not None:
+            yes_fill_cents = _dollars_to_cents(str(average_fill_price))
+            outcome_fill_price = (
+                yes_fill_cents
+                if outcome == "yes"
+                else 100 - yes_fill_cents
             )
 
+        if fill_count >= order.count:
+            status = "executed"
+        elif remaining_count > 0:
+            status = "resting"
+        else:
+            status = "canceled"
+
+        result = Order(
+            order_id=created["order_id"],
+            ticker=order.ticker,
+            status=status,
+            side=order.side,
+            action=order.action,
+            yes_price=order.yes_price,
+            no_price=order.no_price,
+            count=order.count,
+            remaining_count=remaining_count,
+            client_order_id=client_order_id,
+            fill_count=fill_count,
+            average_fill_price=(
+                str(average_fill_price)
+                if average_fill_price is not None
+                else None
+            ),
+            outcome_fill_price=outcome_fill_price,
+        )
+
         logger.warning(
-            "LIVE ORDER RESULT | ticker=%s | order_id=%s | action=%s | "
-            "side=%s | requested=%d | fill_count=%d | remaining=%s | "
-            "outcome_fill=%s",
+            "LIVE ORDER RESULT | ticker=%s | order_id=%s | "
+            "action=%s | outcome=%s | book_side=%s | "
+            "reduce_only=%s | requested=%d | fill_count=%d | "
+            "remaining=%d | limit_yes=%dc | "
+            "average_fill_price=%s | outcome_fill=%s",
             order.ticker,
-            result.order_id,
-            order.action.value,
-            order.side.value,
+            created.get("order_id"),
+            action,
+            outcome,
+            book_side,
+            action == "sell",
             order.count,
-            result.fill_count,
-            result.remaining_count,
-            result.outcome_fill_price,
+            fill_count,
+            remaining_count,
+            yes_price_cents,
+            average_fill_price,
+            outcome_fill_price,
         )
 
         return result
@@ -205,17 +298,14 @@ class KalshiClient:
     async def cancel_order(self, order_id: str) -> Order:
         data = await self._request(
             "DELETE",
-            f"/portfolio/orders/{order_id}",
+            f"/portfolio/events/orders/{order_id}",
         )
 
-        canceled = data.get("order", data)
-        if isinstance(canceled, dict) and canceled.get("order_id"):
-            return Order.model_validate(canceled)
-
         return Order(
-            order_id=order_id,
+            order_id=data["order_id"],
             ticker="",
             status="canceled",
+            client_order_id=data.get("client_order_id"),
         )
 
     async def get_orders(self, **params: Any) -> list[Order]:
