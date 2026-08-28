@@ -89,7 +89,7 @@ class CobyStrategy(Strategy):
         # After chaos subsides, require this many consecutive clean evaluations
         # before allowing the ticker to become eligible again.
         self.chaos_recovery_confirmations = int(
-            params.get("chaos_recovery_confirmations", 15)
+            params.get("chaos_recovery_confirmations", 3)
         )
 
         self.use_trading_hours = bool(params.get("use_trading_hours", False))
