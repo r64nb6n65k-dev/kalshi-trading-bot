@@ -1,4 +1,4 @@
-"""Resilient public Coinbase BNB/USD trade stream for strategy filtering."""
+"""Resilient public ETH/USD trade stream for strategy filtering."""
 
 from __future__ import annotations
 
@@ -16,18 +16,18 @@ from kalshi_bot.telemetry.logging import get_logger
 logger = get_logger(__name__)
 
 
-class BnbPriceFeed:
-    """Maintain a rolling window of public Coinbase BNB/USD trades.
+class EthereumPriceFeed:
+    """Maintain a rolling window of public Coinbase ETH/USD trades.
 
-    Coinbase BNB-USD is one of the constituent markets used by CF Benchmarks
-    for BNBUSD_RTI. It is still only one constituent, not the licensed RTI
-    itself, so missing or stale data remains a hard entry veto.
+    Coinbase is a proxy for the underlying ETH/USD market, not Kalshi's
+    settlement source. The strategy therefore treats missing or stale data as
+    a hard entry veto and logs the source on every decision.
     """
 
     def __init__(
         self,
         ws_url: str,
-        product_id: str = "BNB-USD",
+        product_id: str = "ETH-USD",
         history_minutes: int = 20,
     ) -> None:
         self.ws_url = ws_url
@@ -40,7 +40,7 @@ class BnbPriceFeed:
     async def start(self) -> None:
         if self._task is None or self._task.done():
             self._stopping = False
-            self._task = asyncio.create_task(self._run(), name="bnb-price-feed")
+            self._task = asyncio.create_task(self._run(), name="eth-price-feed")
 
     async def stop(self) -> None:
         self._stopping = True
@@ -97,9 +97,7 @@ class BnbPriceFeed:
                 if trade.get("product_id") != self.product_id:
                     continue
                 try:
-                    timestamp = datetime.fromisoformat(
-                        str(trade["time"]).replace("Z", "+00:00")
-                    )
+                    timestamp = datetime.fromisoformat(str(trade["time"]).replace("Z", "+00:00"))
                     if timestamp.tzinfo is None:
                         timestamp = timestamp.replace(tzinfo=UTC)
                     self._append(
@@ -107,11 +105,11 @@ class BnbPriceFeed:
                             price=float(trade["price"]),
                             size=float(trade["size"]),
                             timestamp=timestamp,
-                            source="COINBASE_BNBUSD_CONSTITUENT",
+                            source="COINBASE_PROXY",
                         )
                     )
                 except (KeyError, TypeError, ValueError):
-                    logger.exception("Invalid BNB market-trade message")
+                    logger.exception("Invalid ETH market-trade message")
 
     async def _run(self) -> None:
         delay = 1.0
@@ -132,11 +130,9 @@ class BnbPriceFeed:
                             }
                         )
                     )
-                    await ws.send(
-                        json.dumps({"type": "subscribe", "channel": "heartbeats"})
-                    )
+                    await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
                     logger.warning(
-                        "BNB FEED CONNECTED | source=COINBASE_BNBUSD_CONSTITUENT | product=%s",
+                        "ETH FEED CONNECTED | source=COINBASE_PROXY | product=%s",
                         self.product_id,
                     )
                     delay = 1.0
@@ -148,7 +144,7 @@ class BnbPriceFeed:
                 raise
             except Exception:
                 logger.exception(
-                    "BNB FEED DISCONNECTED | retry_seconds=%.1f",
+                    "ETH FEED DISCONNECTED | retry_seconds=%.1f",
                     delay,
                 )
                 await asyncio.sleep(delay)
