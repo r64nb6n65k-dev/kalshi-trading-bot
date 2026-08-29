@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import time
 
-from kalshi_bot.data.bitcoin import BitcoinPriceFeed
+from kalshi_bot.data.ethereum import EthereumPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Market, Order, OrderRequest, Position, Side
 from kalshi_bot.risk.manager import RiskManager
@@ -28,7 +28,7 @@ class TradingEngine:
         risk: RiskManager,
         dry_run: bool = True,
         poll_interval: float = 1.0,
-        underlying_feed: BitcoinPriceFeed | None = None,
+        underlying_feed: EthereumPriceFeed | None = None,
     ) -> None:
         self.client = client
         self.strategy = strategy
@@ -39,7 +39,7 @@ class TradingEngine:
         self._running = False
 
     async def _snapshot(self, ticker: str) -> StrategyContext:
-        if ticker == "KXBTC15M":
+        if ticker == "KXETH15M":
             market = None
 
             while self._running and market is None:
@@ -50,7 +50,7 @@ class TradingEngine:
                 # selecting an expired contract or crashing the Railway process.
                 markets = await self.client.get_markets(
                     status="open",
-                    series_ticker="KXBTC15M",
+                    series_ticker="KXETH15M",
                     limit=100,
                 )
 
@@ -75,7 +75,7 @@ class TradingEngine:
 
                 if not active_markets:
                     all_series_markets = await self.client.get_markets(
-                        series_ticker="KXBTC15M",
+                        series_ticker="KXETH15M",
                         limit=100,
                     )
                     active_markets = future_candidates(all_series_markets)
@@ -85,13 +85,13 @@ class TradingEngine:
                     break
 
                 logger.warning(
-                    "No current KXBTC15M market returned yet; retrying in %.1fs",
+                    "No current KXETH15M market returned yet; retrying in %.1fs",
                     self.poll_interval,
                 )
                 await asyncio.sleep(self.poll_interval)
 
             if market is None:
-                raise RuntimeError("Trading engine stopped before a KXBTC15M market was found")
+                raise RuntimeError("Trading engine stopped before a KXETH15M market was found")
         else:
             market = await self.client.get_market(ticker)
 
