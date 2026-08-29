@@ -91,6 +91,17 @@ class Settings(BaseSettings):
         description="Reject entries when the BTC/USD proxy feed is older than this.",
     )
 
+    eth_ws_url: str = Field(
+        default="wss://advanced-trade-ws.coinbase.com",
+        description="Public ETH/USD WebSocket used as an ETH spot proxy.",
+    )
+    eth_product_id: str = Field(default="ETH-USD")
+    eth_max_age_seconds: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Reject entries when the ETH/USD proxy feed is older than this.",
+    )
+
     risk: RiskSettings = Field(default_factory=RiskSettings)
 
     @field_validator("api_key_id")
