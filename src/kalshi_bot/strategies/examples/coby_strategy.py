@@ -54,7 +54,7 @@ class CobyStrategy(Strategy):
         self.take_profit = int(params.get("take_profit", 98))
         self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
-        self.max_contracts = int(params.get("max_contracts", 15))
+        self.max_contracts = int(params.get("max_contracts", 20))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.live_ioc_slippage_cents = int(params.get("live_ioc_slippage_cents", 2))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
