@@ -52,7 +52,7 @@ class CobyStrategy(Strategy):
         self.minimum_trend_change = float(params.get("minimum_trend_change", -5.00))
         self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
         self.take_profit = int(params.get("take_profit", 98))
-        self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
+        self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 100))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
         self.max_contracts = int(params.get("max_contracts", 30))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
