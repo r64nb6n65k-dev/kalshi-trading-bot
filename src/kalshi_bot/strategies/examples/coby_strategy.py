@@ -61,7 +61,7 @@ class CobyStrategy(Strategy):
 
         # Original entry behavior: observe first 5 minutes, then allow entry
         # from 10:00 remaining down to the final 60-second no-entry window.
-        self.entry_window_seconds = int(params.get("entry_window_seconds", 600))
+        self.entry_window_seconds = int(params.get("entry_window_seconds",420))
         self.min_entry_price = int(params.get("min_entry_price", 70))
 
         # Adaptive chaos filter.
