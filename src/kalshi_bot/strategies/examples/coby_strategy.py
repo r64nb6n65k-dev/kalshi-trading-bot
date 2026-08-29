@@ -35,10 +35,10 @@ class CobyStrategy(Strategy):
             params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
         )
         self.required_confirmations = int(params.get("required_confirmations", 3))
-        self.minimum_distance = float(params.get("minimum_distance", 15.00))
-        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 30.00))
-        self.normal_minimum_separation = float(params.get("normal_minimum_separation", 30.00))
-        self.high_volume_minimum_separation = float(params.get("high_volume_minimum_separation", 30.00))
+        self.minimum_distance = float(params.get("minimum_distance", 0.50))
+        self.hard_minimum_separation = float(params.get("hard_minimum_separation", 1.00))
+        self.normal_minimum_separation = float(params.get("normal_minimum_separation", 1.00))
+        self.high_volume_minimum_separation = float(params.get("high_volume_minimum_separation", 1.00))
         self.low_volume_ratio = float(params.get("low_volume_ratio", 0.75))
         self.high_volume_ratio = float(params.get("high_volume_ratio", 1.50))
         self.volume_baseline_seconds = float(params.get("volume_baseline_seconds", 300.0))
@@ -49,19 +49,19 @@ class CobyStrategy(Strategy):
         self.crossing_skip_enable_seconds = float(params.get("crossing_skip_enable_seconds", 180.0))
 
         self.minimum_efficiency = float(params.get("minimum_efficiency", 0.12))
-        self.minimum_trend_change = float(params.get("minimum_trend_change", -5.00))
-        self.max_btc_age_seconds = float(params.get("max_btc_age_seconds", 5))
+        self.minimum_trend_change = float(params.get("minimum_trend_change", -0.16))
+        self.max_underlying_age_seconds = float(params.get("max_underlying_age_seconds", 5))
         self.take_profit = int(params.get("take_profit", 98))
-        self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 100))
+        self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
-        self.max_contracts = int(params.get("max_contracts", 30))
+        self.max_contracts = int(params.get("max_contracts", 15))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.live_ioc_slippage_cents = int(params.get("live_ioc_slippage_cents", 2))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
 
         # Original entry behavior: observe first 5 minutes, then allow entry
         # from 10:00 remaining down to the final 60-second no-entry window.
-        self.entry_window_seconds = int(params.get("entry_window_seconds", 540))
+        self.entry_window_seconds = int(params.get("entry_window_seconds", 600))
         self.min_entry_price = int(params.get("min_entry_price", 70))
 
         # Adaptive chaos filter.
@@ -73,12 +73,12 @@ class CobyStrategy(Strategy):
         self.chaos_travel_multiplier = float(params.get("chaos_travel_multiplier", 2.75))
         self.chaos_efficiency_ceiling = float(params.get("chaos_efficiency_ceiling", 0.08))
         self.chaos_reversal_ratio = float(params.get("chaos_reversal_ratio", 0.46))
-        self.chaos_min_travel = float(params.get("chaos_min_travel", 100.00))
+        self.chaos_min_travel = float(params.get("chaos_min_travel", 3.25))
 
-        # A BTC contract-price stop must persist and be confirmed by adverse
-        # movement in BTC/USD. One thin Kalshi bid is not enough to dump a trade.
+        # An ETH contract-price stop must persist and be confirmed by adverse
+        # movement in ETH/USD. One thin Kalshi bid is not enough to dump a trade.
         self.stop_confirmations = int(params.get("stop_confirmations", 3))
-        self.stop_adverse_move = float(params.get("stop_adverse_move", 20.00))
+        self.stop_adverse_move = float(params.get("stop_adverse_move", 0.65))
 
         # IMPORTANT: chaos is observed from market open, but it cannot permanently
         # disqualify the market until entries themselves are allowed.
@@ -417,7 +417,7 @@ class CobyStrategy(Strategy):
 
             if self._stop_confirmation_count_by_ticker[m.ticker] >= self.stop_confirmations:
                 self._pending_action[m.ticker] = Action.SELL
-                self._exit_reason[m.ticker] = "CONFIRMED_BTC_DYNAMIC_STOP"
+                self._exit_reason[m.ticker] = "CONFIRMED_ETH_DYNAMIC_STOP"
                 return [self._order(
                     ticker=m.ticker, action=Action.SELL, side=side,
                     price=self.stop_exit_floor, count=count,
@@ -461,18 +461,18 @@ class CobyStrategy(Strategy):
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
                 no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="NO_BTC_DATA",
+                reason="NO_ETH_DATA",
             )
             return []
 
         latest = ticks[-1]
         age = (datetime.now(timezone.utc) - latest.timestamp).total_seconds()
-        if age > self.max_btc_age_seconds or m.floor_strike is None:
+        if age > self.max_underlying_age_seconds or m.floor_strike is None:
             self._log_entry_check(
                 ticker=m.ticker, seconds_left=seconds_left,
                 yes_bid=m.yes_bid, yes_ask=m.yes_ask,
                 no_bid=m.no_bid, no_ask=m.no_ask,
-                reason="BTC_STALE_OR_NO_TARGET",
+                reason="ETH_STALE_OR_NO_TARGET",
             )
             return []
 
@@ -582,8 +582,8 @@ class CobyStrategy(Strategy):
             * math.sqrt(max(1.0, min(seconds_left, 60.0))),
         )
 
-        # Coinbase publishes BTC trade size, but this BTC dry-run keeps all
-        # volume regimes on the same $30 separation until fresh data supports tuning.
+        # Coinbase publishes ETH trade size. For this ETH trial, all volume regimes
+        # use the same $1.00 base separation until live data supports finer tuning.
         recent_volume = sum(
             x.price * x.size for x in ticks
             if (latest.timestamp - x.timestamp).total_seconds() <= 60
@@ -619,7 +619,7 @@ class CobyStrategy(Strategy):
         common = dict(
             ticker=m.ticker,
             seconds_left=seconds_left,
-            btc_price=latest.price,
+            eth_price=latest.price,
             target_price=target,
             separation=separation,
             yes_bid=m.yes_bid,
@@ -775,7 +775,7 @@ class CobyStrategy(Strategy):
                 **common,
                 decision="WAIT",
                 reason=(
-                    f"BTC_SEPARATION_UNDER_{adaptive_minimum_separation:.2f}_"
+                    f"ETH_SEPARATION_UNDER_{adaptive_minimum_separation:.2f}_"
                     f"VOLUME_{volume_regime}"
                 ),
             )
