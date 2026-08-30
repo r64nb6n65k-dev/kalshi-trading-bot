@@ -91,10 +91,9 @@ class Settings(BaseSettings):
         description="Reject entries when the BTC/USD proxy feed is older than this.",
     )
 
-    oanda_api_key: str = Field(
-        default_factory=lambda: os.getenv("OANDA_API_KEY", ""),
-        description="OANDA practice API token used for the XAU/USD price feed.",
-    )
+    # Keep the historical field name so the existing Railway
+    # KALSHI_PYTH_API_KEY variable continues to supply the OANDA token.
+    pyth_api_key: str = Field(default="")
     gold_max_age_seconds: float = Field(
         default=3.0,
         gt=0.0,
