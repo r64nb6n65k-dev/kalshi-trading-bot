@@ -216,7 +216,7 @@ def run(
                 underlying_feed = GoldPriceFeed(
                     base_url="",
                     price_feed_id="XAU_USD",
-                    api_key=settings.oanda_api_key,
+                    api_key=settings.pyth_api_key,
                 )
                 strategy_params["max_underlying_age_seconds"] = settings.gold_max_age_seconds
             engine = TradingEngine(
