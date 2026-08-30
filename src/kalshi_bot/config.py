@@ -91,15 +91,14 @@ class Settings(BaseSettings):
         description="Reject entries when the BTC/USD proxy feed is older than this.",
     )
 
-    eth_ws_url: str = Field(
-        default="wss://advanced-trade-ws.coinbase.com",
-        description="Public ETH/USD WebSocket used as an ETH spot proxy.",
+    oanda_api_key: str = Field(
+        default_factory=lambda: os.getenv("OANDA_API_KEY", ""),
+        description="OANDA practice API token used for the XAU/USD price feed.",
     )
-    eth_product_id: str = Field(default="ETH-USD")
-    eth_max_age_seconds: float = Field(
+    gold_max_age_seconds: float = Field(
         default=3.0,
         gt=0.0,
-        description="Reject entries when the ETH/USD proxy feed is older than this.",
+        description="Reject entries when the OANDA XAU/USD feed is older than this.",
     )
 
     risk: RiskSettings = Field(default_factory=RiskSettings)
