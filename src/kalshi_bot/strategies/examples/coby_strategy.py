@@ -34,7 +34,7 @@ class CobyStrategy(Strategy):
         self.min_history_seconds = float(
             params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
         )
-        self.required_confirmations = int(params.get("required_confirmations", 3))
+        self.required_confirmations = int(params.get("required_confirmations", 2))
         self.minimum_distance = float(params.get("minimum_distance", 3.00))
         self.hard_minimum_separation = float(params.get("hard_minimum_separation", 3.00))
         self.normal_minimum_separation = float(params.get("normal_minimum_separation", 3.00))
@@ -54,7 +54,7 @@ class CobyStrategy(Strategy):
         self.take_profit = int(params.get("take_profit", 98))
         self.dynamic_stop_gap = int(params.get("dynamic_stop_gap", 13))
         self.legacy_stop_cap = int(params.get("legacy_stop_cap", 79))
-        self.max_contracts = int(params.get("max_contracts", 30))
+        self.max_contracts = int(params.get("max_contracts", 20))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.live_ioc_slippage_cents = int(params.get("live_ioc_slippage_cents", 2))
         self.final_exit_seconds = int(params.get("final_exit_seconds", 60))
@@ -834,6 +834,29 @@ class CobyStrategy(Strategy):
         if side is Side.NO and separation >= 0:
             self._confirmation_count_by_ticker[m.ticker] = 0
             record_model_snapshot(**common, decision="WAIT", reason="MODEL_TARGET_DIRECTION_CONFLICT")
+            return []
+
+        # Do not enter against the established 60-second move. A flat reading
+        # is allowed, but YES requires nonnegative momentum and NO requires
+        # nonpositive momentum.
+        if side is Side.YES and mom60 < 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason="MOMENTUM_60_DIRECTION_CONFLICT",
+            )
+            return []
+
+        if side is Side.NO and mom60 > 0:
+            self._confirmation_count_by_ticker[m.ticker] = 0
+            self._confirmation_side_by_ticker.pop(m.ticker, None)
+            record_model_snapshot(
+                **common,
+                decision="WAIT",
+                reason="MOMENTUM_60_DIRECTION_CONFLICT",
+            )
             return []
 
         trend_change = mom15 - (mom60 / 4.0)
