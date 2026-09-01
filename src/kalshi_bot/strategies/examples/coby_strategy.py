@@ -34,7 +34,7 @@ class CobyStrategy(Strategy):
         self.min_history_seconds = float(
             params.get("minimum_history_seconds", params.get("min_history_seconds", 60))
         )
-        self.required_confirmations = int(params.get("required_confirmations", 2))
+        self.required_confirmations = int(params.get("required_confirmations", 3))
         self.minimum_distance = float(params.get("minimum_distance", 3.00))
         self.hard_minimum_separation = float(params.get("hard_minimum_separation", 3.00))
         self.normal_minimum_separation = float(params.get("normal_minimum_separation", 3.00))
