@@ -48,10 +48,6 @@ class CobyStrategy(Strategy):
         self.take_profit = int(params.get("take_profit", 98))
         self.hard_stop = int(params.get("hard_stop", 79))
         self.required_confirmations = int(params.get("required_confirmations", 2))
-        self.max_underlying_age_seconds = float(
-            params.get("max_underlying_age_seconds", 5)
-        )
-
         self.max_contracts = int(params.get("max_contracts", 100))
         self.max_notional_cents = int(params.get("max_notional_cents", 20_000))
         self.live_ioc_slippage_cents = int(
@@ -320,36 +316,14 @@ class CobyStrategy(Strategy):
             self._snapshot(ctx, seconds_left, "SKIP", "FINAL_60_SECONDS_NO_ENTRY")
             return []
 
-        ticks = ctx.underlying_ticks
-        if not ticks:
-            self._reset_confirmation(ticker)
-            self._snapshot(ctx, seconds_left, "WAIT", "NO_GOLD_DATA")
-            return []
-
-        latest = ticks[-1]
-        age = (datetime.now(timezone.utc) - latest.timestamp).total_seconds()
-        if (
-            age < -2
-            or age > self.max_underlying_age_seconds
-            or market.floor_strike is None
-        ):
-            self._reset_confirmation(ticker)
-            self._snapshot(ctx, seconds_left, "WAIT", "GOLD_STALE_OR_NO_TARGET")
-            return []
-
-        target = float(market.floor_strike)
-        separation = latest.price - target
-
         choices: list[tuple[int, Side]] = []
         if (
-            separation > 0
-            and market.yes_ask is not None
+            market.yes_ask is not None
             and self.minimum_entry_price <= int(market.yes_ask) <= self.maximum_entry_price
         ):
             choices.append((int(market.yes_ask), Side.YES))
         if (
-            separation < 0
-            and market.no_ask is not None
+            market.no_ask is not None
             and self.minimum_entry_price <= int(market.no_ask) <= self.maximum_entry_price
         ):
             choices.append((int(market.no_ask), Side.NO))
@@ -384,14 +358,10 @@ class CobyStrategy(Strategy):
         self._snapshot(ctx, seconds_left, "BUY_" + side.value.upper(), "ORIGINAL_LATE_FAVORITE_ENTRY")
         logger.warning(
             "GOLD LATE FAVORITE ENTRY | ticker=%s | side=%s | ask=%dc | "
-            "gold=%.2f | target=%.2f | separation=%+.2f | confirmations=%d | "
-            "seconds_left=%.1f | count=%d",
+            "confirmations=%d | seconds_left=%.1f | count=%d",
             ticker,
             side.value,
             observed_ask,
-            latest.price,
-            target,
-            separation,
             confirmations,
             seconds_left,
             count,
