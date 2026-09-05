@@ -1,7 +1,8 @@
 """Conservative paper-only multi-market crypto portfolio engine.
 
-It scans all open Kalshi crypto markets for complementary arbitrage,
-monotonic strike-ladder arbitrage, and passive spread-reversion entries.
+It scans all open Kalshi crypto markets for complementary arbitrage and
+monotonic strike-ladder arbitrage. Directional scalps are restricted to BTC
+and ETH 15-minute markets and require a confirmed contract-price rebound.
 The adaptive scorer learns only from completed paper positions and can never
 override hard bankroll, fee, liquidity, or settlement-safety checks.
 """
@@ -10,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import re
 from collections import defaultdict, deque
@@ -53,6 +53,7 @@ CRYPTO_WORDS = (
     "CRYPTO",
 )
 UPPER_WORDS = ("ABOVE", "GREATER", "HIGHER", "AT LEAST", "OVER")
+SCALP_SERIES = ("KXBTC15M", "KXETH15M")
 
 
 def fee_cents(price: int, count: int, coefficient: float = 0.07) -> int:
@@ -84,6 +85,13 @@ def is_upper_threshold(market: Market) -> bool:
     )
 
 
+def is_scalp_market(market: Market) -> bool:
+    text = " ".join(
+        filter(None, (market.series_ticker, market.event_ticker, market.ticker))
+    ).upper()
+    return any(series in text for series in SCALP_SERIES)
+
+
 @dataclass
 class PaperPosition:
     ticker: str
@@ -108,6 +116,8 @@ class PendingMaker:
     expires: datetime
     score: float
     score_key: str
+    volume_at_quote: int
+    crossed_samples: int = 0
 
 
 @dataclass
@@ -137,12 +147,12 @@ class AdaptiveScorer:
 
     def score(self, key: str, structural_edge: float, fill_quality: float) -> float:
         stat = self.stats.get(key, {"wins": 1.0, "losses": 1.0, "pnl": 0.0, "n": 0.0})
-        probability = stat["wins"] / (stat["wins"] + stat["losses"])
-        learned = stat["pnl"] / max(20.0, stat["n"] * 20.0)
+        win_rate = stat["wins"] / max(1.0, stat["wins"] + stat["losses"])
         confidence = min(1.0, stat["n"] / 50.0)
-        return (
-            structural_edge * fill_quality + confidence * learned + (1 - confidence) * probability
-        )
+        structural = max(0.0, min(1.0, structural_edge / 10.0))
+        quality = max(0.0, min(1.0, fill_quality))
+        learned = 0.5 + confidence * (win_rate - 0.5)
+        return max(0.0, min(5.0, 5.0 * (0.45 * structural + 0.35 * quality + 0.20 * learned)))
 
     def update(self, key: str, pnl_cents: int) -> None:
         stat = self.stats.setdefault(key, {"wins": 1.0, "losses": 1.0, "pnl": 0.0, "n": 0.0})
@@ -363,11 +373,20 @@ class MultiCryptoPortfolioEngine:
                 self.pending.pop(ticker, None)
                 continue
             ask = m.yes_ask if order.side is Side.YES else m.no_ask
-            if ask is None or ask > order.price:
+            age = (now - order.created).total_seconds()
+            volume_advanced = (m.volume or 0) > order.volume_at_quote
+            if ask is None or ask > order.price or not volume_advanced or age < 2:
+                order.crossed_samples = 0
+                continue
+            order.crossed_samples += 1
+            if order.crossed_samples < 2:
                 continue
             fee = fee_cents(order.price, order.count, coefficient=0.07)
             cost = order.price * order.count + fee
-            if cost > self.available() or len(self.positions) >= self.max_positions:
+            if (
+                cost > self.available()
+                or len(self.positions) + len(self.locked) >= self.max_positions
+            ):
                 self.pending.pop(ticker, None)
                 continue
             position = PaperPosition(
@@ -376,9 +395,9 @@ class MultiCryptoPortfolioEngine:
                 order.price,
                 order.count,
                 now,
-                min(99, order.price + 5),
-                max(1, order.price - 6),
-                "PASSIVE_SPREAD",
+                min(99, order.price + 9),
+                max(1, order.price - 5),
+                "BTC_ETH_REBOUND",
                 order.score_key,
                 fee,
             )
@@ -392,7 +411,7 @@ class MultiCryptoPortfolioEngine:
                 count=order.count,
                 stop_price=position.stop,
                 take_profit=position.take_profit,
-                execution_mode="paper_conservative_cross",
+                execution_mode="paper_volume_confirmed_cross",
             )
 
     def _manage_positions(self, by_ticker: dict[str, Market], now: datetime) -> None:
@@ -405,11 +424,11 @@ class MultiCryptoPortfolioEngine:
             held = (now - p.opened).total_seconds()
             reason = None
             if bid >= p.take_profit:
-                exit_price, reason = p.take_profit, "SPREAD_TAKE_PROFIT"
+                exit_price, reason = p.take_profit, "REBOUND_TAKE_PROFIT"
             elif bid <= p.stop:
-                exit_price, reason = bid, "SPREAD_STOP"
-            elif held >= 90:
-                exit_price, reason = bid, "SPREAD_TIME_EXIT"
+                exit_price, reason = bid, "REBOUND_STOP"
+            elif held >= 120:
+                exit_price, reason = bid, "REBOUND_TIME_EXIT"
             else:
                 seconds = self._seconds_left(m, now)
                 if seconds is not None and seconds <= 120:
@@ -429,9 +448,9 @@ class MultiCryptoPortfolioEngine:
             )
             self.scorer.update(p.score_key, pnl)
 
-    def _quote_spreads(self, markets: Iterable[Market], now: datetime) -> None:
+    def _quote_rebounds(self, markets: Iterable[Market], now: datetime) -> None:
         if (
-            len(self.positions) + len(self.pending) >= self.max_positions
+            len(self.positions) + len(self.locked) + len(self.pending) >= self.max_positions
             or self.realized_pnl <= -self.daily_loss_limit
         ):
             return
@@ -443,41 +462,39 @@ class MultiCryptoPortfolioEngine:
                 or self._cool("MM:" + m.ticker, now, 180)
             ):
                 continue
-            if not self._valid_book(m) or (m.volume or 0) < 100:
+            if not is_scalp_market(m) or not self._valid_book(m) or (m.volume or 0) < 1_000:
                 continue
             seconds = self._seconds_left(m, now)
-            if seconds is None or seconds <= 180:
+            if seconds is None or not 180 < seconds < 780:
                 continue
             assert None not in (m.yes_bid, m.yes_ask, m.no_bid, m.no_ask)
-            yes_bid, yes_ask = int(m.yes_bid), int(m.yes_ask)
-            if yes_ask - yes_bid < 4:
-                continue
             hist = self.history[m.ticker]
-            if len(hist) < 15:
+            if len(hist) < 20:
                 continue
-            mids = [value for _, value in hist]
-            mean = sum(mids) / len(mids)
-            volatility = math.sqrt(sum((x - mean) ** 2 for x in mids) / len(mids))
-            if volatility > 4.0:
-                continue
-            current = mids[-1]
-            if current <= mean - 0.75:
-                side, price = Side.YES, min(yes_ask - 1, yes_bid + 1)
-            elif current >= mean + 0.75:
-                side, price = Side.NO, min(int(m.no_ask) - 1, int(m.no_bid) + 1)
-            else:
-                continue
-            spread = yes_ask - yes_bid
-            width_regime = "WIDE" if spread >= 6 else "NORMAL"
-            motion_regime = "CALM" if volatility < 2 else "MOVING"
-            key = f"PASSIVE_SPREAD:{width_regime}:{motion_regime}"
-            structural = spread - 2 - volatility
-            fill_quality = min(1.0, math.log10(max(10, m.volume or 10)) / 4)
-            score = self.scorer.score(key, structural, fill_quality)
-            if score >= 1.25:
-                candidates.append((score, m, side, price, key))
+            yes_mids = [value for _, value in hist]
+            for side, mids, bid, ask in (
+                (Side.YES, yes_mids, int(m.yes_bid), int(m.yes_ask)),
+                (Side.NO, [100 - value for value in yes_mids], int(m.no_bid), int(m.no_ask)),
+            ):
+                price = min(ask - 1, bid + 1)
+                if not 50 <= price <= 60 or ask - bid < 3:
+                    continue
+                recent = mids[-10:]
+                low_index = min(range(len(recent)), key=recent.__getitem__)
+                low = recent[low_index]
+                rebound = recent[-1] - low
+                pre_drop = max(recent[: low_index + 1]) - low
+                confirmed = recent[-3] < recent[-2] <= recent[-1]
+                if low_index > len(recent) - 3 or rebound < 2 or pre_drop < 3 or not confirmed:
+                    continue
+                key = f"BTC_ETH_REBOUND:{side.value.upper()}"
+                structural = rebound + pre_drop
+                depth_quality = min(1.0, (m.volume or 0) / 10_000)
+                score = self.scorer.score(key, structural, depth_quality)
+                if score >= 2.25:
+                    candidates.append((score, m, side, price, key))
         for score, m, side, price, key in sorted(candidates, reverse=True, key=lambda x: x[0]):
-            if len(self.positions) + len(self.pending) >= self.max_positions:
+            if len(self.positions) + len(self.locked) + len(self.pending) >= self.max_positions:
                 break
             count = self._count_for(price, cap=20)
             if count <= 0:
@@ -488,9 +505,10 @@ class MultiCryptoPortfolioEngine:
                 price,
                 count,
                 now,
-                datetime.fromtimestamp(now.timestamp() + 10, UTC),
+                datetime.fromtimestamp(now.timestamp() + 20, UTC),
                 score,
                 key,
+                m.volume or 0,
             )
             record_model_snapshot(
                 ticker=m.ticker,
@@ -499,7 +517,7 @@ class MultiCryptoPortfolioEngine:
                 no_bid=m.no_bid,
                 no_ask=m.no_ask,
                 decision="QUOTE",
-                reason=f"PASSIVE_SPREAD_{side.value.upper()}_AI_{score:.2f}",
+                reason=f"BTC_ETH_REBOUND_{side.value.upper()}_AI_{score:.2f}",
             )
 
     async def step(self) -> int:
@@ -513,7 +531,7 @@ class MultiCryptoPortfolioEngine:
         self._manage_positions(by_ticker, now)
         self._same_market_arbitrage(markets, now)
         self._ladder_arbitrage(markets, now)
-        self._quote_spreads(markets, now)
+        self._quote_rebounds(markets, now)
         record_model_snapshot(
             ticker="CRYPTO_PORTFOLIO",
             decision="MONITOR",
@@ -550,4 +568,3 @@ class MultiCryptoPortfolioEngine:
 
     def stop(self) -> None:
         self._running = False
-
