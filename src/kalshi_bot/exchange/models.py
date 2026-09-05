@@ -60,7 +60,11 @@ class TimeInForce(str, Enum):
 class Market(BaseModel):
     ticker: str
     event_ticker: str | None = None
+    series_ticker: str | None = None
     title: str | None = None
+    subtitle: str | None = None
+    yes_sub_title: str | None = None
+    no_sub_title: str | None = None
     status: str | None = None
     yes_bid: int | None = None
     yes_ask: int | None = None
@@ -71,6 +75,8 @@ class Market(BaseModel):
     open_interest: int | None = None
     close_time: str | None = None
     floor_strike: float | None = None
+    cap_strike: float | None = None
+    strike_type: str | None = None
     rules_primary: str | None = None
     yes_bid_size: int | None = None
     yes_ask_size: int | None = None
@@ -83,6 +89,9 @@ class Market(BaseModel):
             return data
 
         d = dict(data)
+
+        if not d.get("subtitle"):
+            d["subtitle"] = d.get("yes_sub_title") or d.get("no_sub_title")
 
         # Current Kalshi V2 market responses expose prices as dollar strings
         # such as "0.9300". Preserve any legacy integer-cent field if it is
