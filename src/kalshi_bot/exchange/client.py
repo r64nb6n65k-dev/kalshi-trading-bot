@@ -6,9 +6,10 @@ reduce-only protection on exits.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from types import TracebackType
 from typing import Any
 from urllib.parse import urlsplit
@@ -59,7 +60,7 @@ class KalshiClient:
         )
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "KalshiClient":
+    def from_settings(cls, settings: Settings) -> KalshiClient:
         private_key = None
         if settings.api_key_id:
             private_key = load_private_key(settings.private_key_path)
@@ -116,6 +117,68 @@ class KalshiClient:
         data = await self._request("GET", "/markets", params=params)
         return [Market.model_validate(m) for m in data.get("markets", [])]
 
+    async def get_all_markets(self, **params: Any) -> list[Market]:
+        """Return every matching market, following Kalshi's cursor safely."""
+        query = dict(params)
+        query.setdefault("limit", 1000)
+        markets: list[Market] = []
+        cursor: str | None = None
+        for _ in range(25):
+            if cursor:
+                query["cursor"] = cursor
+            data = await self._request("GET", "/markets", params=query)
+            markets.extend(Market.model_validate(m) for m in data.get("markets", []))
+            raw_cursor = data.get("cursor")
+            cursor = str(raw_cursor) if raw_cursor else None
+            if not cursor:
+                break
+        return markets
+
+    async def get_open_crypto_markets(self) -> list[Market]:
+        """Discover Crypto-category series and poll every currently active series.
+
+        Kalshi's markets endpoint does not honor a category filter. Scanning the
+        global cursor would traverse many thousands of unrelated markets, so the
+        category-qualified series list is the authoritative discovery source.
+        """
+        now = time.monotonic()
+        last_discovery = getattr(self, "_crypto_discovery_time", 0.0)
+        active: set[str] = getattr(self, "_active_crypto_series", set())
+        discover = not active or now - last_discovery >= 300
+
+        if discover:
+            data = await self._request("GET", "/series", params={"category": "Crypto"})
+            series = {
+                str(item["ticker"])
+                for item in data.get("series", [])
+                if isinstance(item, dict) and item.get("ticker")
+            }
+        else:
+            series = active
+
+        semaphore = asyncio.Semaphore(8)
+
+        async def fetch(series_ticker: str) -> tuple[str, list[Market]]:
+            async with semaphore:
+                try:
+                    rows = await self.get_markets(
+                        status="open",
+                        series_ticker=series_ticker,
+                        limit=1000,
+                    )
+                    return series_ticker, rows
+                except (KalshiError, httpx.HTTPError):
+                    logger.exception("Crypto series poll failed | %s", series_ticker)
+                    return series_ticker, []
+
+        results = await asyncio.gather(*(fetch(ticker) for ticker in sorted(series)))
+        markets = [market for _, rows in results for market in rows]
+        discovered_active = {ticker for ticker, rows in results if rows}
+        if discover:
+            self._active_crypto_series = discovered_active
+            self._crypto_discovery_time = now
+        return markets
+
     async def get_market(self, ticker: str) -> Market:
         data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data["market"])
@@ -143,10 +206,7 @@ class KalshiClient:
             "/portfolio/positions",
             params=params,
         )
-        return [
-            Position.model_validate(p)
-            for p in data.get("market_positions", [])
-        ]
+        return [Position.model_validate(p) for p in data.get("market_positions", [])]
 
     async def create_order(self, order: OrderRequest) -> Order:
         """Create a V2 event order.
@@ -167,33 +227,21 @@ class KalshiClient:
             yes_price_cents = order.yes_price
         elif action == "buy" and outcome == "no":
             book_side = "ask"
-            yes_price_cents = (
-                None if order.no_price is None
-                else 100 - order.no_price
-            )
+            yes_price_cents = None if order.no_price is None else 100 - order.no_price
         elif action == "sell" and outcome == "no":
             book_side = "bid"
-            yes_price_cents = (
-                None if order.no_price is None
-                else 100 - order.no_price
-            )
+            yes_price_cents = None if order.no_price is None else 100 - order.no_price
         else:
-            raise ValueError(
-                f"Unsupported order direction: action={action}, side={outcome}"
-            )
+            raise ValueError(f"Unsupported order direction: action={action}, side={outcome}")
 
         if yes_price_cents is None:
             raise ValueError("Order price is required")
 
         if not 0 < yes_price_cents < 100:
-            raise ValueError(
-                f"Order price must be between 1 and 99 cents: {yes_price_cents}"
-            )
+            raise ValueError(f"Order price must be between 1 and 99 cents: {yes_price_cents}")
 
         raw_tif = (
-            order.time_in_force.value
-            if order.time_in_force is not None
-            else "good_till_canceled"
+            order.time_in_force.value if order.time_in_force is not None else "good_till_canceled"
         )
 
         tif_map = {
@@ -219,11 +267,7 @@ class KalshiClient:
             "price": f"{yes_price_cents / 100:.4f}",
             "time_in_force": time_in_force,
             "self_trade_prevention_type": "taker_at_cross",
-            "post_only": (
-                bool(order.post_only)
-                if order.post_only is not None
-                else False
-            ),
+            "post_only": (bool(order.post_only) if order.post_only is not None else False),
             "reduce_only": action == "sell",
         }
 
@@ -245,11 +289,7 @@ class KalshiClient:
         outcome_fill_price: int | None = None
         if fill_count > 0 and average_fill_price is not None:
             yes_fill_cents = _dollars_to_cents(str(average_fill_price))
-            outcome_fill_price = (
-                yes_fill_cents
-                if outcome == "yes"
-                else 100 - yes_fill_cents
-            )
+            outcome_fill_price = yes_fill_cents if outcome == "yes" else 100 - yes_fill_cents
 
         if fill_count >= order.count:
             status = "executed"
@@ -271,9 +311,7 @@ class KalshiClient:
             client_order_id=client_order_id,
             fill_count=fill_count,
             average_fill_price=(
-                str(average_fill_price)
-                if average_fill_price is not None
-                else None
+                str(average_fill_price) if average_fill_price is not None else None
             ),
             outcome_fill_price=outcome_fill_price,
         )
@@ -321,15 +359,12 @@ class KalshiClient:
             params=params,
         )
 
-        return [
-            Order.model_validate(o)
-            for o in data.get("orders", [])
-        ]
+        return [Order.model_validate(o) for o in data.get("orders", [])]
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "KalshiClient":
+    async def __aenter__(self) -> KalshiClient:
         return self
 
     async def __aexit__(
