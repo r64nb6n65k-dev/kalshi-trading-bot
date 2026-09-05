@@ -20,9 +20,9 @@ from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
-from kalshi_bot.data.bitcoin import BitcoinPriceFeed
 from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
+from kalshi_bot.portfolio.crypto_engine import MultiCryptoPortfolioEngine
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
 from kalshi_bot.strategies.base import Strategy
@@ -35,7 +35,7 @@ from kalshi_bot.strategies.examples.momentum import Momentum
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -53,7 +53,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ by Viprasol Tech")
 
 
 @app.command()
@@ -267,6 +267,44 @@ def btc_scalper(
                 dry_run=True,
             )
             await engine.run(max_events=None if events == 0 else events)
+
+    asyncio.run(_run())
+
+
+@app.command("crypto-portfolio")
+def crypto_portfolio(
+    cycles: int = typer.Option(
+        0,
+        help="Full crypto-market scans before stopping (0 runs continuously).",
+    ),
+    bankroll: int = typer.Option(
+        500,
+        min=100,
+        help="Paper bankroll in dollars.",
+    ),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Reserved until conservative paper results validate execution.",
+    ),
+) -> None:
+    """Run all three multi-market crypto modules with one shared bankroll."""
+    if live:
+        console.print(
+            "[red]crypto-portfolio is safety-locked to paper mode until fill data validates it.[/]"
+        )
+        raise typer.Exit(code=2)
+    start_dashboard()
+
+    async def _run() -> None:
+        settings = load_settings()
+        async with KalshiClient.from_settings(settings) as client:
+            engine = MultiCryptoPortfolioEngine(
+                client=client,
+                bankroll_cents=bankroll * 100,
+                poll_interval=max(1.0, settings.poll_interval),
+            )
+            await engine.run(max_cycles=None if cycles == 0 else cycles)
 
     asyncio.run(_run())
 
