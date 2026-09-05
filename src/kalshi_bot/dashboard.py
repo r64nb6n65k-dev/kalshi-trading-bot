@@ -1,4 +1,5 @@
 """Live Coby model dashboard and session telemetry."""
+
 from __future__ import annotations
 
 import csv
@@ -7,14 +8,17 @@ import json
 import os
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 _VOLUME = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
-_DEFAULT_DB = str(Path(_VOLUME) / "coby_eth_dashboard.db") if _VOLUME else "/tmp/coby_eth_dashboard.db"
+_DEFAULT_DB = (
+    str(Path(_VOLUME) / "coby_crypto_portfolio.db") if _VOLUME else "/tmp/coby_crypto_portfolio.db"
+)
 DB_PATH = Path(os.getenv("COBY_DASHBOARD_DB", _DEFAULT_DB))
 _db_lock = threading.RLock()
 _server_started = False
@@ -74,7 +78,8 @@ def _init_db() -> None:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS model_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ticker TEXT,
-            seconds_left REAL, bnb_price REAL, gold_price REAL, btc_price REAL, eth_price REAL, target_price REAL,
+            seconds_left REAL, bnb_price REAL, gold_price REAL, btc_price REAL,
+            eth_price REAL, target_price REAL,
             separation REAL, yes_bid INTEGER, yes_ask INTEGER,
             no_bid INTEGER, no_ask INTEGER, model_yes REAL, model_no REAL,
             edge_yes REAL, edge_no REAL, momentum_15 REAL,
@@ -94,17 +99,34 @@ def _init_db() -> None:
 
 def record_model_snapshot(**x: Any) -> None:
     _init_db()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     keys = [
-        "ticker", "seconds_left", "gold_price", "target_price", "separation",
-        "yes_bid", "yes_ask", "no_bid", "no_ask", "model_yes", "model_no",
-        "edge_yes", "edge_no", "momentum_15", "momentum_60", "volatility",
-        "decision", "reason",
+        "ticker",
+        "seconds_left",
+        "gold_price",
+        "target_price",
+        "separation",
+        "yes_bid",
+        "yes_ask",
+        "no_bid",
+        "no_ask",
+        "model_yes",
+        "model_no",
+        "edge_yes",
+        "edge_no",
+        "momentum_15",
+        "momentum_60",
+        "volatility",
+        "decision",
+        "reason",
     ]
     with _db_lock, _db() as conn:
         conn.execute(
-            "INSERT INTO model_snapshots (ts," + ",".join(keys) + ") VALUES (" +
-            ",".join("?" for _ in range(len(keys) + 1)) + ")",
+            "INSERT INTO model_snapshots (ts,"
+            + ",".join(keys)
+            + ") VALUES ("
+            + ",".join("?" for _ in range(len(keys) + 1))
+            + ")",
             [now] + [x.get(k) for k in keys],
         )
         conn.execute(
@@ -124,24 +146,31 @@ def record_entry(
     execution_mode: str | None = None,
 ) -> None:
     _init_db()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with _db_lock, _db() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO open_positions
             (ticker,side,entry_price,count,seconds_left,entry_time,
              stop_price,take_profit,execution_mode)
             VALUES (?,?,?,?,?,?,?,?,?)""",
-            (ticker, side, entry_price, count, seconds_left, now,
-             stop_price, take_profit, execution_mode),
+            (
+                ticker,
+                side,
+                entry_price,
+                count,
+                seconds_left,
+                now,
+                stop_price,
+                take_profit,
+                execution_mode,
+            ),
         )
 
 
 def get_open_position(ticker: str) -> dict[str, Any] | None:
     _init_db()
     with _db_lock, _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM open_positions WHERE ticker=?", (ticker,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM open_positions WHERE ticker=?", (ticker,)).fetchone()
     return dict(row) if row else None
 
 
@@ -162,11 +191,12 @@ def record_exit(
     total_pnl_cents: int,
 ) -> None:
     _init_db()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with _db_lock, _db() as conn:
         row = conn.execute(
             "SELECT entry_time,execution_mode,stop_price,take_profit,seconds_left "
-            "FROM open_positions WHERE ticker=?", (ticker,)
+            "FROM open_positions WHERE ticker=?",
+            (ticker,),
         ).fetchone()
         entry_time = row["entry_time"] if row else None
         execution_mode = row["execution_mode"] if row else None
@@ -179,9 +209,22 @@ def record_exit(
              total_pnl_cents,entry_time,exit_time,execution_mode,stop_price,
              take_profit,seconds_left)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (ticker, side, entry_price, exit_price, reason, count,
-             pnl_cents, total_pnl_cents, entry_time, now, execution_mode,
-             stop_price, take_profit, seconds_left),
+            (
+                ticker,
+                side,
+                entry_price,
+                exit_price,
+                reason,
+                count,
+                pnl_cents,
+                total_pnl_cents,
+                entry_time,
+                now,
+                execution_mode,
+                stop_price,
+                take_profit,
+                seconds_left,
+            ),
         )
         conn.execute("DELETE FROM open_positions WHERE ticker=?", (ticker,))
 
@@ -189,15 +232,13 @@ def record_exit(
 def _data() -> dict[str, Any]:
     _init_db()
     with _db_lock, _db() as conn:
-        trades = [dict(r) for r in conn.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT 500"
-        )]
-        opens = [dict(r) for r in conn.execute(
-            "SELECT * FROM open_positions ORDER BY entry_time DESC"
-        )]
-        snapshots = [dict(r) for r in conn.execute(
-            "SELECT * FROM model_snapshots ORDER BY id DESC LIMIT 30"
-        )]
+        trades = [dict(r) for r in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 500")]
+        opens = [
+            dict(r) for r in conn.execute("SELECT * FROM open_positions ORDER BY entry_time DESC")
+        ]
+        snapshots = [
+            dict(r) for r in conn.execute("SELECT * FROM model_snapshots ORDER BY id DESC LIMIT 30")
+        ]
         totals = conn.execute(
             """SELECT COUNT(*) AS total,
                SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END) AS wins,
@@ -239,7 +280,7 @@ def _csv(table: str) -> bytes:
     return out.getvalue().encode()
 
 
-HTML = '''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coby Gold Bot</title><style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;margin:18px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:12px;margin-bottom:8px}.v{font-size:24px;font-weight:700}.s{color:#8b949e;font-size:12px}a{color:#58a6ff}.green{color:#3fb950}.red{color:#f85149}table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #30363d;text-align:left}</style><h1>Coby Gold Bot</h1><div><a href="/download/trades.csv">Download trades CSV</a> ÃÂÃÂ· <a href="/download/model.csv">Download model data CSV</a></div><h2>Live Model</h2><div class=g id=live></div><h2>Performance</h2><div class=g id=stats></div><h2>Open Position</h2><div id=open></div><h2>Recent Model Decisions</h2><div id=decisions></div><h2>Recent Trades</h2><div id=trades></div><script>const f=(x,n=1)=>x==null?'ÃÂ¢ÃÂÃÂ':Number(x).toFixed(n),card=(k,v)=>`<div class=c><div class=s>${k}</div><div class=v>${v}</div></div>`;async function r(){try{let d=await(await fetch('/api/data',{cache:'no-store'})).json(),x=d.latest||{},s=d.stats;live.innerHTML=card('Decision',x.decision||'WAIT')+card('Reason',x.reason||'ÃÂ¢ÃÂÃÂ')+card('Gold','$'+f(x.gold_price,2))+card('Target','$'+f(x.target_price,2))+card('Separation','$'+f(x.separation,2))+card('Seconds left',f(x.seconds_left,0))+card('Model YES',f(x.model_yes,1)+'%')+card('Model NO',f(x.model_no,1)+'%')+card('YES edge',f(x.edge_yes,1)+'ÃÂÃÂ¢')+card('NO edge',f(x.edge_no,1)+'ÃÂÃÂ¢')+card('15s momentum','$'+f(x.momentum_15,2))+card('60s momentum','$'+f(x.momentum_60,2))+card('Volatility',f(x.volatility,3));stats.innerHTML=card('P&L',(s.total_pnl_cents>=0?'+':'')+'$'+f(s.total_pnl_cents/100,2))+card('Win rate',f(s.win_rate,1)+'%')+card('Trades',s.total_trades)+card('Record',s.wins+'-'+s.losses);open.innerHTML=d.open_positions.length?d.open_positions.map(p=>`<div class=c>${p.side.toUpperCase()} @ ${p.entry_price}ÃÂÃÂ¢ ÃÂÃÂ· ${p.count} contracts ÃÂÃÂ· ${p.execution_mode||'unknown'}<br><span class=s>Stop ${p.stop_price}ÃÂÃÂ¢ ÃÂÃÂ· TP ${p.take_profit}ÃÂÃÂ¢ ÃÂÃÂ· ${p.ticker}</span></div>`).join(''):'<div class=c>No open position</div>';decisions.innerHTML=d.snapshots.slice(0,12).map(q=>`<div class=c><b>${q.decision||'WAIT'}</b> ÃÂÃÂ· ${q.reason||'ÃÂ¢ÃÂÃÂ'}<br><span class=s>Gold $${f(q.gold_price,2)} / target $${f(q.target_price,2)} ÃÂÃÂ· sep $${f(q.separation,2)} ÃÂÃÂ· ${f(q.seconds_left,0)}s ÃÂÃÂ· YES ${f(q.model_yes,1)}% ÃÂÃÂ· edge ${f(q.edge_yes,1)}ÃÂÃÂ¢</span></div>`).join('');trades.innerHTML='<table><tr><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>'+d.trades.slice(0,25).map(t=>`<tr><td>${t.side}</td><td>${t.entry_price}ÃÂÃÂ¢</td><td>${t.exit_price}ÃÂÃÂ¢</td><td>${(t.pnl_cents/100).toFixed(2)}</td><td>${t.reason}<br><span class=s>${t.execution_mode||'unknown'} ÃÂÃÂ· stop ${t.stop_price??'ÃÂ¢ÃÂÃÂ'}ÃÂÃÂ¢ ÃÂÃÂ· TP ${t.take_profit??'ÃÂ¢ÃÂÃÂ'}ÃÂÃÂ¢</span></td></tr>`).join('')+'</table>'}catch(e){console.error(e)}}r();setInterval(r,2000)</script>'''
+HTML = """<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coby Crypto Portfolio</title><style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;margin:18px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:12px;margin-bottom:8px}.v{font-size:22px;font-weight:700}.s{color:#8b949e;font-size:12px}a{color:#58a6ff}table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #30363d;text-align:left}</style><h1>Coby Crypto Portfolio</h1><div><a href="/download/trades.csv">Download trades CSV</a> Â· <a href="/download/model.csv">Download decisions CSV</a></div><h2>Portfolio Monitor</h2><div class=g id=live></div><h2>Performance</h2><div class=g id=stats></div><h2>Open Positions</h2><div id=open></div><h2>Recent Decisions</h2><div id=decisions></div><h2>Recent Trades</h2><div id=trades></div><script>const f=(x,n=1)=>x==null?'â':Number(x).toFixed(n),card=(k,v)=>`<div class=c><div class=s>${k}</div><div class=v>${v}</div></div>`;async function r(){try{let d=await(await fetch('/api/data',{cache:'no-store'})).json(),x=d.latest||{},s=d.stats;live.innerHTML=card('Decision',x.decision||'WAIT')+card('Status',x.reason||'â')+card('Ticker',x.ticker||'â')+card('YES bid / ask',`${x.yes_bid??'â'}Â¢ / ${x.yes_ask??'â'}Â¢`)+card('NO bid / ask',`${x.no_bid??'â'}Â¢ / ${x.no_ask??'â'}Â¢`);stats.innerHTML=card('P&L',(s.total_pnl_cents>=0?'+':'')+'$'+f(s.total_pnl_cents/100,2))+card('Win rate',f(s.win_rate,1)+'%')+card('Trades',s.total_trades)+card('Record',s.wins+'-'+s.losses);open.innerHTML=d.open_positions.length?d.open_positions.map(p=>`<div class=c>${String(p.side).toUpperCase()} @ ${p.entry_price}Â¢ Â· ${p.count} contracts Â· ${p.execution_mode||'paper'}<br><span class=s>Stop ${p.stop_price??'â'}Â¢ Â· TP ${p.take_profit??'â'}Â¢ Â· ${p.ticker}</span></div>`).join(''):'<div class=c>No open positions</div>';decisions.innerHTML=d.snapshots.slice(0,15).map(q=>`<div class=c><b>${q.decision||'WAIT'}</b> Â· ${q.reason||'â'}<br><span class=s>${q.ticker||'â'} Â· YES ${q.yes_bid??'â'}/${q.yes_ask??'â'}Â¢ Â· NO ${q.no_bid??'â'}/${q.no_ask??'â'}Â¢</span></div>`).join('');trades.innerHTML='<table><tr><th>Market</th><th>Module</th><th>Entry</th><th>Exit</th><th>Count</th><th>P&L</th></tr>'+d.trades.slice(0,30).map(t=>`<tr><td>${t.ticker}</td><td>${t.reason}</td><td>${t.entry_price}Â¢</td><td>${t.exit_price}Â¢</td><td>${t.count}</td><td>${(t.pnl_cents/100).toFixed(2)}</td></tr>`).join('')+'</table>'}catch(e){console.error(e)}}r();setInterval(r,2000)</script>"""  # noqa: E501
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
