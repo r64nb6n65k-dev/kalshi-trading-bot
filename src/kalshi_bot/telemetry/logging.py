@@ -23,6 +23,11 @@ def configure_logging(level: int = logging.INFO) -> None:
         datefmt="[%X]",
         handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
     )
+    # httpx emits one INFO record per request. The portfolio discovery scan
+    # intentionally performs many requests, so keep routine 200 responses from
+    # exhausting Railway's deployment log allowance. Errors still surface.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     _CONFIGURED = True
 
 
