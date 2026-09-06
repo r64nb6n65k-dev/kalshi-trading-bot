@@ -74,6 +74,11 @@ class Market(BaseModel):
     volume: int | None = None
     open_interest: int | None = None
     close_time: str | None = None
+    expected_expiration_time: str | None = None
+    expiration_time: str | None = None
+    latest_expiration_time: str | None = None
+    settlement_timer_seconds: int | None = None
+    can_close_early: bool | None = None
     floor_strike: float | None = None
     cap_strike: float | None = None
     strike_type: str | None = None
