@@ -22,7 +22,7 @@ from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
-from kalshi_bot.portfolio.crypto_engine import MultiCryptoPortfolioEngine
+from kalshi_bot.portfolio.ladder_engine import SameDayLadderEngine
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
 from kalshi_bot.strategies.base import Strategy
@@ -35,7 +35,7 @@ from kalshi_bot.strategies.examples.momentum import Momentum
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -53,7 +53,9 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ by Viprasol Tech")
+    console.print(
+        f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech"
+    )
 
 
 @app.command()
@@ -271,27 +273,30 @@ def btc_scalper(
     asyncio.run(_run())
 
 
-@app.command("crypto-portfolio")
-def crypto_portfolio(
+@app.command("same-day-ladders")
+def same_day_ladders(
     cycles: int = typer.Option(
         0,
-        help="Full crypto-market scans before stopping (0 runs continuously).",
+        help="All-market scans before stopping (0 runs continuously).",
     ),
-    bankroll: int = typer.Option(
-        500,
-        min=100,
-        help="Paper bankroll in dollars.",
+    bankroll: int = typer.Option(500, min=100, help="Paper bankroll in dollars."),
+    contracts: int = typer.Option(5, min=1, max=50, help="Maximum pairs per opportunity."),
+    minimum_edge: int = typer.Option(
+        3,
+        min=1,
+        max=25,
+        help="Minimum profit in cents per pair after estimated fees.",
     ),
     live: bool = typer.Option(
         False,
         "--live",
-        help="Reserved until conservative paper results validate execution.",
+        help="Reserved until paired-fill telemetry validates execution.",
     ),
 ) -> None:
-    """Run all three multi-market crypto modules with one shared bankroll."""
+    """Scan every category for depth-confirmed ladders closing today Central."""
     if live:
         console.print(
-            "[red]crypto-portfolio is safety-locked to paper mode until fill data validates it.[/]"
+            "[red]same-day-ladders is paper-only until partial-fill risk is validated.[/]"
         )
         raise typer.Exit(code=2)
     start_dashboard()
@@ -299,10 +304,12 @@ def crypto_portfolio(
     async def _run() -> None:
         settings = load_settings()
         async with KalshiClient.from_settings(settings) as client:
-            engine = MultiCryptoPortfolioEngine(
+            engine = SameDayLadderEngine(
                 client=client,
                 bankroll_cents=bankroll * 100,
-                poll_interval=max(1.0, settings.poll_interval),
+                poll_interval=max(5.0, settings.poll_interval),
+                contracts_per_pair=contracts,
+                minimum_profit_per_pair=minimum_edge,
             )
             await engine.run(max_cycles=None if cycles == 0 else cycles)
 
