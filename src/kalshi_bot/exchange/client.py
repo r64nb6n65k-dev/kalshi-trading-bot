@@ -123,15 +123,17 @@ class KalshiClient:
         query.setdefault("limit", 1000)
         markets: list[Market] = []
         cursor: str | None = None
-        for _ in range(25):
+        seen_cursors: set[str] = set()
+        while True:
             if cursor:
                 query["cursor"] = cursor
             data = await self._request("GET", "/markets", params=query)
             markets.extend(Market.model_validate(m) for m in data.get("markets", []))
             raw_cursor = data.get("cursor")
             cursor = str(raw_cursor) if raw_cursor else None
-            if not cursor:
+            if not cursor or cursor in seen_cursors:
                 break
+            seen_cursors.add(cursor)
         return markets
 
     async def get_open_crypto_markets(self) -> list[Market]:
