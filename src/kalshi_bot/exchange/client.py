@@ -102,12 +102,23 @@ class KalshiClient:
         path: str,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        response = await self._client.request(
-            method,
-            API_PREFIX + path,
-            **kwargs,
-        )
+        response: httpx.Response | None = None
+        for attempt in range(5):
+            response = await self._client.request(
+                method,
+                API_PREFIX + path,
+                **kwargs,
+            )
+            if response.status_code != 429 or method.upper() != "GET":
+                break
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after is not None else 2**attempt
+            except ValueError:
+                delay = float(2**attempt)
+            await asyncio.sleep(max(1.0, min(30.0, delay)))
 
+        assert response is not None
         if response.is_error:
             raise KalshiError(response.status_code, response.text)
 
