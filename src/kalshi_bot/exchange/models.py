@@ -66,6 +66,7 @@ class Market(BaseModel):
     yes_sub_title: str | None = None
     no_sub_title: str | None = None
     status: str | None = None
+    result: str | None = None
     yes_bid: int | None = None
     yes_ask: int | None = None
     no_bid: int | None = None
@@ -74,6 +75,7 @@ class Market(BaseModel):
     volume: int | None = None
     open_interest: int | None = None
     close_time: str | None = None
+    open_time: str | None = None
     expected_expiration_time: str | None = None
     expiration_time: str | None = None
     latest_expiration_time: str | None = None
