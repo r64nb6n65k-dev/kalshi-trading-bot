@@ -192,6 +192,41 @@ class KalshiClient:
             self._crypto_discovery_time = now
         return markets
 
+    async def get_open_15m_markets(self) -> list[Market]:
+        """Return every open 15-minute series market with a bounded API load."""
+        now = time.monotonic()
+        discovered_at = getattr(self, "_fifteen_minute_discovery_time", 0.0)
+        series: set[str] = getattr(self, "_fifteen_minute_series", set())
+
+        if not series or now - discovered_at >= 300:
+            # Fifteen-minute contracts currently live in Crypto. Discovering the
+            # category avoids walking thousands of unrelated open markets every second.
+            data = await self._request("GET", "/series", params={"category": "Crypto"})
+            series = {
+                str(item["ticker"])
+                for item in data.get("series", [])
+                if isinstance(item, dict)
+                and item.get("ticker")
+                and "15M" in str(item["ticker"]).upper()
+            }
+            self._fifteen_minute_series = series
+            self._fifteen_minute_discovery_time = now
+
+        semaphore = asyncio.Semaphore(8)
+
+        async def fetch(series_ticker: str) -> list[Market]:
+            async with semaphore:
+                try:
+                    return await self.get_markets(
+                        status="open", series_ticker=series_ticker, limit=100
+                    )
+                except (KalshiError, httpx.HTTPError):
+                    logger.exception("15-minute series poll failed | %s", series_ticker)
+                    return []
+
+        rows = await asyncio.gather(*(fetch(ticker) for ticker in sorted(series)))
+        return [market for group in rows for market in group]
+
     async def get_market(self, ticker: str) -> Market:
         data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data["market"])
