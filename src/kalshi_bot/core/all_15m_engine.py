@@ -45,6 +45,57 @@ class All15mEngine:
             if value
         }
 
+    async def _settle_inactive_positions(self, active_tickers: set[str]) -> None:
+        """Record official Kalshi settlement before releasing a tracked position."""
+        for ticker in set(self._paper_positions) - active_tickers:
+            signed_count = self._paper_positions.get(ticker, 0)
+            if signed_count == 0:
+                self._paper_positions.pop(ticker, None)
+                continue
+            try:
+                market = await self.client.get_market(ticker)
+            except Exception:
+                logger.exception("SETTLEMENT LOOKUP FAILED | ticker=%s", ticker)
+                continue
+            result = (market.result or "").lower()
+            if result not in {"yes", "no"}:
+                logger.info(
+                    "AWAITING SETTLEMENT | ticker=%s | status=%s",
+                    ticker,
+                    market.status,
+                )
+                continue
+
+            side = Side.YES if signed_count > 0 else Side.NO
+            count = abs(signed_count)
+            won = result == side.value
+            exit_price = 100 if won else 0
+            entry_price = self._entry_prices.get(ticker, self.strategy.entry_price_for(ticker))
+            pnl = (exit_price - entry_price) * count
+            self._total_pnl_cents += pnl
+            record_exit(
+                ticker=ticker,
+                side=side.value,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                reason="SETTLEMENT_WIN" if won else "SETTLEMENT_LOSS",
+                count=count,
+                pnl_cents=pnl,
+                total_pnl_cents=self._total_pnl_cents,
+            )
+            logger.warning(
+                "SETTLEMENT RECORDED | ticker=%s | side=%s | result=%s | exit=%dc | pnl=$%.2f",
+                ticker,
+                side.value,
+                result,
+                exit_price,
+                pnl / 100,
+            )
+            self._paper_positions.pop(ticker, None)
+            self._entry_prices.pop(ticker, None)
+            self._exit_values.pop(ticker, None)
+            self._exit_counts.pop(ticker, None)
+
     async def _submit(self, request: OrderRequest, market: Market, position: int) -> None:
         decision = self.risk.check(request, position)
         if not decision.approved:
@@ -98,6 +149,13 @@ class All15mEngine:
         fill_price = int(result.outcome_fill_price or 0)
         if fill_count <= 0 or fill_price <= 0:
             return
+        if not self.dry_run:
+            delta = fill_count if request.side is Side.YES else -fill_count
+            if request.action is Action.SELL:
+                delta = -delta
+            self._paper_positions[request.ticker] = (
+                self._paper_positions.get(request.ticker, 0) + delta
+            )
         if request.action is Action.BUY:
             self._entry_prices[request.ticker] = fill_price
             record_entry(
@@ -135,6 +193,7 @@ class All15mEngine:
             total_pnl_cents=self._total_pnl_cents,
         )
         self._entry_prices.pop(request.ticker, None)
+        self._paper_positions.pop(request.ticker, None)
 
     async def run(self, max_cycles: int | None = None) -> None:
         cycle = 0
@@ -150,9 +209,8 @@ class All15mEngine:
                 try:
                     markets = await self.client.get_open_15m_markets()
                     active_tickers = {market.ticker for market in markets}
-                    self.strategy.reconcile(active_tickers)
-                    for ticker in set(self._paper_positions) - active_tickers:
-                        self._paper_positions.pop(ticker, None)
+                    await self._settle_inactive_positions(active_tickers)
+                    self.strategy.reconcile(active_tickers | set(self._paper_positions))
                     positions = await self._positions()
                     now = time.time()
                     for market in markets:
