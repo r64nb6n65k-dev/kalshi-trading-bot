@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from dataclasses import dataclass
+import re
 from datetime import UTC, datetime
 from typing import Any
 
+from kalshi_bot.dashboard import record_model_snapshot
 from kalshi_bot.exchange.models import (
     Action,
     Market,
@@ -16,16 +16,10 @@ from kalshi_bot.exchange.models import (
     Side,
     TimeInForce,
 )
+from kalshi_bot.strategies.base import UnderlyingTick
 from kalshi_bot.telemetry.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class Observation:
-    timestamp: float
-    midpoint: float
-    volume: int
 
 
 class All15mMomentumStrategy:
@@ -40,7 +34,6 @@ class All15mMomentumStrategy:
         self.decision_window = float(params.get("decision_window", 15))
         self.take_profit = int(params.get("take_profit", 98))
         self.minimum_history = float(params.get("minimum_history", 45))
-        self._history: dict[str, deque[Observation]] = defaultdict(lambda: deque(maxlen=900))
         self._decided: set[str] = set()
         self._pending: set[str] = set()
         self._sides: dict[str, Side] = {}
@@ -60,47 +53,54 @@ class All15mMomentumStrategy:
             return None
 
     @staticmethod
-    def _midpoint(market: Market) -> float | None:
-        if market.yes_bid is not None and market.yes_ask is not None:
-            return (market.yes_bid + market.yes_ask) / 2
-        return float(market.last_price) if market.last_price is not None else None
+    def product_for(market: Market) -> str | None:
+        series = (market.series_ticker or market.ticker.split("-")[0]).upper()
+        match = re.fullmatch(r"KX([A-Z0-9]+)15M", series)
+        return f"{match.group(1)}-USD" if match else None
 
-    def observe(self, market: Market, now: float) -> None:
-        midpoint = self._midpoint(market)
-        if midpoint is not None:
-            self._history[market.ticker].append(Observation(now, midpoint, int(market.volume or 0)))
+    @staticmethod
+    def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
+        return min(ticks, key=lambda item: abs(item.timestamp.timestamp() - timestamp))
 
-    def _at_or_before(self, history: deque[Observation], timestamp: float) -> Observation:
-        return min(history, key=lambda item: abs(item.timestamp - timestamp))
-
-    def _signal(self, market: Market, now: float) -> tuple[Side, str] | None:
-        history = self._history[market.ticker]
-        if len(history) < 2 or now - history[0].timestamp < self.minimum_history:
+    def _signal(
+        self, market: Market, now: float, ticks: tuple[UnderlyingTick, ...]
+    ) -> tuple[Side, str] | None:
+        target = float(market.floor_strike) if market.floor_strike is not None else None
+        if target is None or target <= 0 or len(ticks) < 2:
             return None
-        latest = history[-1]
-        short = self._at_or_before(history, now - 60)
-        long = history[0]
-        short_momentum = latest.midpoint - short.midpoint
-        long_momentum = latest.midpoint - long.midpoint
-        separation = latest.midpoint - 50.0
-        volume_change = max(0, latest.volume - long.volume)
-
-        # Direction is a weighted vote. Volume strengthens the observed move;
-        # it never invents a direction on its own.
-        directional_move = 0.65 * short_momentum + 0.35 * long_momentum
-        volume_weight = min(2.0, 1.0 + volume_change / 500.0)
-        # Separation is supporting evidence, not a command to chase whichever
-        # side is already expensive. Fresh momentum remains the primary vote.
-        score = directional_move * volume_weight + 0.05 * separation
+        latest = ticks[-1]
+        first_time = ticks[0].timestamp.timestamp()
+        if now - latest.timestamp.timestamp() > 5 or now - first_time < self.minimum_history:
+            return None
+        short = self._at_or_before(ticks, now - 60)
+        long = ticks[0]
+        short_bps = (latest.price - short.price) / target * 10_000
+        long_bps = (latest.price - long.price) / target * 10_000
+        separation_bps = (latest.price - target) / target * 10_000
+        recent_volume = sum(tick.size for tick in ticks if tick.timestamp.timestamp() >= now - 60)
+        older_volume = sum(tick.size for tick in ticks if tick.timestamp.timestamp() < now - 60)
+        older_seconds = max(1.0, now - first_time - 60)
+        baseline_volume = older_volume * 60 / older_seconds
+        volume_ratio = recent_volume / baseline_volume if baseline_volume > 0 else 1.0
+        volume_weight = max(0.5, min(2.0, volume_ratio))
+        score = 0.55 * separation_bps + volume_weight * (0.30 * short_bps + 0.15 * long_bps)
         side = Side.YES if score >= 0 else Side.NO
         detail = (
-            f"score={score:.2f} short={short_momentum:+.2f} long={long_momentum:+.2f} "
-            f"separation={separation:+.2f} volume_delta={volume_change}"
+            f"underlying={latest.price:.4f} target={target:.4f} score={score:+.2f} "
+            f"separation_bps={separation_bps:+.2f} momentum_60_bps={short_bps:+.2f} "
+            f"momentum_long_bps={long_bps:+.2f} volume_ratio={volume_ratio:.2f}"
         )
         return side, detail
 
     def reserved_cents(self) -> int:
         return sum(self._entry_costs.values())
+
+    def entry_price_for(self, ticker: str) -> int:
+        count = self._counts.get(ticker, 0)
+        return round(self._entry_costs.get(ticker, 0) / count) if count else 0
+
+    def count_for(self, ticker: str) -> int:
+        return self._counts.get(ticker, 0)
 
     def reconcile(self, active_tickers: set[str]) -> None:
         """Release bankroll reservations after a market closes or disappears."""
@@ -110,8 +110,13 @@ class All15mMomentumStrategy:
             self._sides.pop(ticker, None)
             self._pending.discard(ticker)
 
-    def orders_for(self, market: Market, position: int, now: float) -> list[OrderRequest]:
-        self.observe(market, now)
+    def orders_for(
+        self,
+        market: Market,
+        position: int,
+        now: float,
+        underlying_ticks: tuple[UnderlyingTick, ...],
+    ) -> list[OrderRequest]:
         ticker = market.ticker
         seconds_left = self.seconds_to_close(market)
         if seconds_left is None or ticker in self._pending:
@@ -132,10 +137,21 @@ class All15mMomentumStrategy:
         ):
             return []
 
-        signal = self._signal(market, now)
+        signal = self._signal(market, now, underlying_ticks)
         self._decided.add(ticker)
         if signal is None:
-            logger.warning("SKIP | ticker=%s | insufficient momentum history", ticker)
+            logger.warning("SKIP | ticker=%s | missing/stale price history or strike", ticker)
+            record_model_snapshot(
+                ticker=ticker,
+                seconds_left=seconds_left,
+                target_price=market.floor_strike,
+                yes_bid=market.yes_bid,
+                yes_ask=market.yes_ask,
+                no_bid=market.no_bid,
+                no_ask=market.no_ask,
+                decision="SKIP",
+                reason="MISSING_OR_STALE_PRICE_HISTORY_OR_STRIKE",
+            )
             return []
         side, detail = signal
         ask = market.yes_ask if side is Side.YES else market.no_ask
@@ -153,6 +169,22 @@ class All15mMomentumStrategy:
             return []
         logger.warning(
             "SIGNAL | ticker=%s | side=%s | ask=%dc | %s", ticker, side.value, ask, detail
+        )
+        latest_price = underlying_ticks[-1].price
+        target = float(market.floor_strike or 0)
+        short = self._at_or_before(underlying_ticks, now - 60)
+        record_model_snapshot(
+            ticker=ticker,
+            seconds_left=seconds_left,
+            target_price=target,
+            separation=latest_price - target,
+            yes_bid=market.yes_bid,
+            yes_ask=market.yes_ask,
+            no_bid=market.no_bid,
+            no_ask=market.no_ask,
+            momentum_60=latest_price - short.price,
+            decision=f"BUY_{side.value.upper()}",
+            reason=detail,
         )
         self._pending.add(ticker)
         return [self._order(ticker, Action.BUY, side, ask, self.contracts)]
