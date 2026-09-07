@@ -18,6 +18,7 @@ from kalshi_bot.backtesting.data import random_walk_snapshots
 from kalshi_bot.backtesting.engine import Backtester
 from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
+from kalshi_bot.core.all_15m_engine import All15mEngine
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.data.gold import GoldPriceFeed
@@ -26,6 +27,7 @@ from kalshi_bot.portfolio.ladder_engine import SameDayLadderEngine
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
 from kalshi_bot.strategies.base import Strategy
+from kalshi_bot.strategies.examples.all_15m_momentum import All15mMomentumStrategy
 from kalshi_bot.strategies.examples.arbitrage import ArbitrageYesNo
 from kalshi_bot.strategies.examples.coby_strategy import CobyStrategy
 from kalshi_bot.strategies.examples.fair_value import FairValue
@@ -35,7 +37,7 @@ from kalshi_bot.strategies.examples.momentum import Momentum
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot â open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -54,7 +56,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 def version() -> None:
     """Print the installed version."""
     console.print(
-        f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech"
+        f"kalshi-trading-bot [bold cyan]{__version__}[/] Ã¢ÂÂ by Viprasol Tech"
     )
 
 
@@ -310,6 +312,37 @@ def same_day_ladders(
                 poll_interval=max(5.0, settings.poll_interval),
                 contracts_per_pair=contracts,
                 minimum_profit_per_pair=minimum_edge,
+            )
+            await engine.run(max_cycles=None if cycles == 0 else cycles)
+
+    asyncio.run(_run())
+
+
+@app.command("all-15m")
+def all_15m(
+    cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
+    bankroll: int = typer.Option(500, min=1, help="Maximum strategy bankroll in dollars."),
+    contracts: int = typer.Option(20, min=1, help="Contracts per trade."),
+    live: bool = typer.Option(False, "--live", help="Send real orders (default is paper)."),
+) -> None:
+    """Monitor and directionally trade every open 15-minute market."""
+    start_dashboard()
+
+    async def _run() -> None:
+        settings = load_settings()
+        async with KalshiClient.from_settings(settings) as client:
+            if live and not client.authenticated:
+                console.print("[red]Live mode requires Kalshi credentials.[/]")
+                raise typer.Exit(code=1)
+            engine = All15mEngine(
+                client=client,
+                strategy=All15mMomentumStrategy(
+                    bankroll_cents=bankroll * 100,
+                    contracts=contracts,
+                ),
+                risk=RiskManager.from_settings(settings.risk),
+                dry_run=not live,
+                poll_interval=settings.poll_interval,
             )
             await engine.run(max_cycles=None if cycles == 0 else cycles)
 
