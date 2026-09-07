@@ -35,6 +35,7 @@ class All15mMomentumStrategy:
         self.take_profit = int(params.get("take_profit", 98))
         self.minimum_history = float(params.get("minimum_history", 45))
         self.minimum_separation_bps = float(params.get("minimum_separation_bps", 4.0))
+        self.entry_slippage_cents = int(params.get("entry_slippage_cents", 2))
         self._decided: set[str] = set()
         self._pending: set[str] = set()
         self._sides: dict[str, Side] = {}
@@ -164,7 +165,8 @@ class All15mMomentumStrategy:
         if ask is None or not 1 <= ask <= 99:
             logger.warning("SKIP | ticker=%s | side=%s | no executable ask", ticker, side.value)
             return []
-        cost = ask * self.contracts
+        limit_price = min(99, ask + self.entry_slippage_cents)
+        cost = limit_price * self.contracts
         if self.reserved_cents() + cost > self.bankroll_cents:
             logger.warning(
                 "SKIP | ticker=%s | bankroll cap | needed=%d available=%d",
@@ -174,7 +176,12 @@ class All15mMomentumStrategy:
             )
             return []
         logger.warning(
-            "SIGNAL | ticker=%s | side=%s | ask=%dc | %s", ticker, side.value, ask, detail
+            "SIGNAL | ticker=%s | side=%s | ask=%dc | limit=%dc | %s",
+            ticker,
+            side.value,
+            ask,
+            limit_price,
+            detail,
         )
         latest_price = underlying_ticks[-1].price
         target = float(market.floor_strike or 0)
@@ -193,7 +200,7 @@ class All15mMomentumStrategy:
             reason=detail,
         )
         self._pending.add(ticker)
-        return [self._order(ticker, Action.BUY, side, ask, self.contracts)]
+        return [self._order(ticker, Action.BUY, side, limit_price, self.contracts)]
 
     @staticmethod
     def _order(ticker: str, action: Action, side: Side, price: int, count: int) -> OrderRequest:
