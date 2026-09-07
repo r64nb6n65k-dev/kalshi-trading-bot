@@ -28,12 +28,13 @@ class All15mMomentumStrategy:
     name = "all_15m_momentum"
 
     def __init__(self, **params: Any) -> None:
-        self.contracts = int(params.get("contracts", 20))
+        self.contracts = int(params.get("contracts", 5))
         self.bankroll_cents = int(params.get("bankroll_cents", 50_000))
         self.decision_seconds = float(params.get("decision_seconds", 600))
         self.decision_window = float(params.get("decision_window", 15))
         self.take_profit = int(params.get("take_profit", 98))
         self.minimum_history = float(params.get("minimum_history", 45))
+        self.minimum_separation_bps = float(params.get("minimum_separation_bps", 4.0))
         self._decided: set[str] = set()
         self._pending: set[str] = set()
         self._sides: dict[str, Side] = {}
@@ -64,19 +65,25 @@ class All15mMomentumStrategy:
 
     def _signal(
         self, market: Market, now: float, ticks: tuple[UnderlyingTick, ...]
-    ) -> tuple[Side, str] | None:
+    ) -> tuple[Side | None, str]:
         target = float(market.floor_strike) if market.floor_strike is not None else None
         if target is None or target <= 0 or len(ticks) < 2:
-            return None
+            return None, "MISSING_OR_STALE_PRICE_HISTORY_OR_STRIKE"
         latest = ticks[-1]
         first_time = ticks[0].timestamp.timestamp()
         if now - latest.timestamp.timestamp() > 5 or now - first_time < self.minimum_history:
-            return None
+            return None, "MISSING_OR_STALE_PRICE_HISTORY_OR_STRIKE"
         short = self._at_or_before(ticks, now - 60)
         long = ticks[0]
         short_bps = (latest.price - short.price) / target * 10_000
         long_bps = (latest.price - long.price) / target * 10_000
         separation_bps = (latest.price - target) / target * 10_000
+        if abs(separation_bps) < self.minimum_separation_bps:
+            return (
+                None,
+                f"INSUFFICIENT_SEPARATION | separation_bps={separation_bps:+.2f} "
+                f"minimum={self.minimum_separation_bps:.2f}",
+            )
         recent_volume = sum(tick.size for tick in ticks if tick.timestamp.timestamp() >= now - 60)
         older_volume = sum(tick.size for tick in ticks if tick.timestamp.timestamp() < now - 60)
         older_seconds = max(1.0, now - first_time - 60)
@@ -137,10 +144,10 @@ class All15mMomentumStrategy:
         ):
             return []
 
-        signal = self._signal(market, now, underlying_ticks)
+        side, detail = self._signal(market, now, underlying_ticks)
         self._decided.add(ticker)
-        if signal is None:
-            logger.warning("SKIP | ticker=%s | missing/stale price history or strike", ticker)
+        if side is None:
+            logger.warning("SKIP | ticker=%s | %s", ticker, detail)
             record_model_snapshot(
                 ticker=ticker,
                 seconds_left=seconds_left,
@@ -150,10 +157,9 @@ class All15mMomentumStrategy:
                 no_bid=market.no_bid,
                 no_ask=market.no_ask,
                 decision="SKIP",
-                reason="MISSING_OR_STALE_PRICE_HISTORY_OR_STRIKE",
+                reason=detail,
             )
             return []
-        side, detail = signal
         ask = market.yes_ask if side is Side.YES else market.no_ask
         if ask is None or not 1 <= ask <= 99:
             logger.warning("SKIP | ticker=%s | side=%s | no executable ask", ticker, side.value)
