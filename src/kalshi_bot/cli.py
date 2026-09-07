@@ -321,7 +321,7 @@ def same_day_ladders(
 def all_15m(
     cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
     bankroll: int = typer.Option(500, min=1, help="Maximum strategy bankroll in dollars."),
-    contracts: int = typer.Option(20, min=1, help="Contracts per trade."),
+    contracts: int = typer.Option(5, min=1, help="Contracts per trade."),
     live: bool = typer.Option(False, "--live", help="Send real orders (default is paper)."),
 ) -> None:
     """Monitor and directionally trade every open 15-minute market."""
