@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 
 
 class All15mMomentumStrategy:
-    """Choose YES or NO once near 10:00, then hold unless the bid reaches 98c."""
+    """Seek a fresh qualifying entry from 10:00 to 1:00, then manage its exit."""
 
     name = "all_15m_momentum"
     _PRODUCT_ALIASES: ClassVar[dict[str, str]] = {
@@ -45,7 +45,7 @@ class All15mMomentumStrategy:
         self.contracts = int(params.get("contracts", 5))
         self.bankroll_cents = int(params.get("bankroll_cents", 50_000))
         self.decision_seconds = float(params.get("decision_seconds", 600))
-        self.decision_window = float(params.get("decision_window", 15))
+        self.entry_cutoff_seconds = float(params.get("entry_cutoff_seconds", 60))
         self.take_profit = int(params.get("take_profit", 98))
         self.exit_slippage_cents = max(0, int(params.get("exit_slippage_cents", 2)))
         self.maximum_entry_price = int(params.get("maximum_entry_price", 90))
@@ -59,6 +59,7 @@ class All15mMomentumStrategy:
         self._pending: set[str] = set()
         self._entry_intents: dict[str, Side] = {}
         self._entry_details: dict[str, str] = {}
+        self._last_skip_reasons: dict[str, str] = {}
         self._sides: dict[str, Side] = {}
         self._counts: dict[str, int] = {}
         self._entry_costs: dict[str, int] = {}
@@ -152,6 +153,7 @@ class All15mMomentumStrategy:
             self._pending.discard(ticker)
             self._entry_intents.pop(ticker, None)
             self._entry_details.pop(ticker, None)
+            self._last_skip_reasons.pop(ticker, None)
 
     def orders_for(
         self,
@@ -199,18 +201,16 @@ class All15mMomentumStrategy:
 
         if ticker in self._decided:
             return []
-        if not (
-            self.decision_seconds - self.decision_window <= seconds_left <= self.decision_seconds
-        ):
+        if not (self.entry_cutoff_seconds < seconds_left <= self.decision_seconds):
             return []
 
-        side = self._entry_intents.get(ticker)
-        detail = self._entry_details.get(ticker, "")
-        first_attempt = side is None
-        if first_attempt:
-            side, detail = self._signal(market, now, underlying_ticks)
-            if side is None:
-                self._decided.add(ticker)
+        previous_side = self._entry_intents.get(ticker)
+        side, detail = self._signal(market, now, underlying_ticks)
+        first_attempt = previous_side is None
+        if side is None:
+            self._entry_intents.pop(ticker, None)
+            self._entry_details.pop(ticker, None)
+            if self._last_skip_reasons.get(ticker) != detail:
                 logger.warning("SKIP | ticker=%s | %s", ticker, detail)
                 record_model_snapshot(
                     ticker=ticker,
@@ -223,9 +223,11 @@ class All15mMomentumStrategy:
                     decision="SKIP",
                     reason=detail,
                 )
-                return []
-            self._entry_intents[ticker] = side
-            self._entry_details[ticker] = detail
+                self._last_skip_reasons[ticker] = detail
+            return []
+        self._last_skip_reasons.pop(ticker, None)
+        self._entry_intents[ticker] = side
+        self._entry_details[ticker] = detail
         ask = market.yes_ask if side is Side.YES else market.no_ask
         if ask is None or not 1 <= ask <= 99:
             logger.warning("SKIP | ticker=%s | side=%s | no executable ask", ticker, side.value)
