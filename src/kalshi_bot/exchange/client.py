@@ -194,16 +194,18 @@ class KalshiClient:
         return markets
 
     async def get_open_15m_markets(self) -> list[Market]:
-        """Return every open numeric-strike 15-minute market across all categories."""
+        """Return open numeric-strike 15-minute markets in Kalshi's Crypto category."""
         now = time.monotonic()
         discovered_at = getattr(self, "_fifteen_minute_discovery_time", 0.0)
         series: set[str] = getattr(self, "_fifteen_minute_series", set())
 
         if not series or now - discovered_at >= 300:
-            # The 15-minute lineup spans Crypto, Commodities, and Financials.
-            # Discover the complete series catalog every five minutes, then poll
-            # only the matching recurring series on each scan.
-            data = await self._request("GET", "/series")
+            # Live trading is intentionally crypto-only. Keep the broader
+            # commodity/financial lineup in the simulator until it has enough
+            # evidence to justify risking real funds.
+            data = await self._request(
+                "GET", "/series", params={"category": "Crypto"}
+            )
             series = {
                 str(item["ticker"])
                 for item in data.get("series", [])
