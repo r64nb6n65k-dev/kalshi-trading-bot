@@ -38,7 +38,15 @@ class All15mEngine:
 
     async def _positions(self) -> dict[str, Position]:
         if not self.dry_run and self.client.authenticated:
-            return {p.ticker: p for p in await self.client.get_positions()}
+            positions = {p.ticker: p for p in await self.client.get_positions()}
+            # A newly filled position can briefly be absent from Kalshi's positions
+            # response. Keep locally confirmed fills visible to the exit logic until
+            # the API catches up. Exchange reduce-only protection prevents this
+            # fallback from opening an accidental opposite position.
+            for ticker, value in self._paper_positions.items():
+                if value and (ticker not in positions or positions[ticker].position == 0):
+                    positions[ticker] = Position(ticker=ticker, position=value)
+            return positions
         return {
             ticker: Position(ticker=ticker, position=value)
             for ticker, value in self._paper_positions.items()
@@ -148,6 +156,17 @@ class All15mEngine:
         fill_count = int(result.fill_count or 0)
         fill_price = int(result.outcome_fill_price or 0)
         if fill_count <= 0 or fill_price <= 0:
+            logger.warning(
+                "%s UNFILLED | ticker=%s | side=%s | requested=%d | "
+                "fill_count=%d | status=%s | exchange_index=%s",
+                "EXIT" if request.action is Action.SELL else "ENTRY",
+                request.ticker,
+                request.side.value,
+                request.count,
+                fill_count,
+                result.status,
+                request.exchange_index,
+            )
             return
         if not self.dry_run:
             delta = fill_count if request.side is Side.YES else -fill_count
