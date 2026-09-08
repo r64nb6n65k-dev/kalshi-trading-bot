@@ -47,8 +47,13 @@ class All15mMomentumStrategy:
         self.decision_seconds = float(params.get("decision_seconds", 600))
         self.decision_window = float(params.get("decision_window", 15))
         self.take_profit = int(params.get("take_profit", 98))
+        self.exit_slippage_cents = max(0, int(params.get("exit_slippage_cents", 2)))
+        self.maximum_entry_price = int(params.get("maximum_entry_price", 90))
         self.minimum_history = float(params.get("minimum_history", 45))
-        self.minimum_separation_bps = float(params.get("minimum_separation_bps", 4.0))
+        self.minimum_separation_bps = float(params.get("minimum_separation_bps", 6.0))
+        self.eth_minimum_separation_bps = float(
+            params.get("eth_minimum_separation_bps", 8.0)
+        )
         self.entry_slippage_cents = int(params.get("entry_slippage_cents", 2))
         self._decided: set[str] = set()
         self._pending: set[str] = set()
@@ -101,11 +106,17 @@ class All15mMomentumStrategy:
         short_bps = (latest.price - short.price) / target * 10_000
         long_bps = (latest.price - long.price) / target * 10_000
         separation_bps = (latest.price - target) / target * 10_000
-        if abs(separation_bps) < self.minimum_separation_bps:
+        product = self.product_for(market)
+        minimum_separation_bps = (
+            self.eth_minimum_separation_bps
+            if product == "ETH-USD"
+            else self.minimum_separation_bps
+        )
+        if abs(separation_bps) < minimum_separation_bps:
             return (
                 None,
                 f"INSUFFICIENT_SEPARATION | separation_bps={separation_bps:+.2f} "
-                f"minimum={self.minimum_separation_bps:.2f}",
+                f"minimum={minimum_separation_bps:.2f}",
             )
         recent_volume = sum(tick.size for tick in ticks if tick.timestamp.timestamp() >= now - 60)
         older_volume = sum(tick.size for tick in ticks if tick.timestamp.timestamp() < now - 60)
@@ -158,13 +169,28 @@ class All15mMomentumStrategy:
             side = self._sides.get(ticker, Side.YES if position > 0 else Side.NO)
             bid = market.yes_bid if side is Side.YES else market.no_bid
             if bid is not None and bid >= self.take_profit:
+                # Trigger at the configured target, but give the IOC order a small
+                # execution cushion. A limit sell still receives the best available
+                # price; this is only the lowest acceptable price if the quote moves
+                # while the request is in flight.
+                exit_limit = max(1, self.take_profit - self.exit_slippage_cents)
+                logger.warning(
+                    "EXIT ATTEMPT | ticker=%s | side=%s | bid=%dc | limit=%dc | "
+                    "count=%d | exchange_index=%s",
+                    ticker,
+                    side.value,
+                    bid,
+                    exit_limit,
+                    abs(position),
+                    market.exchange_index,
+                )
                 self._pending.add(ticker)
                 return [
                     self._order(
                         ticker,
                         Action.SELL,
                         side,
-                        self.take_profit,
+                        exit_limit,
                         abs(position),
                         market.exchange_index,
                     )
@@ -204,7 +230,16 @@ class All15mMomentumStrategy:
         if ask is None or not 1 <= ask <= 99:
             logger.warning("SKIP | ticker=%s | side=%s | no executable ask", ticker, side.value)
             return []
-        limit_price = min(99, ask + self.entry_slippage_cents)
+        if ask > self.maximum_entry_price:
+            logger.warning(
+                "SKIP | ticker=%s | side=%s | entry=%dc above maximum=%dc",
+                ticker,
+                side.value,
+                ask,
+                self.maximum_entry_price,
+            )
+            return []
+        limit_price = min(self.maximum_entry_price, ask + self.entry_slippage_cents)
         cost = limit_price * self.contracts
         if self.reserved_cents() + cost > self.bankroll_cents:
             logger.warning(
