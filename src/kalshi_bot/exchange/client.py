@@ -7,6 +7,7 @@ reduce-only protection on exits.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from decimal import ROUND_HALF_UP, Decimal
@@ -193,21 +194,22 @@ class KalshiClient:
         return markets
 
     async def get_open_15m_markets(self) -> list[Market]:
-        """Return every open 15-minute series market with a bounded API load."""
+        """Return every open numeric-strike 15-minute market across all categories."""
         now = time.monotonic()
         discovered_at = getattr(self, "_fifteen_minute_discovery_time", 0.0)
         series: set[str] = getattr(self, "_fifteen_minute_series", set())
 
         if not series or now - discovered_at >= 300:
-            # Fifteen-minute contracts currently live in Crypto. Discovering the
-            # category avoids walking thousands of unrelated open markets every second.
-            data = await self._request("GET", "/series", params={"category": "Crypto"})
+            # The 15-minute lineup spans Crypto, Commodities, and Financials.
+            # Discover the complete series catalog every five minutes, then poll
+            # only the matching recurring series on each scan.
+            data = await self._request("GET", "/series")
             series = {
                 str(item["ticker"])
                 for item in data.get("series", [])
                 if isinstance(item, dict)
                 and item.get("ticker")
-                and "15M" in str(item["ticker"]).upper()
+                and re.fullmatch(r"KX[A-Z0-9]+15M", str(item["ticker"]).upper())
             }
             self._fifteen_minute_series = series
             self._fifteen_minute_discovery_time = now
@@ -225,7 +227,12 @@ class KalshiClient:
                     return []
 
         rows = await asyncio.gather(*(fetch(ticker) for ticker in sorted(series)))
-        return [market for group in rows for market in group]
+        return [
+            market
+            for group in rows
+            for market in group
+            if market.floor_strike is not None and market.close_time is not None
+        ]
 
     async def get_market(self, ticker: str) -> Market:
         data = await self._request("GET", f"/markets/{ticker}")
