@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from kalshi_bot.dashboard import record_entry, record_exit, update_open_count
-from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
+from kalshi_bot.data.multi_asset import MultiAssetPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Action, Market, Order, OrderRequest, Position, Side
 from kalshi_bot.risk.manager import RiskManager
@@ -25,7 +25,7 @@ class All15mEngine:
         *,
         dry_run: bool,
         poll_interval: float,
-        price_feed: MultiCryptoPriceFeed,
+        price_feed: MultiAssetPriceFeed,
     ) -> None:
         self.client, self.strategy, self.risk = client, strategy, risk
         self.dry_run, self.poll_interval = dry_run, poll_interval
