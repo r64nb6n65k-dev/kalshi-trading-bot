@@ -22,7 +22,7 @@ from kalshi_bot.core.all_15m_engine import All15mEngine
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.data.gold import GoldPriceFeed
-from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
+from kalshi_bot.data.multi_asset import MultiAssetPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.portfolio.ladder_engine import SameDayLadderEngine
 from kalshi_bot.risk.manager import RiskManager
@@ -38,7 +38,7 @@ from kalshi_bot.strategies.examples.momentum import Momentum
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot â open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot Ã¢ÂÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -56,7 +56,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] Ã¢ÂÂ by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂ¢ÃÂÃÂ by Viprasol Tech")
 
 
 @app.command()
@@ -342,10 +342,7 @@ def all_15m(
                 risk=RiskManager.from_settings(settings.risk),
                 dry_run=not live,
                 poll_interval=settings.poll_interval,
-                price_feed=MultiCryptoPriceFeed(
-                    settings.btc_ws_url,
-                    ("BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"),
-                ),
+                price_feed=MultiAssetPriceFeed(settings),
             )
             await engine.run(max_cycles=None if cycles == 0 else cycles)
 
