@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from kalshi_bot.dashboard import record_model_snapshot
 from kalshi_bot.exchange.models import (
@@ -26,9 +26,23 @@ class All15mMomentumStrategy:
     """Choose YES or NO once near 10:00, then hold unless the bid reaches 98c."""
 
     name = "all_15m_momentum"
+    _PRODUCT_ALIASES: ClassVar[dict[str, str]] = {
+        "GOLD": "XAU_USD",
+        "SILVER": "XAG_USD",
+        "COPPER": "XCU_USD",
+        "WTI": "WTICO_USD",
+        "NATGAS": "NATGAS_USD",
+        "PALLADIUM": "XPD_USD",
+        "PLATINUM": "XPT_USD",
+        "EURUSD": "EURUSD-USD",
+        "GBPUSD": "GBPUSD-USD",
+        "USDJPY": "USDJPY-USD",
+        "INX": "INX-USD",
+        "NDQ": "NDQ-USD",
+    }
 
     def __init__(self, **params: Any) -> None:
-        self.contracts = int(params.get("contracts", 10))
+        self.contracts = int(params.get("contracts", 5))
         self.bankroll_cents = int(params.get("bankroll_cents", 50_000))
         self.decision_seconds = float(params.get("decision_seconds", 600))
         self.decision_window = float(params.get("decision_window", 15))
@@ -54,11 +68,17 @@ class All15mMomentumStrategy:
         except ValueError:
             return None
 
-    @staticmethod
-    def product_for(market: Market) -> str | None:
+    @classmethod
+    def product_for(cls, market: Market) -> str | None:
         series = (market.series_ticker or market.ticker.split("-")[0]).upper()
         match = re.fullmatch(r"KX([A-Z0-9]+)15M", series)
-        return f"{match.group(1)}-USD" if match else None
+        if not match:
+            return None
+        product = match.group(1)
+        # Leader/comparison markets do not have one numeric target/underlying.
+        if product in {"CRYPTOCOMP", "CRYPTOLEAD"}:
+            return None
+        return cls._PRODUCT_ALIASES.get(product, f"{product}-USD")
 
     @staticmethod
     def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
