@@ -28,7 +28,7 @@ class All15mMomentumStrategy:
     name = "all_15m_momentum"
 
     def __init__(self, **params: Any) -> None:
-        self.contracts = int(params.get("contracts", 5))
+        self.contracts = int(params.get("contracts", 10))
         self.bankroll_cents = int(params.get("bankroll_cents", 50_000))
         self.decision_seconds = float(params.get("decision_seconds", 600))
         self.decision_window = float(params.get("decision_window", 15))
