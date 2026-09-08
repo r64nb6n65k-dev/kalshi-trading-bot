@@ -52,6 +52,8 @@ class All15mMomentumStrategy:
         self.entry_slippage_cents = int(params.get("entry_slippage_cents", 2))
         self._decided: set[str] = set()
         self._pending: set[str] = set()
+        self._entry_intents: dict[str, Side] = {}
+        self._entry_details: dict[str, str] = {}
         self._sides: dict[str, Side] = {}
         self._counts: dict[str, int] = {}
         self._entry_costs: dict[str, int] = {}
@@ -137,6 +139,8 @@ class All15mMomentumStrategy:
             self._counts.pop(ticker, None)
             self._sides.pop(ticker, None)
             self._pending.discard(ticker)
+            self._entry_intents.pop(ticker, None)
+            self._entry_details.pop(ticker, None)
 
     def orders_for(
         self,
@@ -155,7 +159,16 @@ class All15mMomentumStrategy:
             bid = market.yes_bid if side is Side.YES else market.no_bid
             if bid is not None and bid >= self.take_profit:
                 self._pending.add(ticker)
-                return [self._order(ticker, Action.SELL, side, self.take_profit, abs(position))]
+                return [
+                    self._order(
+                        ticker,
+                        Action.SELL,
+                        side,
+                        self.take_profit,
+                        abs(position),
+                        market.exchange_index,
+                    )
+                ]
             return []
 
         if ticker in self._decided:
@@ -165,22 +178,28 @@ class All15mMomentumStrategy:
         ):
             return []
 
-        side, detail = self._signal(market, now, underlying_ticks)
-        self._decided.add(ticker)
-        if side is None:
-            logger.warning("SKIP | ticker=%s | %s", ticker, detail)
-            record_model_snapshot(
-                ticker=ticker,
-                seconds_left=seconds_left,
-                target_price=market.floor_strike,
-                yes_bid=market.yes_bid,
-                yes_ask=market.yes_ask,
-                no_bid=market.no_bid,
-                no_ask=market.no_ask,
-                decision="SKIP",
-                reason=detail,
-            )
-            return []
+        side = self._entry_intents.get(ticker)
+        detail = self._entry_details.get(ticker, "")
+        first_attempt = side is None
+        if first_attempt:
+            side, detail = self._signal(market, now, underlying_ticks)
+            if side is None:
+                self._decided.add(ticker)
+                logger.warning("SKIP | ticker=%s | %s", ticker, detail)
+                record_model_snapshot(
+                    ticker=ticker,
+                    seconds_left=seconds_left,
+                    target_price=market.floor_strike,
+                    yes_bid=market.yes_bid,
+                    yes_ask=market.yes_ask,
+                    no_bid=market.no_bid,
+                    no_ask=market.no_ask,
+                    decision="SKIP",
+                    reason=detail,
+                )
+                return []
+            self._entry_intents[ticker] = side
+            self._entry_details[ticker] = detail
         ask = market.yes_ask if side is Side.YES else market.no_ask
         if ask is None or not 1 <= ask <= 99:
             logger.warning("SKIP | ticker=%s | side=%s | no executable ask", ticker, side.value)
@@ -196,34 +215,53 @@ class All15mMomentumStrategy:
             )
             return []
         logger.warning(
-            "SIGNAL | ticker=%s | side=%s | ask=%dc | limit=%dc | %s",
+            "%s | ticker=%s | side=%s | ask=%dc | limit=%dc | exchange_index=%s | %s",
+            "SIGNAL" if first_attempt else "ENTRY RETRY",
             ticker,
             side.value,
             ask,
             limit_price,
+            market.exchange_index,
             detail,
         )
-        latest_price = underlying_ticks[-1].price
-        target = float(market.floor_strike or 0)
-        short = self._at_or_before(underlying_ticks, now - 60)
-        record_model_snapshot(
-            ticker=ticker,
-            seconds_left=seconds_left,
-            target_price=target,
-            separation=latest_price - target,
-            yes_bid=market.yes_bid,
-            yes_ask=market.yes_ask,
-            no_bid=market.no_bid,
-            no_ask=market.no_ask,
-            momentum_60=latest_price - short.price,
-            decision=f"BUY_{side.value.upper()}",
-            reason=detail,
-        )
+        if first_attempt:
+            latest_price = underlying_ticks[-1].price
+            target = float(market.floor_strike or 0)
+            short = self._at_or_before(underlying_ticks, now - 60)
+            record_model_snapshot(
+                ticker=ticker,
+                seconds_left=seconds_left,
+                target_price=target,
+                separation=latest_price - target,
+                yes_bid=market.yes_bid,
+                yes_ask=market.yes_ask,
+                no_bid=market.no_bid,
+                no_ask=market.no_ask,
+                momentum_60=latest_price - short.price,
+                decision=f"BUY_{side.value.upper()}",
+                reason=detail,
+            )
         self._pending.add(ticker)
-        return [self._order(ticker, Action.BUY, side, limit_price, self.contracts)]
+        return [
+            self._order(
+                ticker,
+                Action.BUY,
+                side,
+                limit_price,
+                self.contracts,
+                market.exchange_index,
+            )
+        ]
 
     @staticmethod
-    def _order(ticker: str, action: Action, side: Side, price: int, count: int) -> OrderRequest:
+    def _order(
+        ticker: str,
+        action: Action,
+        side: Side,
+        price: int,
+        count: int,
+        exchange_index: int | None = None,
+    ) -> OrderRequest:
         kwargs: dict[str, Any] = {
             "ticker": ticker,
             "action": action,
@@ -231,6 +269,7 @@ class All15mMomentumStrategy:
             "count": count,
             "type": OrderType.LIMIT,
             "time_in_force": TimeInForce.IMMEDIATE_OR_CANCEL,
+            "exchange_index": exchange_index,
         }
         kwargs["yes_price" if side is Side.YES else "no_price"] = price
         return OrderRequest(**kwargs)
@@ -247,6 +286,9 @@ class All15mMomentumStrategy:
             or 0
         )
         if request.action is Action.BUY:
+            self._decided.add(ticker)
+            self._entry_intents.pop(ticker, None)
+            self._entry_details.pop(ticker, None)
             self._sides[ticker] = request.side
             self._counts[ticker] = count
             self._entry_costs[ticker] = price * count
