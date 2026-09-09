@@ -194,20 +194,23 @@ class KalshiClient:
         return markets
 
     async def get_open_15m_markets(self) -> list[Market]:
-        """Return open numeric-strike 15-minute markets in Kalshi's Crypto category."""
+        """Return open numeric-strike 15-minute Kalshi commodity markets only.
+
+        The directional 15-minute engine is intentionally isolated from Crypto,
+        FX, indices, and any other category.  Series discovery is refreshed every
+        five minutes so newly-added commodity 15-minute series are noticed, while
+        the strategy still refuses any series without a verified underlying feed.
+        """
         now = time.monotonic()
         discovered_at = getattr(self, "_fifteen_minute_discovery_time", 0.0)
         series: set[str] = getattr(self, "_fifteen_minute_series", set())
 
         if not series or now - discovered_at >= 300:
-            # Live trading is intentionally crypto-only. Keep the broader
-            # commodity/financial lineup in the simulator until it has enough
-            # evidence to justify risking real funds.
             data = await self._request(
-                "GET", "/series", params={"category": "Crypto"}
+                "GET", "/series", params={"category": "Commodities"}
             )
             series = {
-                str(item["ticker"])
+                str(item["ticker"]).upper()
                 for item in data.get("series", [])
                 if isinstance(item, dict)
                 and item.get("ticker")
@@ -215,6 +218,11 @@ class KalshiClient:
             }
             self._fifteen_minute_series = series
             self._fifteen_minute_discovery_time = now
+            logger.warning(
+                "COMMODITY 15M SERIES DISCOVERED | count=%d | series=%s",
+                len(series),
+                sorted(series),
+            )
 
         semaphore = asyncio.Semaphore(8)
 
