@@ -1,4 +1,4 @@
-"""Scanner/execution loop for all open Kalshi 15-minute markets."""
+"""Scanner/execution loop for open Kalshi 15-minute commodity markets."""
 
 from __future__ import annotations
 
@@ -217,7 +217,7 @@ class All15mEngine:
     async def run(self, max_cycles: int | None = None) -> None:
         cycle = 0
         logger.warning(
-            "ALL-15M ENGINE STARTED | dry_run=%s | bankroll=$%.2f | contracts=%d",
+            "COMMODITIES-15M ENGINE STARTED | dry_run=%s | bankroll=$%.2f | contracts=%d",
             self.dry_run,
             self.strategy.bankroll_cents / 100,
             self.strategy.contracts,
@@ -226,7 +226,15 @@ class All15mEngine:
         try:
             while max_cycles is None or cycle < max_cycles:
                 try:
-                    markets = await self.client.get_open_15m_markets()
+                    discovered = await self.client.get_open_15m_markets()
+                    markets = [market for market in discovered if self.strategy.supports_market(market)]
+                    skipped = [market for market in discovered if not self.strategy.supports_market(market)]
+                    for market in skipped:
+                        logger.warning(
+                            "UNSUPPORTED COMMODITY 15M SKIPPED | ticker=%s | series=%s | reason=NO_VERIFIED_PRICE_FEED",
+                            market.ticker,
+                            market.series_ticker,
+                        )
                     active_tickers = {market.ticker for market in markets}
                     await self._settle_inactive_positions(active_tickers)
                     self.strategy.reconcile(active_tickers | set(self._paper_positions))
@@ -240,7 +248,7 @@ class All15mEngine:
                         for order in self.strategy.orders_for(market, current, now, ticks):
                             await self._submit(order, market, current)
                 except Exception:
-                    logger.exception("ALL-15M SCAN FAILED; retrying")
+                    logger.exception("COMMODITIES-15M SCAN FAILED; retrying")
                 cycle += 1
                 if max_cycles is None or cycle < max_cycles:
                     await asyncio.sleep(self.poll_interval)
