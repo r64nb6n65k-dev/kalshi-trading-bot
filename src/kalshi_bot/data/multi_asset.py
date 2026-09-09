@@ -1,4 +1,4 @@
-"""Live-style price and volume feeds for Kalshi 15-minute markets."""
+"""Live price and activity feeds for Kalshi 15-minute commodity markets."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 
 
 class MultiAssetPriceFeed:
-    """Use Coinbase trades, OANDA commodities, and Kalshi fallbacks."""
+    """Use OANDA for commodities with Kalshi underlying streams as fallback."""
 
     CRYPTO_PRODUCTS: ClassVar[tuple[str, ...]] = (
         "BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD",
@@ -80,15 +80,16 @@ class MultiAssetPriceFeed:
             return
         self._stopping = False
         self._tasks = [
-            asyncio.create_task(self._run_coinbase(), name="live-style-crypto-feed"),
-            asyncio.create_task(self._run_pyth(), name="kalshi-pyth-fallback"),
-            asyncio.create_task(self._run_cf(), name="kalshi-cf-fallback"),
+            # Kalshi's underlying-value stream is an independent fallback for
+            # commodity prices and also closely tracks the reference used by the
+            # market itself.  OANDA is preferred when it is fresh.
+            asyncio.create_task(self._run_pyth(), name="kalshi-commodity-fallback"),
         ]
         if self._oanda_token:
             self._tasks.append(asyncio.create_task(self._run_oanda(), name="commodity-feed"))
         else:
             logger.warning(
-                "COMMODITY PRIMARY FEED DISABLED | missing=KALSHI_PYTH_API_KEY"
+                "OANDA COMMODITY PRIMARY FEED DISABLED | missing=KALSHI_PYTH_API_KEY | using=KALSHI_UNDERLYING_FALLBACK"
             )
 
     async def stop(self) -> None:
