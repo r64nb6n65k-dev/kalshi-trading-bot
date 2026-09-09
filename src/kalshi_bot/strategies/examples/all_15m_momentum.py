@@ -1,4 +1,4 @@
-"""One-decision momentum strategy for every Kalshi 15-minute market."""
+"""Momentum strategy for Kalshi 15-minute commodity markets only."""
 
 from __future__ import annotations
 
@@ -23,23 +23,22 @@ logger = get_logger(__name__)
 
 
 class All15mMomentumStrategy:
-    """Seek a fresh qualifying entry from 10:00 to 1:00, then manage its exit."""
+    """Seek a qualifying commodity entry from 10:00 to 1:00, then manage its exit."""
 
     name = "all_15m_momentum"
+    # Verified Kalshi 15-minute commodity series and their external spot/CFD
+    # feed symbols. Unknown/new commodity series are skipped until a feed mapping
+    # is deliberately added; they are never traded from Kalshi odds alone.
     _PRODUCT_ALIASES: ClassVar[dict[str, str]] = {
         "GOLD": "XAU_USD",
         "SILVER": "XAG_USD",
         "COPPER": "XCU_USD",
         "WTI": "WTICO_USD",
         "NATGAS": "NATGAS_USD",
-        "PALLADIUM": "XPD_USD",
-        "PLATINUM": "XPT_USD",
-        "EURUSD": "EURUSD-USD",
-        "GBPUSD": "GBPUSD-USD",
-        "USDJPY": "USDJPY-USD",
-        "INX": "INX-USD",
-        "NDQ": "NDQ-USD",
     }
+    _SUPPORTED_SERIES: ClassVar[frozenset[str]] = frozenset(
+        f"KX{name}15M" for name in _PRODUCT_ALIASES
+    )
 
     def __init__(self, **params: Any) -> None:
         self.contracts = int(params.get("contracts", 5))
@@ -80,13 +79,13 @@ class All15mMomentumStrategy:
     def product_for(cls, market: Market) -> str | None:
         series = (market.series_ticker or market.ticker.split("-")[0]).upper()
         match = re.fullmatch(r"KX([A-Z0-9]+)15M", series)
-        if not match:
+        if not match or series not in cls._SUPPORTED_SERIES:
             return None
-        product = match.group(1)
-        # Leader/comparison markets do not have one numeric target/underlying.
-        if product in {"CRYPTOCOMP", "CRYPTOLEAD"}:
-            return None
-        return cls._PRODUCT_ALIASES.get(product, f"{product}-USD")
+        return cls._PRODUCT_ALIASES.get(match.group(1))
+
+    @classmethod
+    def supports_market(cls, market: Market) -> bool:
+        return cls.product_for(market) is not None
 
     @staticmethod
     def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
