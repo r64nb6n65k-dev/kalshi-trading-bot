@@ -38,7 +38,7 @@ from kalshi_bot.strategies.examples.momentum import Momentum
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot Ã¢ÂÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot ÃÂ¢ÃÂÃÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -56,7 +56,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂ¢ÃÂÃÂ by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ by Viprasol Tech")
 
 
 @app.command()
@@ -321,10 +321,10 @@ def same_day_ladders(
 def all_15m(
     cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
     bankroll: int = typer.Option(500, min=1, help="Maximum strategy bankroll in dollars."),
-    contracts: int = typer.Option(5, min=1, help="Contracts per trade."),
+    contracts: int = typer.Option(10, min=1, help="Contracts per trade."),
     live: bool = typer.Option(False, "--live", help="Send real orders (default is paper)."),
 ) -> None:
-    """Monitor and directionally trade every open 15-minute market."""
+    """Monitor and directionally trade every supported 15-minute commodity market."""
     start_dashboard()
 
     async def _run() -> None:
