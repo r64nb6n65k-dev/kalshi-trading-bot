@@ -56,6 +56,7 @@ class PolymarketListing:
     closed: bool
     source: str
     up_token_id: str | None = None
+    down_token_id: str | None = None
     resolved_side: str | None = None
 
     @property
@@ -81,6 +82,7 @@ class PolymarketPublicClient:
         gamma_base_url: str = "https://gamma-api.polymarket.com",
         timeout: float = 8.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        international_only: bool = False,
     ) -> None:
         invalid = set(intervals) - {5, 15}
         if invalid:
@@ -94,6 +96,7 @@ class PolymarketPublicClient:
             transport=transport,
         )
         self._next_us_probe = 0.0
+        self.international_only = international_only
 
     async def __aenter__(self) -> PolymarketPublicClient:
         return self
@@ -118,7 +121,7 @@ class PolymarketPublicClient:
             for interval in self.intervals
         ]
         rows: list[PolymarketListing | None] = [None] * len(candidates)
-        if timestamp >= self._next_us_probe:
+        if not self.international_only and timestamp >= self._next_us_probe:
             us_rows = await asyncio.gather(
                 *(
                     self._from_us_search(asset, interval, slug)
@@ -263,6 +266,10 @@ class PolymarketPublicClient:
             up_index = next(i for i, value in enumerate(outcomes) if value in {"up", "yes"})
         except StopIteration:
             up_index = 0
+        try:
+            down_index = next(i for i, value in enumerate(outcomes) if value in {"down", "no"})
+        except StopIteration:
+            down_index = 1 if len(tokens) > 1 and up_index == 0 else 0
         yes_bid = _cents(row.get("bestBid"))
         yes_ask = _cents(row.get("bestAsk"))
         if yes_bid is None and up_index < len(prices):
@@ -286,6 +293,7 @@ class PolymarketPublicClient:
             closed=bool(row.get("closed", False)),
             source="POLYMARKET_PUBLIC",
             up_token_id=tokens[up_index] if up_index < len(tokens) else None,
+            down_token_id=tokens[down_index] if down_index < len(tokens) else None,
             resolved_side=resolved,
         )
 
