@@ -21,6 +21,7 @@ keywords = [
   "market-making",
   "quant",
 ]
+
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -32,6 +33,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Office/Business :: Financial :: Investment",
 ]
+
 dependencies = [
   "httpx>=0.27",
   "websockets>=12.0",
@@ -43,6 +45,7 @@ dependencies = [
   "pandas>=2.2",
   "numpy>=1.26",
   "python-dotenv>=1.0",
+  "py-clob-client-v2>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +58,7 @@ dev = [
   "pre-commit>=3.7",
   "respx>=0.21",
 ]
+
 docs = [
   "mkdocs-material>=9.5",
   "mkdocstrings[python]>=0.25",
@@ -81,9 +85,9 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PIE"]
 ignore = [
-  "B008",   # typer uses function calls in argument defaults
-  "B027",   # intentional empty optional hooks on the Strategy ABC
-  "UP042",  # str+Enum is kept for pydantic/JSON serialisation compatibility
+  "B008",
+  "B027",
+  "UP042",
 ]
 
 [tool.ruff.lint.isort]
