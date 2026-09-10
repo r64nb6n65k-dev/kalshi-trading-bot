@@ -20,10 +20,13 @@ from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
 from kalshi_bot.core.all_15m_engine import All15mEngine
 from kalshi_bot.core.engine import TradingEngine
+from kalshi_bot.core.polymarket_sim_engine import PolymarketSimEngine
 from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.data.multi_asset import MultiAssetPriceFeed
+from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
 from kalshi_bot.exchange.client import KalshiClient
+from kalshi_bot.polymarket import PolymarketPublicClient
 from kalshi_bot.portfolio.ladder_engine import SameDayLadderEngine
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.scalping.engine import BtcOrderBookScalpingEngine
@@ -35,10 +38,11 @@ from kalshi_bot.strategies.examples.fair_value import FairValue
 from kalshi_bot.strategies.examples.market_maker import MarketMaker
 from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
 from kalshi_bot.strategies.examples.momentum import Momentum
+from kalshi_bot.strategies.examples.polymarket_momentum import PolymarketMomentumStrategy
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot ÃÂ¢ÃÂÃÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -56,7 +60,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ by Viprasol Tech")
 
 
 @app.command()
@@ -343,6 +347,45 @@ def all_15m(
                 dry_run=not live,
                 poll_interval=settings.poll_interval,
                 price_feed=MultiAssetPriceFeed(settings),
+            )
+            await engine.run(max_cycles=None if cycles == 0 else cycles)
+
+    asyncio.run(_run())
+
+
+@app.command("polymarket-sim")
+def polymarket_sim(
+    cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
+    bankroll: int = typer.Option(500, min=1, help="Paper bankroll in dollars."),
+    contracts: int = typer.Option(10, min=1, help="Paper contracts per trade."),
+    intervals: str = typer.Option("5,15", help="Rolling market lengths: 5, 15, or 5,15."),
+    poll: float = typer.Option(1.0, min=0.25, help="Quote polling interval in seconds."),
+) -> None:
+    """Simulate the live crypto strategy on Polymarket 5m and 15m markets."""
+    try:
+        parsed_intervals = tuple(int(value.strip()) for value in intervals.split(","))
+    except ValueError as exc:
+        raise typer.BadParameter("intervals must be 5, 15, or 5,15") from exc
+    if not parsed_intervals or set(parsed_intervals) - {5, 15}:
+        raise typer.BadParameter("intervals must be 5, 15, or 5,15")
+
+    start_dashboard()
+
+    async def _run() -> None:
+        settings = load_settings()
+        async with PolymarketPublicClient(intervals=parsed_intervals) as client:
+            feed = MultiCryptoPriceFeed(
+                settings.btc_ws_url,
+                tuple(client.ASSETS.values()),
+            )
+            engine = PolymarketSimEngine(
+                client=client,
+                feed=feed,
+                strategy=PolymarketMomentumStrategy(
+                    bankroll_cents=bankroll * 100,
+                    contracts=contracts,
+                ),
+                poll_interval=poll,
             )
             await engine.run(max_cycles=None if cycles == 0 else cycles)
 
