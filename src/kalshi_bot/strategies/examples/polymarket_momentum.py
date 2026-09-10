@@ -217,17 +217,26 @@ class PolymarketMomentumStrategy:
         )
         logger.warning("%s | ticker=%s | %s", decision, listing.slug, reason)
 
-    def open_position(self, listing: PolymarketListing, side: Side, price: int) -> None:
-        position = SimPosition(side=side, entry_price=price, count=self.contracts)
+    def open_position(
+        self,
+        listing: PolymarketListing,
+        side: Side,
+        price: int,
+        *,
+        count: int | None = None,
+        execution_mode: str = "polymarket_paper",
+    ) -> None:
+        actual_count = self.contracts if count is None else count
+        position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
             ticker=listing.slug,
             side=side.value,
             entry_price=price,
-            count=self.contracts,
+            count=actual_count,
             seconds_left=listing.close_time - datetime.now(UTC).timestamp(),
             take_profit=self.take_profit,
-            execution_mode="polymarket_paper",
+            execution_mode=execution_mode,
         )
 
     def close_position(self, slug: str, exit_price: int, reason: str, now: float) -> None:
