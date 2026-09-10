@@ -21,6 +21,7 @@ from kalshi_bot.config import load_settings
 from kalshi_bot.core.all_15m_engine import All15mEngine
 from kalshi_bot.core.engine import TradingEngine
 from kalshi_bot.core.polymarket_sim_engine import PolymarketSimEngine
+from kalshi_bot.core.polymarket_live_engine import PolymarketLiveEngine, PolymarketTradingClient
 from kalshi_bot.dashboard import start_dashboard
 from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.data.multi_asset import MultiAssetPriceFeed
@@ -42,7 +43,7 @@ from kalshi_bot.strategies.examples.polymarket_momentum import PolymarketMomentu
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -60,7 +61,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ by Viprasol Tech")
 
 
 @app.command()
@@ -386,6 +387,72 @@ def polymarket_sim(
                     contracts=contracts,
                 ),
                 poll_interval=poll,
+            )
+            await engine.run(max_cycles=None if cycles == 0 else cycles)
+
+    asyncio.run(_run())
+
+
+@app.command("polymarket-auth-check")
+def polymarket_auth_check() -> None:
+    """Validate Polymarket signer/wallet auth and Railway geolocation without trading."""
+
+    async def _run() -> None:
+        client = PolymarketTradingClient()
+        geo = await client.check_geoblock()
+        balance = await client.collateral_balance()
+        if geo.get("blocked"):
+            console.print(
+                f"[red]BLOCKED[/] Railway server location: {geo.get('country')} / {geo.get('region')}"
+            )
+            raise typer.Exit(code=2)
+        masked = f"{client.wallet[:6]}...{client.wallet[-4:]}"
+        console.print(f"[green]Polymarket auth OK[/] | wallet={masked}")
+        console.print(f"Railway server location: {geo.get('country')} / {geo.get('region')} (eligible)")
+        if balance is not None:
+            console.print(f"Reported collateral balance: ${balance:.2f}")
+
+    asyncio.run(_run())
+
+
+@app.command("polymarket-live")
+def polymarket_live(
+    cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
+    bankroll: int = typer.Option(30, min=1, help="Hard strategy bankroll cap in dollars."),
+    contracts: int = typer.Option(2, min=1, help="Contracts per trade."),
+    intervals: str = typer.Option("5,15", help="Rolling market lengths: 5, 15, or 5,15."),
+    poll: float = typer.Option(1.0, min=0.25, help="Quote polling interval in seconds."),
+    live: bool = typer.Option(False, "--live", help="Enable real CLOB orders; also requires POLY_LIVE=true."),
+) -> None:
+    """Run the Polymarket momentum strategy with confirmed real CLOB execution."""
+    try:
+        parsed_intervals = tuple(int(value.strip()) for value in intervals.split(","))
+    except ValueError as exc:
+        raise typer.BadParameter("intervals must be 5, 15, or 5,15") from exc
+    if not parsed_intervals or set(parsed_intervals) - {5, 15}:
+        raise typer.BadParameter("intervals must be 5, 15, or 5,15")
+
+    start_dashboard()
+
+    async def _run() -> None:
+        settings = load_settings()
+        async with PolymarketPublicClient(
+            intervals=parsed_intervals, international_only=True
+        ) as market_client:
+            feed = MultiCryptoPriceFeed(
+                settings.btc_ws_url,
+                tuple(market_client.ASSETS.values()),
+            )
+            engine = PolymarketLiveEngine(
+                market_client=market_client,
+                trading_client=PolymarketTradingClient(),
+                feed=feed,
+                strategy=PolymarketMomentumStrategy(
+                    bankroll_cents=bankroll * 100,
+                    contracts=contracts,
+                ),
+                poll_interval=poll,
+                live_enabled=live,
             )
             await engine.run(max_cycles=None if cycles == 0 else cycles)
 
