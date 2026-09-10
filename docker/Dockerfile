@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
-# Kalshi Trading Bot — by Viprasol Tech
-FROM python:3.12-slim AS base
+
+FROM tailscale/tailscale:stable AS tailscale
+FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -8,14 +9,21 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching.
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 
-# Run as a non-root user.
-RUN useradd --create-home --uid 1000 trader
+COPY docker/start-with-tailscale.sh /usr/local/bin/start-with-tailscale
+
+RUN chmod 0755 /usr/local/bin/start-with-tailscale \
+    && useradd --create-home --uid 1000 trader \
+    && mkdir -p /tmp/tailscale \
+    && chown -R trader:trader /tmp/tailscale /app
+
 USER trader
 
-ENTRYPOINT ["kalshi-bot"]
-CMD ["--help"]
+ENTRYPOINT ["/usr/local/bin/start-with-tailscale"]
+CMD ["kalshi-bot", "--help"]
