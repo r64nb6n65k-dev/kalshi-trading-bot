@@ -327,4 +327,11 @@ class PolymarketTradingClient:
             size
             for price, size in levels
             if price <= limit_price
+        )
+
+        return (
+            best_ask,
+            limit_price,
+            executable_depth,
+        )
        
