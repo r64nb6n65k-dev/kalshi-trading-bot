@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from dataclasses import dataclass, replace
@@ -91,6 +92,73 @@ class PolymarketTradingClient:
             signature_type=self.SIGNATURE_TYPE, funder=self.wallet,
             use_server_time=True, retry_on_error=False,
         )
+        self._secure_client: Any | None = None
+        self._secure_client_lock = asyncio.Lock()
+        self._redemption_lock = asyncio.Lock()
+
+    async def _secure(self) -> Any:
+        if self._secure_client is not None:
+            return self._secure_client
+        async with self._secure_client_lock:
+            if self._secure_client is not None:
+                return self._secure_client
+            try:
+                from polymarket import AsyncSecureClient, RelayerApiKey
+            except ImportError as exc:
+                raise RuntimeError(
+                    "polymarket-client is required for automatic redemption"
+                ) from exc
+            relayer_key = _require("POLYMARKET_RELAYER_API_KEY")
+            relayer_address = _require("POLYMARKET_RELAYER_API_KEY_ADDRESS")
+            self._secure_client = await AsyncSecureClient.create(
+                private_key=self.private_key,
+                wallet=self.wallet,
+                api_key=RelayerApiKey(
+                    key=relayer_key,
+                    address=relayer_address,
+                ),
+            )
+            return self._secure_client
+
+    async def prepare_redemption(self) -> None:
+        """Validate the gasless redemption credentials during startup."""
+        await self._secure()
+
+    async def redeemable_condition_ids(self) -> tuple[str, ...]:
+        """Return every currently redeemable condition held by the wallet."""
+        client = await self._secure()
+        found: set[str] = set()
+        pages = client.list_positions(
+            user=self.wallet,
+            status="REDEEMABLE",
+            page_size=100,
+        )
+        async for page in pages:
+            for position in page.items:
+                if not bool(_value(position, "redeemable", default=False)):
+                    continue
+                condition_id = str(_value(position, "condition_id", "conditionId", default=""))
+                if condition_id:
+                    found.add(condition_id)
+        return tuple(sorted(found))
+
+    async def redeem_positions(self, condition_id: str) -> Any:
+        """Redeem both outcome balances for one resolved condition and wait."""
+        async with self._redemption_lock:
+            client = await self._secure()
+            transaction = await client.redeem_positions(condition_id=condition_id)
+            return await transaction.wait()
+
+    async def close(self) -> None:
+        client = self._secure_client
+        if client is None:
+            return
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if closer is None:
+            return
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
 
     async def check_geoblock(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -184,10 +252,19 @@ class PolymarketLiveEngine:
         self.maximum_entry_price = max(
             1, min(99, int(os.getenv("POLY_MAX_ENTRY_PRICE", "85")))
         )
+        self.auto_redeem = os.getenv("POLY_AUTO_REDEEM", "true").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        self.redeem_scan_seconds = max(
+            5.0, float(os.getenv("POLY_REDEEM_SCAN_SECONDS", "15"))
+        )
         self._targets: dict[str, float] = {}
         self._known: dict[str, PolymarketListing] = {}
         self._pending: dict[str, PendingLiveEntry] = {}
         self._exit_uncertain: set[str] = set()
+        self._next_redeem_scan = 0.0
+        self._redeemed_conditions: set[str] = set()
+        self._redeem_retry_at: dict[str, float] = {}
 
     @staticmethod
     def _ok(response: Any) -> bool:
@@ -216,6 +293,52 @@ class PolymarketLiveEngine:
             "couldn't be fully filled", "could not be fully filled",
             "fully filled or killed", "no match",
         ))
+
+    @staticmethod
+    def _insufficient_collateral_exception(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(text in message for text in (
+            "not enough balance", "insufficient balance", "insufficient collateral",
+            "balance or allowance", "insufficient funds",
+        ))
+
+    async def _redeem_condition(self, condition_id: str, now: float) -> bool:
+        if condition_id in self._redeemed_conditions:
+            return True
+        if now < self._redeem_retry_at.get(condition_id, 0.0):
+            return False
+        try:
+            outcome = await self.trading_client.redeem_positions(condition_id)
+        except Exception:
+            self._redeem_retry_at[condition_id] = now + self.redeem_scan_seconds
+            logger.exception(
+                "POLYMARKET REDEEM FAILED | condition_id=%s | will_retry=true",
+                condition_id,
+            )
+            return False
+        self._redeemed_conditions.add(condition_id)
+        self._redeem_retry_at.pop(condition_id, None)
+        tx_hash = _value(outcome, "transaction_hash", "transactionHash", default="unknown")
+        balance = await self.trading_client.collateral_balance()
+        logger.warning(
+            "POLYMARKET AUTO REDEEMED | condition_id=%s | tx=%s | collateral=%s",
+            condition_id,
+            tx_hash,
+            "unknown" if balance is None else f"${balance:.2f}",
+        )
+        return True
+
+    async def _redeem_wallet_positions(self, now: float, *, force: bool = False) -> None:
+        if not self.auto_redeem or (not force and now < self._next_redeem_scan):
+            return
+        self._next_redeem_scan = now + self.redeem_scan_seconds
+        try:
+            condition_ids = await self.trading_client.redeemable_condition_ids()
+        except Exception:
+            logger.exception("POLYMARKET REDEEM SCAN FAILED; will retry")
+            return
+        for condition_id in condition_ids:
+            await self._redeem_condition(condition_id, now)
 
     def _target(self, listing: PolymarketListing) -> float | None:
         if listing.slug in self._targets:
@@ -290,6 +413,12 @@ class PolymarketLiveEngine:
                 pending.signed_order = None
                 logger.warning("LIVE RETRY | ticker=%s | reason=FOK_NO_FILL", pending.listing.slug)
                 return False
+            if self._insufficient_collateral_exception(exc):
+                logger.error(
+                    "LIVE CANCEL | ticker=%s | reason=INSUFFICIENT_COLLATERAL",
+                    pending.listing.slug,
+                )
+                return True
             pending.uncertain = True
             logger.exception("ENTRY RESPONSE UNCERTAIN | ticker=%s", pending.listing.slug)
             return True
@@ -349,6 +478,15 @@ class PolymarketLiveEngine:
             if position is None:
                 continue
             won = position.side.value == resolved.resolved_side
+            if won and self.auto_redeem:
+                if not resolved.condition_id:
+                    logger.error(
+                        "POLYMARKET REDEEM WAIT | ticker=%s | reason=MISSING_CONDITION_ID",
+                        slug,
+                    )
+                    continue
+                if not await self._redeem_condition(resolved.condition_id, now):
+                    continue
             self.strategy.close_position(
                 slug, 100 if won else 0,
                 "SETTLEMENT_WIN" if won else "SETTLEMENT_LOSS", now,
@@ -362,6 +500,8 @@ class PolymarketLiveEngine:
         if geo.get("blocked"):
             raise RuntimeError(f"Server is geoblocked: {geo.get('country')} / {geo.get('region')}")
         balance = await self.trading_client.collateral_balance()
+        if self.auto_redeem:
+            await self.trading_client.prepare_redemption()
         logger.warning(
             "POLYMARKET PREFLIGHT OK | collateral=%s",
             "unknown" if balance is None else f"${balance:.2f}",
@@ -369,6 +509,7 @@ class PolymarketLiveEngine:
 
     async def run(self, max_cycles: int | None = None) -> None:
         await self.preflight()
+        await self._redeem_wallet_positions(time.time(), force=True)
         logger.warning("POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED")
         await self.feed.start()
         cycle = 0
@@ -376,6 +517,7 @@ class PolymarketLiveEngine:
             while max_cycles is None or cycle < max_cycles:
                 try:
                     now = time.time()
+                    await self._redeem_wallet_positions(now)
                     listings = await self.market_client.get_open_crypto_markets(now)
                     listings = [x for x in listings if x.up_token_id and x.down_token_id]
                     self._known.update({x.slug: x for x in listings})
@@ -416,3 +558,4 @@ class PolymarketLiveEngine:
                     await asyncio.sleep(self.poll_interval)
         finally:
             await self.feed.stop()
+            await self.trading_client.close()
