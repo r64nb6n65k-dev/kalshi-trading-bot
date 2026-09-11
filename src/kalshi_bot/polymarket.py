@@ -57,6 +57,8 @@ class PolymarketListing:
     source: str
     up_token_id: str | None = None
     down_token_id: str | None = None
+    condition_id: str | None = None
+    negative_risk: bool = False
     resolved_side: str | None = None
 
     @property
@@ -294,6 +296,8 @@ class PolymarketPublicClient:
             source="POLYMARKET_PUBLIC",
             up_token_id=tokens[up_index] if up_index < len(tokens) else None,
             down_token_id=tokens[down_index] if down_index < len(tokens) else None,
+            condition_id=str(row.get("conditionId") or "") or None,
+            negative_risk=bool(row.get("negRisk", False)),
             resolved_side=resolved,
         )
 
