@@ -420,6 +420,7 @@ class PolymarketLiveEngine:
                 )
                 return True
             pending.uncertain = True
+            self.strategy.decided.add(pending.listing.slug)
             logger.exception("ENTRY RESPONSE UNCERTAIN | ticker=%s", pending.listing.slug)
             return True
         if self._ok(response) and self._status(response) == "matched":
@@ -440,6 +441,9 @@ class PolymarketLiveEngine:
             "ENTRY NOT CONFIRMED | ticker=%s | status=%s",
             pending.listing.slug, self._status(response),
         )
+        # The exchange may have accepted an order even when its response is not
+        # recognizable.  Lock this market rather than risk a duplicate buy.
+        self.strategy.decided.add(pending.listing.slug)
         return True
 
     async def _take_profit(self, listing: PolymarketListing, now: float) -> None:
