@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+import re
 from typing import ClassVar
 from zoneinfo import ZoneInfo
 
@@ -52,6 +53,11 @@ class PolymarketMomentumStrategy:
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
         final_entry_seconds: float = 60.0,
+        confirmation_seconds: float = 5.0,
+        maximum_entry_price_cents: int = 76,
+        normal_entry_floor_cents: int = 70,
+        low_entry_min_score: float = 5.0,
+        low_entry_min_volume_ratio: float = 1.0,
         drawdown_limit_cents: int = 4_000,
     ) -> None:
         self.contracts = contracts
@@ -62,10 +68,20 @@ class PolymarketMomentumStrategy:
         self.entry_slippage_cents = entry_slippage_cents
         self.decision_window = decision_window
         self.final_entry_seconds = max(0.0, final_entry_seconds)
+        self.confirmation_seconds = max(0.0, confirmation_seconds)
+        self.maximum_entry_price_cents = max(
+            1, min(76, maximum_entry_price_cents)
+        )
+        self.normal_entry_floor_cents = max(
+            1, min(self.maximum_entry_price_cents, normal_entry_floor_cents)
+        )
+        self.low_entry_min_score = max(0.0, low_entry_min_score)
+        self.low_entry_min_volume_ratio = max(0.0, low_entry_min_volume_ratio)
         self.drawdown_limit_cents = drawdown_limit_cents
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
         self._last_retry_reason: dict[str, str] = {}
+        self._confirming: dict[str, tuple[Side, float]] = {}
         self.total_pnl_cents = 0
         self._daily_day: date | None = None
         self._daily_pnl_cents = 0
@@ -73,9 +89,76 @@ class PolymarketMomentumStrategy:
 
     @staticmethod
     def decision_seconds(interval_minutes: int) -> float:
-        # The live 15-minute bot observes the first third (5 minutes), then
-        # decides with two thirds remaining.  Preserve that timing on 5m too.
-        return interval_minutes * 60 * (2 / 3)
+        # Evaluate from market open.  History and confirmation requirements
+        # still prevent an unconfirmed opening-tick order.
+        return interval_minutes * 60
+
+    def _clear_confirmation(self, slug: str) -> None:
+        self._confirming.pop(slug, None)
+
+    @staticmethod
+    def _detail_metric(detail: str, name: str, *, absolute: bool = False) -> float | None:
+        match = re.search(
+            rf"(?:^|\s){re.escape(name)}=([+-]?(?:\d+(?:\.\d*)?|\.\d+))",
+            detail,
+        )
+        if match is None:
+            return None
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        return abs(value) if absolute else value
+
+    def price_quality_allowed(self, ask: int, detail: str) -> bool:
+        """Apply the stronger evidence requirement to entries below 70c."""
+        if ask >= self.normal_entry_floor_cents:
+            return True
+        score = self._detail_metric(detail, "score", absolute=True)
+        volume_ratio = self._detail_metric(detail, "volume_ratio")
+        return bool(
+            (score is not None and score >= self.low_entry_min_score)
+            or (
+                volume_ratio is not None
+                and volume_ratio >= self.low_entry_min_volume_ratio
+            )
+        )
+
+    def _signal_confirmed(
+        self,
+        listing: PolymarketListing,
+        side: Side,
+        now: float,
+        seconds_left: float,
+        target: float,
+        detail: str,
+    ) -> bool:
+        candidate = self._confirming.get(listing.slug)
+        if candidate is None or candidate[0] is not side:
+            self._confirming[listing.slug] = (side, now)
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"SIGNAL_CONFIRMING | side={side.value} | elapsed=0.0 "
+                    f"required={self.confirmation_seconds:.1f} | {detail}"
+                ),
+            )
+            return self.confirmation_seconds == 0
+        elapsed = now - candidate[1]
+        if elapsed + 1e-9 < self.confirmation_seconds:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"SIGNAL_CONFIRMING | side={side.value} | elapsed={elapsed:.1f} "
+                    f"required={self.confirmation_seconds:.1f} | {detail}"
+                ),
+            )
+            return False
+        return True
 
     @classmethod
     def entry_block_reason(cls, now: float) -> str | None:
@@ -148,6 +231,19 @@ class PolymarketMomentumStrategy:
             0.30 * short_bps + 0.15 * long_bps
         )
         side = Side.YES if score >= 0 else Side.NO
+        # The score, current separation and 60-second momentum must all point
+        # to the same side.  Long momentum remains context because the morning
+        # data showed that requiring it to agree removed winners, not losses.
+        if (side is Side.YES and (separation_bps <= 0 or short_bps <= 0)) or (
+            side is Side.NO and (separation_bps >= 0 or short_bps >= 0)
+        ):
+            return None, (
+                f"DIRECTION_CONFLICT | intended_side={side.value} "
+                f"score={score:+.2f} separation_bps={separation_bps:+.2f} "
+                f"momentum_60_bps={short_bps:+.2f} "
+                f"momentum_long_bps={long_bps:+.2f} "
+                f"volume_ratio={volume_ratio:.2f}"
+            )
         return side, (
             f"underlying={latest.price:.6f} source={latest.source} "
             f"target={target:.6f} score={score:+.2f} "
@@ -172,6 +268,7 @@ class PolymarketMomentumStrategy:
             return None
         if seconds_left <= self.final_entry_seconds:
             self.decided.add(listing.slug)
+            self._clear_confirmation(listing.slug)
             self._last_retry_reason.pop(listing.slug, None)
             self._snapshot(
                 listing,
@@ -182,6 +279,7 @@ class PolymarketMomentumStrategy:
             )
             return None
         if target is None:
+            self._clear_confirmation(listing.slug)
             self._snapshot_retryable(
                 listing,
                 seconds_left,
@@ -191,7 +289,12 @@ class PolymarketMomentumStrategy:
             return None
         side, detail = self._signal(target, now, ticks)
         if side is None:
+            self._clear_confirmation(listing.slug)
             self._snapshot_retryable(listing, seconds_left, target, detail)
+            return None
+        if not self._signal_confirmed(
+            listing, side, now, seconds_left, target, detail
+        ):
             return None
         ask = listing.yes_ask if side is Side.YES else listing.no_ask
         if ask is None or not 1 <= ask <= 99:
@@ -202,7 +305,38 @@ class PolymarketMomentumStrategy:
                 "NO_EXECUTABLE_ASK",
             )
             return None
-        limit_price = min(99, ask + self.entry_slippage_cents)
+        if ask > self.maximum_entry_price_cents:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"PUBLIC_ASK_ABOVE_MAX | ask={ask}c "
+                    f"maximum={self.maximum_entry_price_cents}c"
+                ),
+            )
+            return None
+        if not self.price_quality_allowed(ask, detail):
+            score = self._detail_metric(detail, "score", absolute=True)
+            volume_ratio = self._detail_metric(detail, "volume_ratio")
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"LOW_PRICE_SIGNAL_TOO_WEAK | ask={ask}c "
+                    f"normal_floor={self.normal_entry_floor_cents}c | "
+                    f"score={'missing' if score is None else f'{score:.2f}'} "
+                    f"required_score={self.low_entry_min_score:.2f} | "
+                    f"volume_ratio={'missing' if volume_ratio is None else f'{volume_ratio:.2f}'} "
+                    f"required_volume_ratio={self.low_entry_min_volume_ratio:.2f}"
+                ),
+            )
+            return None
+        limit_price = min(
+            self.maximum_entry_price_cents,
+            ask + self.entry_slippage_cents,
+        )
         block = self.entry_block_reason(now)
         if self.drawdown_cents >= self.drawdown_limit_cents:
             block = (
@@ -273,6 +407,7 @@ class PolymarketMomentumStrategy:
         actual_count = self.contracts if count is None else count
         self.decided.add(listing.slug)
         self._last_retry_reason.pop(listing.slug, None)
+        self._clear_confirmation(listing.slug)
         position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
@@ -310,5 +445,10 @@ class PolymarketMomentumStrategy:
         self._last_retry_reason = {
             slug: reason
             for slug, reason in self._last_retry_reason.items()
+            if slug in keep
+        }
+        self._confirming = {
+            slug: candidate
+            for slug, candidate in self._confirming.items()
             if slug in keep
         }
