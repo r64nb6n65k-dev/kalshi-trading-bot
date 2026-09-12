@@ -44,13 +44,14 @@ class PolymarketMomentumStrategy:
     def __init__(
         self,
         *,
-        contracts: int = 10,
+        contracts: int = 5,
         bankroll_cents: int = 50_000,
         take_profit: int = 98,
         minimum_history: float = 45.0,
         minimum_separation_bps: float = 4.0,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
+        final_entry_seconds: float = 60.0,
         drawdown_limit_cents: int = 4_000,
     ) -> None:
         self.contracts = contracts
@@ -60,9 +61,11 @@ class PolymarketMomentumStrategy:
         self.minimum_separation_bps = minimum_separation_bps
         self.entry_slippage_cents = entry_slippage_cents
         self.decision_window = decision_window
+        self.final_entry_seconds = max(0.0, final_entry_seconds)
         self.drawdown_limit_cents = drawdown_limit_cents
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
+        self._last_retry_reason: dict[str, str] = {}
         self.total_pnl_cents = 0
         self._daily_day: date | None = None
         self._daily_pnl_cents = 0
@@ -161,19 +164,39 @@ class PolymarketMomentumStrategy:
             return None
         seconds_left = listing.close_time - now
         decision = self.decision_seconds(listing.interval_minutes)
-        if not decision - self.decision_window <= seconds_left <= decision:
+        if seconds_left > decision:
             return None
-        self.decided.add(listing.slug)
+        if seconds_left <= self.final_entry_seconds:
+            self.decided.add(listing.slug)
+            self._last_retry_reason.pop(listing.slug, None)
+            self._snapshot(
+                listing,
+                seconds_left,
+                target,
+                "SKIP",
+                f"ENTRY_WINDOW_EXPIRED | final_entry_seconds={self.final_entry_seconds:.0f}",
+            )
+            return None
         if target is None:
-            self._snapshot(listing, seconds_left, None, "SKIP", "MISSING_OPENING_REFERENCE")
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                None,
+                "MISSING_OPENING_REFERENCE",
+            )
             return None
         side, detail = self._signal(target, now, ticks)
         if side is None:
-            self._snapshot(listing, seconds_left, target, "SKIP", detail)
+            self._snapshot_retryable(listing, seconds_left, target, detail)
             return None
         ask = listing.yes_ask if side is Side.YES else listing.no_ask
         if ask is None or not 1 <= ask <= 99:
-            self._snapshot(listing, seconds_left, target, "SKIP", "NO_EXECUTABLE_ASK")
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                "NO_EXECUTABLE_ASK",
+            )
             return None
         limit_price = min(99, ask + self.entry_slippage_cents)
         block = self.entry_block_reason(now)
@@ -185,16 +208,33 @@ class PolymarketMomentumStrategy:
         if self.reserved_cents() + limit_price * self.contracts > self.bankroll_cents:
             block = "BANKROLL_CAP"
         if block:
-            self._snapshot(
+            self._snapshot_retryable(
                 listing,
                 seconds_left,
                 target,
-                f"SHADOW_BUY_{side.value.upper()}",
                 f"{block} | intended_side={side.value} | {detail}",
+                decision=f"SHADOW_BUY_{side.value.upper()}",
             )
             return None
+        self._last_retry_reason.pop(listing.slug, None)
         self._snapshot(listing, seconds_left, target, f"BUY_{side.value.upper()}", detail)
         return SimSignal(side=side, signal_ask=ask, limit_price=limit_price, detail=detail)
+
+    def _snapshot_retryable(
+        self,
+        listing: PolymarketListing,
+        seconds_left: float,
+        target: float | None,
+        reason: str,
+        *,
+        decision: str = "SKIP_RETRYING",
+    ) -> None:
+        """Record a temporary skip once per reason while leaving the market eligible."""
+        reason_code = reason.split(" | ", 1)[0]
+        if self._last_retry_reason.get(listing.slug) == reason_code:
+            return
+        self._last_retry_reason[listing.slug] = reason_code
+        self._snapshot(listing, seconds_left, target, decision, reason)
 
     def _snapshot(
         self,
@@ -227,6 +267,8 @@ class PolymarketMomentumStrategy:
         execution_mode: str = "polymarket_paper",
     ) -> None:
         actual_count = self.contracts if count is None else count
+        self.decided.add(listing.slug)
+        self._last_retry_reason.pop(listing.slug, None)
         position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
@@ -261,3 +303,8 @@ class PolymarketMomentumStrategy:
 
     def prune(self, keep: set[str]) -> None:
         self.decided.intersection_update(keep | set(self.positions))
+        self._last_retry_reason = {
+            slug: reason
+            for slug, reason in self._last_retry_reason.items()
+            if slug in keep
+        }
