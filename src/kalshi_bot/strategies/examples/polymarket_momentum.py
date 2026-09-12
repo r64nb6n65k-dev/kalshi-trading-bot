@@ -80,6 +80,10 @@ class PolymarketMomentumStrategy:
     @classmethod
     def entry_block_reason(cls, now: float) -> str | None:
         central = datetime.fromtimestamp(now, UTC).astimezone(cls._CENTRAL)
+        # Crypto trades continuously.  Keep the weekday protection windows,
+        # but allow uninterrupted entries from Saturday through Sunday.
+        if central.weekday() >= 5:
+            return None
         minute = central.hour * 60 + central.minute
         for start, end in cls._NO_ENTRY_WINDOWS:
             if start <= minute < end:
