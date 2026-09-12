@@ -75,9 +75,9 @@ class PolymarketMomentumStrategy:
 
     @staticmethod
     def decision_seconds(interval_minutes: int) -> float:
-        # The live 15-minute bot observes the first third (5 minutes), then
-        # decides with two thirds remaining.  Preserve that timing on 5m too.
-        return interval_minutes * 60 * (2 / 3)
+        # Observe the first 45 seconds, then keep evaluating until the final
+        # entry cutoff. For a 5m market this starts with 4:15 remaining.
+        return max(0.0, interval_minutes * 60 - 45.0)
 
     @classmethod
     def entry_block_reason(cls, now: float) -> str | None:
