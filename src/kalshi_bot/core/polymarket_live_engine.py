@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
-import re
 import time
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
@@ -258,20 +257,6 @@ class PolymarketLiveEngine:
         self.maximum_entry_price = max(
             1, min(76, int(os.getenv("POLY_MAX_ENTRY_PRICE", "76")))
         )
-        self.price_aware_mid_cents = max(
-            1, min(self.maximum_entry_price, int(os.getenv("POLY_PRICE_AWARE_MID_CENTS", "66")))
-        )
-        self.price_aware_high_cents = max(
-            self.price_aware_mid_cents,
-            min(self.maximum_entry_price, int(os.getenv("POLY_PRICE_AWARE_HIGH_CENTS", "75"))),
-        )
-        self.price_aware_mid_score = max(
-            0.0, float(os.getenv("POLY_PRICE_AWARE_MID_SCORE", "4.0"))
-        )
-        self.price_aware_high_score = max(
-            self.price_aware_mid_score,
-            float(os.getenv("POLY_PRICE_AWARE_HIGH_SCORE", "4.5")),
-        )
         self.auto_redeem = os.getenv("POLY_AUTO_REDEEM", "true").strip().lower() in {
             "1", "true", "yes", "on",
         }
@@ -321,37 +306,6 @@ class PolymarketLiveEngine:
             "not enough balance", "insufficient balance", "insufficient collateral",
             "balance or allowance", "insufficient funds",
         ))
-
-    @staticmethod
-    def _score_from_detail(detail: str) -> float | None:
-        match = re.search(r"(?:^|\s)score=([+-]?(?:\d+(?:\.\d*)?|\.\d+))", detail)
-        if match is None:
-            return None
-        try:
-            return abs(float(match.group(1)))
-        except ValueError:
-            return None
-
-    def _price_aware_entry_allowed(self, ticker: str, ask: int, detail: str) -> bool:
-        """Require stronger model confirmation as an entry becomes expensive."""
-        score = self._score_from_detail(detail)
-        if score is None or ask < self.price_aware_mid_cents:
-            return True
-        required = (
-            self.price_aware_high_score
-            if ask >= self.price_aware_high_cents
-            else self.price_aware_mid_score
-        )
-        if score >= required:
-            return True
-        logger.warning(
-            "LIVE WAIT | ticker=%s | entry=%dc requires |abs(score)|>=%.2f but score=%.2f",
-            ticker,
-            ask,
-            required,
-            score,
-        )
-        return False
 
     async def _redeem_condition(self, condition_id: str, now: float) -> bool:
         if condition_id in self._redeemed_conditions:
@@ -438,10 +392,6 @@ class PolymarketLiveEngine:
                         "| ask=%dc | maximum=%dc",
                         pending.listing.slug, ask, self.maximum_entry_price,
                     )
-                    return True
-                if not self._price_aware_entry_allowed(
-                    pending.listing.slug, ask, pending.signal.detail
-                ):
                     return True
                 pending.shares = max(self.strategy.contracts, (100 + limit - 1) // limit)
                 cost = limit * pending.shares
