@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
-import re
 import time
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
@@ -254,21 +253,11 @@ class PolymarketLiveEngine:
         # lower cap can still be selected, but never permit an entry above
         # 76 cents even if an older deployment variable still says 85.
         self.maximum_entry_price = max(
-            1, min(76, int(os.getenv("POLY_MAX_ENTRY_PRICE", "76")))
-        )
-        self.price_aware_mid_cents = max(
-            1, min(self.maximum_entry_price, int(os.getenv("POLY_PRICE_AWARE_MID_CENTS", "66")))
-        )
-        self.price_aware_high_cents = max(
-            self.price_aware_mid_cents,
-            min(self.maximum_entry_price, int(os.getenv("POLY_PRICE_AWARE_HIGH_CENTS", "75"))),
-        )
-        self.price_aware_mid_score = max(
-            0.0, float(os.getenv("POLY_PRICE_AWARE_MID_SCORE", "4.0"))
-        )
-        self.price_aware_high_score = max(
-            self.price_aware_mid_score,
-            float(os.getenv("POLY_PRICE_AWARE_HIGH_SCORE", "4.5")),
+            1,
+            min(
+                strategy.maximum_entry_price_cents,
+                int(os.getenv("POLY_MAX_ENTRY_PRICE", "76")),
+            ),
         )
         self.auto_redeem = os.getenv("POLY_AUTO_REDEEM", "true").strip().lower() in {
             "1", "true", "yes", "on",
@@ -320,34 +309,22 @@ class PolymarketLiveEngine:
             "balance or allowance", "insufficient funds",
         ))
 
-    @staticmethod
-    def _score_from_detail(detail: str) -> float | None:
-        match = re.search(r"(?:^|\s)score=([+-]?(?:\d+(?:\.\d*)?|\.\d+))", detail)
-        if match is None:
-            return None
-        try:
-            return abs(float(match.group(1)))
-        except ValueError:
-            return None
-
     def _price_aware_entry_allowed(self, ticker: str, ask: int, detail: str) -> bool:
-        """Require stronger model confirmation as an entry becomes expensive."""
-        score = self._score_from_detail(detail)
-        if score is None or ask < self.price_aware_mid_cents:
+        """Allow 70-76c normally; demand stronger evidence below 70c."""
+        if self.strategy.price_quality_allowed(ask, detail):
             return True
-        required = (
-            self.price_aware_high_score
-            if ask >= self.price_aware_high_cents
-            else self.price_aware_mid_score
-        )
-        if score >= required:
-            return True
+        score = self.strategy._detail_metric(detail, "score", absolute=True)
+        volume_ratio = self.strategy._detail_metric(detail, "volume_ratio")
         logger.warning(
-            "LIVE WAIT | ticker=%s | entry=%dc requires |abs(score)|>=%.2f but score=%.2f",
+            "LIVE WAIT | ticker=%s | entry=%dc below normal=%dc requires "
+            "|abs(score)|>=%.2f or volume_ratio>=%.2f | score=%s volume_ratio=%s",
             ticker,
             ask,
-            required,
-            score,
+            self.strategy.normal_entry_floor_cents,
+            self.strategy.low_entry_min_score,
+            self.strategy.low_entry_min_volume_ratio,
+            "missing" if score is None else f"{score:.2f}",
+            "missing" if volume_ratio is None else f"{volume_ratio:.2f}",
         )
         return False
 
