@@ -47,8 +47,11 @@ class PolymarketMomentumStrategy:
         bankroll_cents: int = 50_000,
         take_profit: int = 98,
         maximum_entry_price: int = 76,
+        minimum_entry_price: int = 50,
         minimum_history: float = 20.0,
         minimum_confidence: float = 0.58,
+        late_minimum_confidence: float = 0.65,
+        early_window_seconds: float = 60.0,
         confirmations: int = 2,
         evaluation_interval: float = 2.0,
         entry_slippage_cents: int = 2,
@@ -59,8 +62,17 @@ class PolymarketMomentumStrategy:
         self.bankroll_cents = bankroll_cents
         self.take_profit = take_profit
         self.maximum_entry_price = max(1, min(99, maximum_entry_price))
+        self.minimum_entry_price = max(
+            1,
+            min(self.maximum_entry_price, minimum_entry_price),
+        )
         self.minimum_history = minimum_history
         self.minimum_confidence = max(0.50, min(0.99, minimum_confidence))
+        self.late_minimum_confidence = max(
+            self.minimum_confidence,
+            min(0.99, late_minimum_confidence),
+        )
+        self.early_window_seconds = max(0.0, early_window_seconds)
         self.confirmations = max(1, confirmations)
         self.evaluation_interval = max(0.25, evaluation_interval)
         self.entry_slippage_cents = entry_slippage_cents
@@ -347,7 +359,13 @@ class PolymarketMomentumStrategy:
         if side is None:
             self._snapshot_retryable(listing, seconds_left, target, detail)
             return None
-        if confidence < self.minimum_confidence:
+        elapsed_seconds = max(0.0, now - listing.open_time)
+        required_confidence = (
+            self.minimum_confidence
+            if elapsed_seconds <= self.early_window_seconds
+            else self.late_minimum_confidence
+        )
+        if confidence < required_confidence:
             self._candidate_side.pop(listing.slug, None)
             self._candidate_readings.pop(listing.slug, None)
             self._snapshot_retryable(
@@ -355,7 +373,8 @@ class PolymarketMomentumStrategy:
                 seconds_left,
                 target,
                 f"LOW_CHART_CONFIDENCE | confidence={confidence:.1%} "
-                f"minimum={self.minimum_confidence:.1%} | predicted={side.value} | {detail}",
+                f"minimum={required_confidence:.1%} | elapsed_seconds={elapsed_seconds:.0f} "
+                f"| predicted={side.value} | {detail}",
             )
             return None
 
@@ -384,6 +403,15 @@ class PolymarketMomentumStrategy:
                 seconds_left,
                 target,
                 "NO_EXECUTABLE_ASK",
+            )
+            return None
+        if ask < self.minimum_entry_price:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                f"ENTRY_PRICE_BELOW_FLOOR | predicted={side.value} | ask={ask}c "
+                f"minimum={self.minimum_entry_price}c | {detail}",
             )
             return None
         if ask > self.maximum_entry_price:
