@@ -20,9 +20,10 @@ from kalshi_bot.backtesting.report import render as render_report
 from kalshi_bot.config import load_settings
 from kalshi_bot.core.all_15m_engine import All15mEngine
 from kalshi_bot.core.engine import TradingEngine
-from kalshi_bot.core.polymarket_sim_engine import PolymarketSimEngine
 from kalshi_bot.core.polymarket_live_engine import PolymarketLiveEngine, PolymarketTradingClient
+from kalshi_bot.core.polymarket_sim_engine import PolymarketSimEngine
 from kalshi_bot.dashboard import start_dashboard
+from kalshi_bot.data.chainlink_twap import ChainlinkTwapFeed
 from kalshi_bot.data.gold import GoldPriceFeed
 from kalshi_bot.data.multi_asset import MultiAssetPriceFeed
 from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
@@ -43,7 +44,7 @@ from kalshi_bot.strategies.examples.polymarket_momentum import PolymarketMomentu
 
 app = typer.Typer(
     add_completion=False,
-    help="Kalshi Trading Bot ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ open-source framework by Viprasol Tech.",
+    help="Kalshi Trading Bot â open-source framework by Viprasol Tech.",
 )
 console = Console()
 
@@ -61,7 +62,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
 @app.command()
 def version() -> None:
     """Print the installed version."""
-    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ by Viprasol Tech")
+    console.print(f"kalshi-trading-bot [bold cyan]{__version__}[/] â by Viprasol Tech")
 
 
 @app.command()
@@ -359,7 +360,7 @@ def polymarket_sim(
     cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
     bankroll: int = typer.Option(500, min=1, help="Paper bankroll in dollars."),
     contracts: int = typer.Option(10, min=1, help="Paper contracts per trade."),
-    intervals: str = typer.Option("5,15", help="Rolling market lengths: 5, 15, or 5,15."),
+    intervals: str = typer.Option("5", help="Rolling market lengths: 5, 15, or 5,15."),
     poll: float = typer.Option(1.0, min=0.25, help="Quote polling interval in seconds."),
 ) -> None:
     """Simulate the live crypto strategy on Polymarket 5m and 15m markets."""
@@ -382,6 +383,7 @@ def polymarket_sim(
             engine = PolymarketSimEngine(
                 client=client,
                 feed=feed,
+                reference_feed=ChainlinkTwapFeed(tuple(client.ASSETS.values())),
                 strategy=PolymarketMomentumStrategy(
                     bankroll_cents=bankroll * 100,
                     contracts=contracts,
@@ -403,12 +405,15 @@ def polymarket_auth_check() -> None:
         balance = await client.collateral_balance()
         if geo.get("blocked"):
             console.print(
-                f"[red]BLOCKED[/] Railway server location: {geo.get('country')} / {geo.get('region')}"
+                "[red]BLOCKED[/] Railway server location: "
+                f"{geo.get('country')} / {geo.get('region')}"
             )
             raise typer.Exit(code=2)
         masked = f"{client.wallet[:6]}...{client.wallet[-4:]}"
         console.print(f"[green]Polymarket auth OK[/] | wallet={masked}")
-        console.print(f"Railway server location: {geo.get('country')} / {geo.get('region')} (eligible)")
+        console.print(
+            f"Railway server location: {geo.get('country')} / {geo.get('region')} (eligible)"
+        )
         if balance is not None:
             console.print(f"Reported collateral balance: ${balance:.2f}")
 
@@ -420,9 +425,11 @@ def polymarket_live(
     cycles: int = typer.Option(0, help="Scan cycles before stopping (0 runs continuously)."),
     bankroll: int = typer.Option(30, min=1, help="Hard strategy bankroll cap in dollars."),
     contracts: int = typer.Option(2, min=1, help="Contracts per trade."),
-    intervals: str = typer.Option("5,15", help="Rolling market lengths: 5, 15, or 5,15."),
+    intervals: str = typer.Option("5", help="Rolling market lengths: 5, 15, or 5,15."),
     poll: float = typer.Option(1.0, min=0.25, help="Quote polling interval in seconds."),
-    live: bool = typer.Option(False, "--live", help="Enable real CLOB orders; also requires POLY_LIVE=true."),
+    live: bool = typer.Option(
+        False, "--live", help="Enable real CLOB orders; also requires POLY_LIVE=true."
+    ),
 ) -> None:
     """Run the Polymarket momentum strategy with confirmed real CLOB execution."""
     try:
@@ -447,6 +454,7 @@ def polymarket_live(
                 market_client=market_client,
                 trading_client=PolymarketTradingClient(),
                 feed=feed,
+                reference_feed=ChainlinkTwapFeed(tuple(market_client.ASSETS.values())),
                 strategy=PolymarketMomentumStrategy(
                     bankroll_cents=bankroll * 100,
                     contracts=contracts,
