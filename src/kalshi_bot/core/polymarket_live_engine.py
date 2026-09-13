@@ -1,5 +1,4 @@
 
-
 """Live Polymarket execution for the rolling crypto momentum strategy."""
 
 from __future__ import annotations
