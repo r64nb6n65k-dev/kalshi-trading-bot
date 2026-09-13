@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from itertools import pairwise
 from typing import ClassVar
 from zoneinfo import ZoneInfo
 
@@ -17,6 +20,10 @@ from kalshi_bot.telemetry.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Printed by the live engine at startup so deployment logs prove which strategy
+# Northflank actually installed.
+STRATEGY_VERSION = "poly-5m-confidence-v6"
+
 
 @dataclass(frozen=True, slots=True)
 class SimSignal:
@@ -24,6 +31,7 @@ class SimSignal:
     signal_ask: int
     limit_price: int
     detail: str
+    maximum_entry_price: int = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,13 +53,15 @@ class PolymarketMomentumStrategy:
         bankroll_cents: int = 50_000,
         take_profit: int = 98,
         minimum_entry_price: int = 50,
-        maximum_entry_price: int = 80,
+        maximum_entry_price: int = 90,
         minimum_history: float = 20.0,
         minimum_separation_bps: float = 4.0,
         minimum_volume_ratio: float = 0.25,
         low_volume_override_bps: float = 12.0,
         confirmations: int = 2,
+        confirmation_seconds: float = 2.0,
         evaluation_interval: float = 2.0,
+        maximum_tick_age_seconds: float = 12.0,
         entry_slippage_cents: int = 2,
         final_entry_seconds: float = 60.0,
         drawdown_limit_cents: int = 4_000,
@@ -72,7 +82,15 @@ class PolymarketMomentumStrategy:
             low_volume_override_bps,
         )
         self.confirmations = max(1, confirmations)
+        self.confirmation_seconds = max(1.0, confirmation_seconds)
         self.evaluation_interval = max(0.25, evaluation_interval)
+        # A candidate must remain alive long enough to complete confirmation.
+        # The old five-second freshness cutoff conflicted with the six-second
+        # confirmation period and repeatedly erased candidates in quiet markets.
+        self.maximum_tick_age_seconds = max(
+            self.confirmation_seconds + self.evaluation_interval,
+            maximum_tick_age_seconds,
+        )
         self.entry_slippage_cents = entry_slippage_cents
         self.final_entry_seconds = max(0.0, final_entry_seconds)
         self.drawdown_limit_cents = drawdown_limit_cents
@@ -82,6 +100,9 @@ class PolymarketMomentumStrategy:
         self._last_evaluation_at: dict[str, float] = {}
         self._candidate_side: dict[str, Side] = {}
         self._candidate_readings: dict[str, int] = {}
+        self._candidate_at: dict[str, float] = {}
+        self._candidate_price: dict[str, float] = {}
+        self._candidate_tick_at: dict[str, float] = {}
         self.total_pnl_cents = 0
         self._daily_day: date | None = None
         self._daily_pnl_cents = 0
@@ -113,6 +134,26 @@ class PolymarketMomentumStrategy:
         return sum(p.entry_price * p.count for p in self.positions.values())
 
     @staticmethod
+    def _metric(detail: str, name: str, default: float = 0.0) -> float:
+        match = re.search(rf"(?:^|\s){re.escape(name)}=([+-]?\d+(?:\.\d+)?)", detail)
+        return float(match.group(1)) if match else default
+
+    def _dynamic_entry_ceiling(self, detail: str) -> int:
+        """Use chart confidence to decide how much the strategy may pay."""
+        confidence = self._metric(detail, "confidence")
+        if confidence >= 72.0:
+            ceiling = 90
+        elif confidence >= 65.0:
+            ceiling = 84
+        elif confidence >= 58.0:
+            ceiling = 76
+        elif confidence >= 50.0:
+            ceiling = 65
+        else:
+            return self.minimum_entry_price - 1
+        return min(self.maximum_entry_price, ceiling)
+
+    @staticmethod
     def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
         return min(ticks, key=lambda row: abs(row.timestamp.timestamp() - timestamp))
 
@@ -128,71 +169,121 @@ class PolymarketMomentumStrategy:
         if len(ticks) < 2:
             return None, "NO_UNDERLYING_FEED_OR_HISTORY"
         market_ticks = tuple(
-            tick
-            for tick in ticks
-            if listing.open_time <= tick.timestamp.timestamp() <= now
+            sorted(
+                (
+                    tick
+                    for tick in ticks
+                    if listing.open_time <= tick.timestamp.timestamp() <= now
+                ),
+                key=lambda tick: tick.timestamp,
+            )
         )
         if len(market_ticks) < 2:
             return None, "NO_MARKET_PRICE_HISTORY"
         latest = market_ticks[-1]
         first_time = market_ticks[0].timestamp.timestamp()
-        if now - latest.timestamp.timestamp() > 5 or now - first_time < self.minimum_history:
+        if (
+            now - latest.timestamp.timestamp() > self.maximum_tick_age_seconds
+            or now - first_time < self.minimum_history
+        ):
             return None, "STALE_OR_INSUFFICIENT_PRICE_HISTORY"
+        very_short = self._at_or_before(market_ticks, max(first_time, now - 15))
+        medium = self._at_or_before(market_ticks, max(first_time, now - 30))
         short = self._at_or_before(market_ticks, max(first_time, now - 60))
         long = market_ticks[0]
+        very_short_bps = (latest.price - very_short.price) / target * 10_000
+        medium_bps = (latest.price - medium.price) / target * 10_000
         short_bps = (latest.price - short.price) / target * 10_000
         long_bps = (latest.price - long.price) / target * 10_000
         separation_bps = (latest.price - target) / target * 10_000
-        if abs(separation_bps) < self.minimum_separation_bps:
-            return (
-                None,
-                f"INSUFFICIENT_SEPARATION | separation_bps={separation_bps:+.2f} "
-                f"minimum={self.minimum_separation_bps:.2f}",
-            )
-        if separation_bps * short_bps <= 0 or separation_bps * long_bps <= 0:
-            return (
-                None,
-                f"MOMENTUM_DISAGREEMENT | separation_bps={separation_bps:+.2f} "
-                f"momentum_60_bps={short_bps:+.2f} "
-                f"momentum_market_bps={long_bps:+.2f}",
-            )
+        direction = 1.0 if separation_bps >= 0 else -1.0
+        # Compare adjacent equal-duration windows. Missing early volume is neutral,
+        # not a reason to throw away the entire opportunity.
+        elapsed = now - first_time
+        volume_window = min(45.0, elapsed / 2)
+        recent_start = now - volume_window
+        baseline_start = recent_start - volume_window
         recent_volume = sum(
             tick.size
             for tick in market_ticks
-            if tick.timestamp.timestamp() >= max(first_time, now - 60)
+            if tick.timestamp.timestamp() >= recent_start
         )
-        older_volume = sum(
+        baseline_volume = sum(
             tick.size
             for tick in market_ticks
-            if tick.timestamp.timestamp() < now - 60
+            if baseline_start <= tick.timestamp.timestamp() < recent_start
         )
-        older_seconds = max(1.0, now - first_time - 60)
-        baseline_volume = older_volume * 60 / older_seconds
         volume_ratio = recent_volume / baseline_volume if baseline_volume > 0 else 1.0
-        if (
-            volume_ratio < self.minimum_volume_ratio
-            and abs(separation_bps) < self.low_volume_override_bps
-        ):
-            return (
-                None,
-                f"LOW_VOLUME_CONFIRMATION | volume_ratio={volume_ratio:.2f} "
-                f"minimum={self.minimum_volume_ratio:.2f} "
-                f"separation_bps={separation_bps:+.2f} "
-                f"override_bps={self.low_volume_override_bps:.2f}",
-            )
+        prices = [tick.price for tick in market_ticks]
+        path = sum(abs(right - left) for left, right in pairwise(prices))
+        efficiency = abs(latest.price - long.price) / path if path > 0 else 0.0
+        crossings = sum(
+            1
+            for left, right in pairwise(prices)
+            if (left - target) * (right - target) < 0
+        )
+        total_size = sum(max(0.0, tick.size) for tick in market_ticks)
+        vwap = (
+            sum(tick.price * max(0.0, tick.size) for tick in market_ticks) / total_size
+            if total_size > 0
+            else sum(prices) / len(prices)
+        )
+        vwap_distance_bps = (latest.price - vwap) / target * 10_000
+        midpoint = first_time + (now - first_time) / 2
+        early = tuple(
+            tick for tick in market_ticks if tick.timestamp.timestamp() < midpoint
+        )
+        late = tuple(
+            tick for tick in market_ticks if tick.timestamp.timestamp() >= midpoint
+        )
+
+        def weighted_price(rows: tuple[UnderlyingTick, ...]) -> float:
+            size = sum(max(0.0, tick.size) for tick in rows)
+            if size > 0:
+                return sum(tick.price * max(0.0, tick.size) for tick in rows) / size
+            return sum(tick.price for tick in rows) / len(rows)
+
+        early_vwap = weighted_price(early) if early else long.price
+        late_vwap = weighted_price(late) if late else latest.price
+        vwap_slope_bps = (late_vwap - early_vwap) / target * 10_000
         volume_weight = max(0.5, min(2.0, volume_ratio))
-        score = 0.55 * separation_bps + volume_weight * (
-            0.30 * short_bps + 0.15 * long_bps
+        score = 0.35 * separation_bps + volume_weight * (
+            0.25 * very_short_bps
+            + 0.20 * medium_bps
+            + 0.15 * short_bps
+            + 0.05 * long_bps
+        )
+        alignment = (
+            0.34 * math.tanh(direction * separation_bps / 6.0)
+            + 0.16 * math.tanh(direction * very_short_bps / 2.0)
+            + 0.14 * math.tanh(direction * medium_bps / 3.0)
+            + 0.10 * math.tanh(direction * short_bps / 5.0)
+            + 0.06 * math.tanh(direction * long_bps / 6.0)
+            + 0.10 * math.tanh(direction * vwap_distance_bps / 3.0)
+            + 0.10 * math.tanh(direction * vwap_slope_bps / 2.0)
+        )
+        trend_bonus = 5.0 * min(1.0, efficiency / 0.35)
+        volume_bonus = 2.0 * min(1.0, max(0.0, volume_ratio))
+        crossing_penalty = min(6.0, crossings * 1.5)
+        confidence = max(
+            0.0,
+            min(90.0, 50.0 + 32.0 * alignment + trend_bonus + volume_bonus - crossing_penalty),
         )
         # The opening target owns direction. Momentum and volume may confirm or defer,
         # but they may never reverse the side selected by the settlement reference.
         side = Side.YES if separation_bps > 0 else Side.NO
         return side, (
             f"underlying={latest.price:.6f} source={latest.source} "
-            f"target={target:.6f} score={score:+.2f} "
+            f"target={target:.6f} score={score:+.2f} confidence={confidence:.1f} "
             f"separation_bps={separation_bps:+.2f} "
+            f"momentum_15_bps={very_short_bps:+.2f} "
+            f"momentum_30_bps={medium_bps:+.2f} "
             f"momentum_60_bps={short_bps:+.2f} "
-            f"momentum_long_bps={long_bps:+.2f} volume_ratio={volume_ratio:.2f}"
+            f"momentum_long_bps={long_bps:+.2f} "
+            f"vwap={vwap:.6f} vwap_distance_bps={vwap_distance_bps:+.2f} "
+            f"vwap_slope_bps={vwap_slope_bps:+.2f} "
+            f"volume_ratio={volume_ratio:.2f} crossings={crossings} "
+            f"efficiency={efficiency:.2f}"
         )
 
     def evaluate(
@@ -234,18 +325,70 @@ class PolymarketMomentumStrategy:
         self._last_evaluation_at[listing.slug] = now
         side, detail = self._signal(listing, target, now, ticks)
         if side is None:
-            self._candidate_side.pop(listing.slug, None)
-            self._candidate_readings.pop(listing.slug, None)
+            self._clear_candidate(listing.slug)
             self._snapshot_retryable(listing, seconds_left, target, detail)
             return None
-        previous_side = self._candidate_side.get(listing.slug)
-        readings = (
-            self._candidate_readings.get(listing.slug, 0) + 1
-            if side is previous_side
-            else 1
+        market_ticks = tuple(
+            sorted(
+                (
+                    tick
+                    for tick in ticks
+                    if listing.open_time <= tick.timestamp.timestamp() <= now
+                ),
+                key=lambda tick: tick.timestamp,
+            )
         )
-        self._candidate_side[listing.slug] = side
-        self._candidate_readings[listing.slug] = readings
+        latest = market_ticks[-1]
+        latest_tick_at = latest.timestamp.timestamp()
+        previous_side = self._candidate_side.get(listing.slug)
+        if side is not previous_side:
+            self._start_candidate(listing.slug, side, now, latest.price, latest_tick_at)
+            readings = 1
+        else:
+            candidate_at = self._candidate_at[listing.slug]
+            candidate_price = self._candidate_price[listing.slug]
+            candidate_tick_at = self._candidate_tick_at[listing.slug]
+            elapsed_confirmation = now - candidate_at
+            if (
+                elapsed_confirmation < self.confirmation_seconds
+                or latest_tick_at <= candidate_tick_at
+            ):
+                self._snapshot_retryable(
+                    listing,
+                    seconds_left,
+                    target,
+                    f"SIGNAL_CONFIRMING | predicted={side.value} | readings=1/"
+                    f"{self.confirmations} | elapsed={elapsed_confirmation:.1f}s/"
+                    f"{self.confirmation_seconds:.1f}s | waiting_for_new_tick=true | {detail}",
+                )
+                return None
+            direction = 1.0 if side is Side.YES else -1.0
+            confirmation_move_bps = (
+                direction * (latest.price - candidate_price) / target * 10_000
+            )
+            # Flat is acceptable.  Reset only when the selected direction has
+            # materially weakened; this keeps trade frequency while preventing
+            # a stale opening burst from receiving automatic confirmation.
+            if confirmation_move_bps < -0.50:
+                self._start_candidate(
+                    listing.slug,
+                    side,
+                    now,
+                    latest.price,
+                    latest_tick_at,
+                )
+                self._snapshot_retryable(
+                    listing,
+                    seconds_left,
+                    target,
+                    f"SIGNAL_RESET_WEAKENED | predicted={side.value} | "
+                    f"candidate_price={candidate_price:.6f} "
+                    f"latest_price={latest.price:.6f} "
+                    f"confirmation_move_bps={confirmation_move_bps:+.2f} | {detail}",
+                )
+                return None
+            readings = self._candidate_readings.get(listing.slug, 1) + 1
+            self._candidate_readings[listing.slug] = readings
         if readings < self.confirmations:
             self._snapshot_retryable(
                 listing,
@@ -273,17 +416,27 @@ class PolymarketMomentumStrategy:
                 f"minimum={self.minimum_entry_price}c | {detail}",
             )
             return None
-        if ask > self.maximum_entry_price:
+        dynamic_ceiling = self._dynamic_entry_ceiling(detail)
+        if dynamic_ceiling < self.minimum_entry_price:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                f"LOW_CHART_CONFIDENCE | predicted={side.value} "
+                f"confidence={self._metric(detail, 'confidence'):.1f}% minimum=50.0% | {detail}",
+            )
+            return None
+        if ask > dynamic_ceiling:
             self._snapshot_retryable(
                 listing,
                 seconds_left,
                 target,
                 f"ENTRY_PRICE_ABOVE_CAP | predicted={side.value} | ask={ask}c "
-                f"maximum={self.maximum_entry_price}c | {detail}",
+                f"maximum={dynamic_ceiling}c | {detail}",
             )
             return None
         limit_price = min(
-            self.maximum_entry_price,
+            dynamic_ceiling,
             ask + max(0, self.entry_slippage_cents),
         )
         block = self.entry_block_reason(now)
@@ -305,7 +458,34 @@ class PolymarketMomentumStrategy:
             return None
         self._last_retry_reason.pop(listing.slug, None)
         self._snapshot(listing, seconds_left, target, f"BUY_{side.value.upper()}", detail)
-        return SimSignal(side=side, signal_ask=ask, limit_price=limit_price, detail=detail)
+        return SimSignal(
+            side=side,
+            signal_ask=ask,
+            limit_price=limit_price,
+            detail=f"{detail} entry_ceiling={dynamic_ceiling}c",
+            maximum_entry_price=dynamic_ceiling,
+        )
+
+    def _start_candidate(
+        self,
+        slug: str,
+        side: Side,
+        now: float,
+        price: float,
+        tick_at: float,
+    ) -> None:
+        self._candidate_side[slug] = side
+        self._candidate_readings[slug] = 1
+        self._candidate_at[slug] = now
+        self._candidate_price[slug] = price
+        self._candidate_tick_at[slug] = tick_at
+
+    def _clear_candidate(self, slug: str) -> None:
+        self._candidate_side.pop(slug, None)
+        self._candidate_readings.pop(slug, None)
+        self._candidate_at.pop(slug, None)
+        self._candidate_price.pop(slug, None)
+        self._candidate_tick_at.pop(slug, None)
 
     def _snapshot_retryable(
         self,
@@ -357,8 +537,7 @@ class PolymarketMomentumStrategy:
         self.decided.add(listing.slug)
         self._last_retry_reason.pop(listing.slug, None)
         self._last_evaluation_at.pop(listing.slug, None)
-        self._candidate_side.pop(listing.slug, None)
-        self._candidate_readings.pop(listing.slug, None)
+        self._clear_candidate(listing.slug)
         position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
@@ -409,5 +588,18 @@ class PolymarketMomentumStrategy:
         self._candidate_readings = {
             slug: readings
             for slug, readings in self._candidate_readings.items()
+            if slug in keep
+        }
+        self._candidate_at = {
+            slug: candidate_at
+            for slug, candidate_at in self._candidate_at.items()
+            if slug in keep
+        }
+        self._candidate_price = {
+            slug: price for slug, price in self._candidate_price.items() if slug in keep
+        }
+        self._candidate_tick_at = {
+            slug: tick_at
+            for slug, tick_at in self._candidate_tick_at.items()
             if slug in keep
         }
