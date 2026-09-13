@@ -1,5 +1,4 @@
 
-
 """Simulation-only port of the live crypto momentum strategy to Polymarket."""
 
 from __future__ import annotations
