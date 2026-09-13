@@ -1,4 +1,3 @@
-
 """Settlement-aligned Polymarket five-minute crypto forecast strategy."""
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-chainlink-forecast-v11"
+STRATEGY_VERSION = "poly-5m-chainlink-forecast-v12"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +56,7 @@ class PolymarketMomentumStrategy:
         maximum_reference_age_seconds: float = 8.0,
         entry_slippage_cents: int = 2,
         final_entry_seconds: float = 60.0,
-        minimum_model_edge: float = 0.0,
+        minimum_model_edge: float = 0.02,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -323,6 +322,7 @@ class PolymarketMomentumStrategy:
         elif efficiency < 0.12:
             regime = "RANGE"
         selected_probability = up_probability if side is Side.YES else 1 - up_probability
+
         return (
             side,
             (
