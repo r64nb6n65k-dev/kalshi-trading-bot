@@ -1,5 +1,3 @@
-
-
 """Live Polymarket execution for the rolling crypto momentum strategy."""
 
 from __future__ import annotations
@@ -15,6 +13,7 @@ from typing import Any
 import httpx
 
 from kalshi_bot.dashboard import record_model_snapshot
+from kalshi_bot.data.chainlink_twap import ChainlinkTwapFeed
 from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
 from kalshi_bot.exchange.models import Side
 from kalshi_bot.polymarket import PolymarketListing, PolymarketPublicClient
@@ -89,14 +88,23 @@ class PolymarketTradingClient:
             raise RuntimeError("Set all three Polymarket CLOB credential variables or none")
         else:
             temporary = ClobClient(
-                host=self.host, chain_id=self.CHAIN_ID, key=self.private_key,
-                signature_type=self.SIGNATURE_TYPE, funder=self.wallet, use_server_time=True,
+                host=self.host,
+                chain_id=self.CHAIN_ID,
+                key=self.private_key,
+                signature_type=self.SIGNATURE_TYPE,
+                funder=self.wallet,
+                use_server_time=True,
             )
             creds = temporary.create_or_derive_api_key()
         self._client = ClobClient(
-            host=self.host, chain_id=self.CHAIN_ID, key=self.private_key, creds=creds,
-            signature_type=self.SIGNATURE_TYPE, funder=self.wallet,
-            use_server_time=True, retry_on_error=False,
+            host=self.host,
+            chain_id=self.CHAIN_ID,
+            key=self.private_key,
+            creds=creds,
+            signature_type=self.SIGNATURE_TYPE,
+            funder=self.wallet,
+            use_server_time=True,
+            retry_on_error=False,
         )
         self._secure_client: Any | None = None
         self._secure_client_lock = asyncio.Lock()
@@ -178,6 +186,7 @@ class PolymarketTradingClient:
     async def collateral_balance(self) -> float | None:
         try:
             from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
             result = await asyncio.to_thread(
                 self._client.get_balance_allowance,
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
@@ -248,8 +257,12 @@ class PolymarketTradingClient:
         )
 
     async def executable_buy_quote(
-        self, listing: PolymarketListing, side: Side, *,
-        slippage_cents: int, maximum_price_cents: int,
+        self,
+        listing: PolymarketListing,
+        side: Side,
+        *,
+        slippage_cents: int,
+        maximum_price_cents: int,
     ) -> tuple[int, int, float] | None:
         book = await asyncio.to_thread(self._client.get_order_book, self._token(listing, side))
         levels: list[tuple[int, float]] = []
@@ -273,35 +286,47 @@ class PolymarketTradingClient:
         return ask, limit, depth
 
     async def build_limit_order(
-        self, listing: PolymarketListing, side: Side, *, action: str,
-        price_cents: int, shares: int,
+        self,
+        listing: PolymarketListing,
+        side: Side,
+        *,
+        action: str,
+        price_cents: int,
+        shares: int,
     ) -> Any:
         from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions
         from py_clob_client_v2 import Side as ClobSide
+
         args = OrderArgs(
-            token_id=self._token(listing, side), price=price_cents / 100,
-            side=ClobSide.BUY if action == "BUY" else ClobSide.SELL, size=shares,
+            token_id=self._token(listing, side),
+            price=price_cents / 100,
+            side=ClobSide.BUY if action == "BUY" else ClobSide.SELL,
+            size=shares,
         )
-        return await asyncio.to_thread(
-            self._client.create_order, args, PartialCreateOrderOptions()
-        )
+        return await asyncio.to_thread(self._client.create_order, args, PartialCreateOrderOptions())
 
     async def post_fok(self, order: Any) -> Any:
         from py_clob_client_v2 import OrderType
-        return await asyncio.to_thread(
-            self._client.post_order, order, OrderType.FOK, False, False
-        )
+
+        return await asyncio.to_thread(self._client.post_order, order, OrderType.FOK, False, False)
 
 
 class PolymarketLiveEngine:
     def __init__(
-        self, *, market_client: PolymarketPublicClient,
-        trading_client: PolymarketTradingClient, feed: MultiCryptoPriceFeed,
-        strategy: PolymarketMomentumStrategy, poll_interval: float = 1.0,
-        execution_window_seconds: float = 3.0, live_enabled: bool = False,
+        self,
+        *,
+        market_client: PolymarketPublicClient,
+        trading_client: PolymarketTradingClient,
+        feed: MultiCryptoPriceFeed,
+        reference_feed: ChainlinkTwapFeed,
+        strategy: PolymarketMomentumStrategy,
+        poll_interval: float = 1.0,
+        execution_window_seconds: float = 3.0,
+        live_enabled: bool = False,
     ) -> None:
         self.market_client, self.trading_client = market_client, trading_client
         self.feed, self.strategy = feed, strategy
+        self.reference_feed = reference_feed
         self.poll_interval = max(0.25, poll_interval)
         self.execution_window_seconds = max(0.5, execution_window_seconds)
         self.live_enabled = live_enabled and _env_bool("POLY_LIVE")
@@ -309,11 +334,12 @@ class PolymarketLiveEngine:
         # Stale deployment variables must not silently change live execution.
         self.maximum_entry_price = self.strategy.maximum_entry_price
         self.auto_redeem = os.getenv("POLY_AUTO_REDEEM", "true").strip().lower() in {
-            "1", "true", "yes", "on",
+            "1",
+            "true",
+            "yes",
+            "on",
         }
-        self.redeem_scan_seconds = max(
-            5.0, float(os.getenv("POLY_REDEEM_SCAN_SECONDS", "15"))
-        )
+        self.redeem_scan_seconds = max(5.0, float(os.getenv("POLY_REDEEM_SCAN_SECONDS", "15")))
         self._targets: dict[str, float] = {}
         self._known: dict[str, PolymarketListing] = {}
         self._pending: dict[str, PendingLiveEntry] = {}
@@ -339,25 +365,38 @@ class PolymarketLiveEngine:
     def _no_fill(cls, response: Any) -> bool:
         error, status = cls._error(response).lower(), cls._status(response)
         return not cls._ok(response) and (
-            "no match" in error or "no orders found" in error
-            or ("fok" in error and "fill" in error) or status == "unmatched"
+            "no match" in error
+            or "no orders found" in error
+            or ("fok" in error and "fill" in error)
+            or status == "unmatched"
         )
 
     @staticmethod
     def _no_fill_exception(exc: Exception) -> bool:
         message = str(exc).lower()
-        return any(text in message for text in (
-            "couldn't be fully filled", "could not be fully filled",
-            "fully filled or killed", "no match",
-        ))
+        return any(
+            text in message
+            for text in (
+                "couldn't be fully filled",
+                "could not be fully filled",
+                "fully filled or killed",
+                "no match",
+            )
+        )
 
     @staticmethod
     def _insufficient_collateral_exception(exc: Exception) -> bool:
         message = str(exc).lower()
-        return any(text in message for text in (
-            "not enough balance", "insufficient balance", "insufficient collateral",
-            "balance or allowance", "insufficient funds",
-        ))
+        return any(
+            text in message
+            for text in (
+                "not enough balance",
+                "insufficient balance",
+                "insufficient collateral",
+                "balance or allowance",
+                "insufficient funds",
+            )
+        )
 
     async def _redeem_condition(self, condition_id: str, now: float) -> bool:
         if condition_id in self._redeemed_conditions:
@@ -400,18 +439,17 @@ class PolymarketLiveEngine:
     def _target(self, listing: PolymarketListing) -> float | None:
         if listing.slug in self._targets:
             return self._targets[listing.slug]
-        ticks = self.feed.snapshot(self.market_client.ASSETS[listing.asset])
-        if not ticks:
+        product = self.market_client.ASSETS[listing.asset]
+        opening = self.reference_feed.opening_reference(product, listing.open_time)
+        if opening is None:
             return None
-        opening = min(ticks, key=lambda x: abs(x.timestamp.timestamp() - listing.open_time))
-        if abs(opening.timestamp.timestamp() - listing.open_time) > 5:
-            return None
-        self._targets[listing.slug] = opening.price
+        self._targets[listing.slug] = opening
         logger.warning(
-            "OPENING REFERENCE CAPTURED | ticker=%s | price=%.6f",
-            listing.slug, opening.price,
+            "OPENING REFERENCE CAPTURED | ticker=%s | price=%.6f | source=CHAINLINK_TWAP_60S",
+            listing.slug,
+            opening,
         )
-        return opening.price
+        return opening
 
     async def _with_live_quotes(
         self,
@@ -422,9 +460,7 @@ class PolymarketLiveEngine:
         if cached is not None and now - cached[0] < self.strategy.evaluation_interval:
             return cached[1]
         try:
-            yes_bid, yes_ask, no_bid, no_ask = await self.trading_client.live_quotes(
-                listing
-            )
+            yes_bid, yes_ask, no_bid, no_ask = await self.trading_client.live_quotes(listing)
         except Exception:
             logger.exception(
                 "CLOB QUOTE REFRESH FAILED | ticker=%s | will_retry=true",
@@ -477,7 +513,8 @@ class PolymarketLiveEngine:
                     ),
                 )
                 quote = await self.trading_client.executable_buy_quote(
-                    pending.listing, pending.signal.side,
+                    pending.listing,
+                    pending.signal.side,
                     slippage_cents=self.strategy.entry_slippage_cents,
                     maximum_price_cents=maximum_entry_price,
                 )
@@ -510,7 +547,9 @@ class PolymarketLiveEngine:
                     logger.warning(
                         "LIVE CANCEL | ticker=%s | reason=FRESH_CLOB_ASK_ABOVE_MAX "
                         "| ask=%dc | maximum=%dc",
-                        pending.listing.slug, ask, maximum_entry_price,
+                        pending.listing.slug,
+                        ask,
+                        maximum_entry_price,
                     )
                     return True
                 pending.shares = max(self.strategy.contracts, (100 + limit - 1) // limit)
@@ -529,8 +568,11 @@ class PolymarketLiveEngine:
                     return False
                 pending.signal = replace(pending.signal, signal_ask=ask, limit_price=limit)
                 pending.signed_order = await self.trading_client.build_limit_order(
-                    pending.listing, pending.signal.side, action="BUY",
-                    price_cents=limit, shares=pending.shares,
+                    pending.listing,
+                    pending.signal.side,
+                    action="BUY",
+                    price_cents=limit,
+                    shares=pending.shares,
                 )
             response = await self.trading_client.post_fok(pending.signed_order)
         except Exception as exc:
@@ -551,12 +593,17 @@ class PolymarketLiveEngine:
         if self._ok(response) and self._status(response) == "matched":
             fill = _fill_cents(response, "BUY", pending.signal.limit_price)
             self.strategy.open_position(
-                pending.listing, pending.signal.side, fill, count=pending.shares,
+                pending.listing,
+                pending.signal.side,
+                fill,
+                count=pending.shares,
                 execution_mode="polymarket_live",
             )
             logger.warning(
                 "POLYMARKET LIVE FILL | ticker=%s | fill=%dc | count=%d",
-                pending.listing.slug, fill, pending.shares,
+                pending.listing.slug,
+                fill,
+                pending.shares,
             )
             return True
         if self._no_fill(response):
@@ -564,7 +611,8 @@ class PolymarketLiveEngine:
             return False
         logger.error(
             "ENTRY NOT CONFIRMED | ticker=%s | status=%s",
-            pending.listing.slug, self._status(response),
+            pending.listing.slug,
+            self._status(response),
         )
         # The exchange may have accepted an order even when its response is not
         # recognizable.  Lock this market rather than risk a duplicate buy.
@@ -580,8 +628,11 @@ class PolymarketLiveEngine:
             return
         try:
             order = await self.trading_client.build_limit_order(
-                listing, position.side, action="SELL",
-                price_cents=self.strategy.take_profit, shares=position.count,
+                listing,
+                position.side,
+                action="SELL",
+                price_cents=self.strategy.take_profit,
+                shares=position.count,
             )
             response = await self.trading_client.post_fok(order)
         except Exception as exc:
@@ -617,8 +668,10 @@ class PolymarketLiveEngine:
                 if not await self._redeem_condition(resolved.condition_id, now):
                     continue
             self.strategy.close_position(
-                slug, 100 if won else 0,
-                "SETTLEMENT_WIN" if won else "SETTLEMENT_LOSS", now,
+                slug,
+                100 if won else 0,
+                "SETTLEMENT_WIN" if won else "SETTLEMENT_LOSS",
+                now,
             )
             self._exit_uncertain.discard(slug)
 
@@ -649,6 +702,7 @@ class PolymarketLiveEngine:
             self.strategy.take_profit,
         )
         await self.feed.start()
+        await self.reference_feed.start()
         cycle = 0
         try:
             while max_cycles is None or cycle < max_cycles:
@@ -659,10 +713,7 @@ class PolymarketLiveEngine:
                     listings = [x for x in listings if x.up_token_id and x.down_token_id]
                     listings = list(
                         await asyncio.gather(
-                            *(
-                                self._listing_for_evaluation(listing, now)
-                                for listing in listings
-                            )
+                            *(self._listing_for_evaluation(listing, now) for listing in listings)
                         )
                     )
                     self._known.update({x.slug: x for x in listings})
@@ -678,7 +729,11 @@ class PolymarketLiveEngine:
                             continue
                         product = self.market_client.ASSETS[listing.asset]
                         signal = self.strategy.evaluate(
-                            listing, self._target(listing), now, self.feed.snapshot(product)
+                            listing,
+                            self._target(listing),
+                            now,
+                            self.feed.snapshot(product),
+                            self.reference_feed.snapshot(product),
                         )
                         if signal:
                             pending = PendingLiveEntry(
@@ -697,9 +752,7 @@ class PolymarketLiveEngine:
                         key: value for key, value in self._targets.items() if key in keep
                     }
                     self._live_quote_cache = {
-                        key: value
-                        for key, value in self._live_quote_cache.items()
-                        if key in keep
+                        key: value for key, value in self._live_quote_cache.items() if key in keep
                     }
                 except Exception:
                     logger.exception("POLYMARKET LIVE SCAN FAILED; retrying")
@@ -708,4 +761,5 @@ class PolymarketLiveEngine:
                     await asyncio.sleep(self.poll_interval)
         finally:
             await self.feed.stop()
+            await self.reference_feed.stop()
             await self.trading_client.close()
