@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-chainlink-forecast-v12"
+STRATEGY_VERSION = "poly-5m-chainlink-forecast-v13"
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +322,22 @@ class PolymarketMomentumStrategy:
         elif efficiency < 0.12:
             regime = "RANGE"
         selected_probability = up_probability if side is Side.YES else 1 - up_probability
+
+        # Chainlink determines settlement.  Forecasting a side opposite the
+        # current Chainlink-to-target position is not an executable signal;
+        # keep watching until the settlement reference agrees.
+        reference_direction = 1.0 if reference_separation_bps > 0 else -1.0
+        predicted_direction = 1.0 if side is Side.YES else -1.0
+        if reference_separation_bps == 0 or reference_direction != predicted_direction:
+            return (
+                None,
+                (
+                    f"REFERENCE_SIDE_DISAGREEMENT | predicted={side.value} "
+                    f"reference_separation_bps={reference_separation_bps:+.2f} "
+                    f"target={target:.6f} reference={latest_reference.price:.6f}"
+                ),
+                selected_probability,
+            )
 
         return (
             side,
