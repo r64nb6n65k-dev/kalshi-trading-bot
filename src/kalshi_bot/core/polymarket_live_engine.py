@@ -1,4 +1,5 @@
 
+
 """Live Polymarket execution for the rolling crypto momentum strategy."""
 
 from __future__ import annotations
@@ -8,16 +9,20 @@ import inspect
 import os
 import time
 from dataclasses import dataclass, replace
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
-from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
 from kalshi_bot.dashboard import record_model_snapshot
+from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
 from kalshi_bot.exchange.models import Side
 from kalshi_bot.polymarket import PolymarketListing, PolymarketPublicClient
-from kalshi_bot.strategies.examples.polymarket_momentum import PolymarketMomentumStrategy, SimSignal
+from kalshi_bot.strategies.examples.polymarket_momentum import (
+    STRATEGY_VERSION,
+    PolymarketMomentumStrategy,
+    SimSignal,
+)
 from kalshi_bot.telemetry.logging import get_logger
 
 logger = get_logger(__name__)
@@ -192,6 +197,56 @@ class PolymarketTradingClient:
             raise RuntimeError(f"No token id for {listing.slug} {side.value}")
         return token
 
+    @staticmethod
+    def _best_ask(book: Any) -> int | None:
+        asks: list[int] = []
+        for row in _value(book, "asks", default=[]) or []:
+            try:
+                price = Decimal(str(_value(row, "price")))
+                cents = int((price * 100).to_integral_value(rounding=ROUND_CEILING))
+                size = float(_value(row, "size", default=0))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if 1 <= cents <= 99 and size > 0:
+                asks.append(cents)
+        return min(asks) if asks else None
+
+    @staticmethod
+    def _best_bid(book: Any) -> int | None:
+        bids: list[int] = []
+        for row in _value(book, "bids", default=[]) or []:
+            try:
+                price = Decimal(str(_value(row, "price")))
+                cents = int((price * 100).to_integral_value(rounding=ROUND_FLOOR))
+                size = float(_value(row, "size", default=0))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if 1 <= cents <= 99 and size > 0:
+                bids.append(cents)
+        return max(bids) if bids else None
+
+    async def live_quotes(
+        self,
+        listing: PolymarketListing,
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        """Return YES/NO bids and asks from their actual token books."""
+        yes_book, no_book = await asyncio.gather(
+            asyncio.to_thread(
+                self._client.get_order_book,
+                self._token(listing, Side.YES),
+            ),
+            asyncio.to_thread(
+                self._client.get_order_book,
+                self._token(listing, Side.NO),
+            ),
+        )
+        return (
+            self._best_bid(yes_book),
+            self._best_ask(yes_book),
+            self._best_bid(no_book),
+            self._best_ask(no_book),
+        )
+
     async def executable_buy_quote(
         self, listing: PolymarketListing, side: Side, *,
         slippage_cents: int, maximum_price_cents: int,
@@ -266,6 +321,7 @@ class PolymarketLiveEngine:
         self._next_redeem_scan = 0.0
         self._redeemed_conditions: set[str] = set()
         self._redeem_retry_at: dict[str, float] = {}
+        self._live_quote_cache: dict[str, tuple[float, PolymarketListing]] = {}
 
     @staticmethod
     def _ok(response: Any) -> bool:
@@ -357,15 +413,73 @@ class PolymarketLiveEngine:
         )
         return opening.price
 
+    async def _with_live_quotes(
+        self,
+        listing: PolymarketListing,
+        now: float,
+    ) -> PolymarketListing:
+        cached = self._live_quote_cache.get(listing.slug)
+        if cached is not None and now - cached[0] < self.strategy.evaluation_interval:
+            return cached[1]
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = await self.trading_client.live_quotes(
+                listing
+            )
+        except Exception:
+            logger.exception(
+                "CLOB QUOTE REFRESH FAILED | ticker=%s | will_retry=true",
+                listing.slug,
+            )
+            quoted = replace(
+                listing,
+                yes_bid=None,
+                yes_ask=None,
+                no_bid=None,
+                no_ask=None,
+            )
+        else:
+            quoted = replace(
+                listing,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+            )
+        self._live_quote_cache[listing.slug] = (now, quoted)
+        return quoted
+
+    async def _listing_for_evaluation(
+        self,
+        listing: PolymarketListing,
+        now: float,
+    ) -> PolymarketListing:
+        seconds_left = listing.close_time - now
+        needs_live_quote = listing.slug in self.strategy.positions or (
+            self.strategy.final_entry_seconds
+            < seconds_left
+            <= self.strategy.decision_seconds(listing.interval_minutes)
+        )
+        if not needs_live_quote:
+            return listing
+        return await self._with_live_quotes(listing, now)
+
     async def _submit(self, pending: PendingLiveEntry, now: float) -> bool:
         if now >= pending.deadline or pending.uncertain:
             return True
         try:
             if pending.signed_order is None:
+                maximum_entry_price = min(
+                    self.maximum_entry_price,
+                    getattr(
+                        pending.signal,
+                        "maximum_entry_price",
+                        self.maximum_entry_price,
+                    ),
+                )
                 quote = await self.trading_client.executable_buy_quote(
                     pending.listing, pending.signal.side,
                     slippage_cents=self.strategy.entry_slippage_cents,
-                    maximum_price_cents=self.maximum_entry_price,
+                    maximum_price_cents=maximum_entry_price,
                 )
                 if quote is None:
                     return False
@@ -380,7 +494,7 @@ class PolymarketLiveEngine:
                     reason=(
                         f"fresh_clob_ask={ask}c | limit={limit}c | "
                         f"minimum={self.strategy.minimum_entry_price}c | "
-                        f"maximum={self.maximum_entry_price}c | depth={depth:.4f}"
+                        f"maximum={maximum_entry_price}c | depth={depth:.4f}"
                     ),
                 )
                 if ask < self.strategy.minimum_entry_price:
@@ -392,11 +506,11 @@ class PolymarketLiveEngine:
                         self.strategy.minimum_entry_price,
                     )
                     return False
-                if ask > self.maximum_entry_price:
+                if ask > maximum_entry_price:
                     logger.warning(
                         "LIVE CANCEL | ticker=%s | reason=FRESH_CLOB_ASK_ABOVE_MAX "
                         "| ask=%dc | maximum=%dc",
-                        pending.listing.slug, ask, self.maximum_entry_price,
+                        pending.listing.slug, ask, maximum_entry_price,
                     )
                     return True
                 pending.shares = max(self.strategy.contracts, (100 + limit - 1) // limit)
@@ -525,7 +639,15 @@ class PolymarketLiveEngine:
     async def run(self, max_cycles: int | None = None) -> None:
         await self.preflight()
         await self._redeem_wallet_positions(time.time(), force=True)
-        logger.warning("POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED")
+        logger.warning(
+            "POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED | strategy_version=%s "
+            "| contracts=%d | entry=%dc-%dc | take_profit=%dc",
+            STRATEGY_VERSION,
+            self.strategy.contracts,
+            self.strategy.minimum_entry_price,
+            self.strategy.maximum_entry_price,
+            self.strategy.take_profit,
+        )
         await self.feed.start()
         cycle = 0
         try:
@@ -535,6 +657,14 @@ class PolymarketLiveEngine:
                     await self._redeem_wallet_positions(now)
                     listings = await self.market_client.get_open_crypto_markets(now)
                     listings = [x for x in listings if x.up_token_id and x.down_token_id]
+                    listings = list(
+                        await asyncio.gather(
+                            *(
+                                self._listing_for_evaluation(listing, now)
+                                for listing in listings
+                            )
+                        )
+                    )
                     self._known.update({x.slug: x for x in listings})
                     await self._settle_missing({x.slug for x in listings}, now)
                     for listing in listings:
@@ -565,6 +695,11 @@ class PolymarketLiveEngine:
                     self.strategy.prune(keep)
                     self._targets = {
                         key: value for key, value in self._targets.items() if key in keep
+                    }
+                    self._live_quote_cache = {
+                        key: value
+                        for key, value in self._live_quote_cache.items()
+                        if key in keep
                     }
                 except Exception:
                     logger.exception("POLYMARKET LIVE SCAN FAILED; retrying")
