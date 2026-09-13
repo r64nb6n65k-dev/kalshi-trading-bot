@@ -6,6 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 
+from kalshi_bot.data.chainlink_twap import ChainlinkTwapFeed
 from kalshi_bot.data.multi_crypto import MultiCryptoPriceFeed
 from kalshi_bot.exchange.models import Side
 from kalshi_bot.polymarket import PolymarketListing, PolymarketPublicClient
@@ -34,12 +35,14 @@ class PolymarketSimEngine:
         *,
         client: PolymarketPublicClient,
         feed: MultiCryptoPriceFeed,
+        reference_feed: ChainlinkTwapFeed,
         strategy: PolymarketMomentumStrategy,
         poll_interval: float = 1.0,
         execution_window_seconds: float = 3.0,
     ) -> None:
         self.client = client
         self.feed = feed
+        self.reference_feed = reference_feed
         self.strategy = strategy
         self.poll_interval = max(0.25, poll_interval)
         self.execution_window_seconds = max(0.0, execution_window_seconds)
@@ -52,21 +55,17 @@ class PolymarketSimEngine:
         if existing is not None:
             return existing
         product = self.client.ASSETS[listing.asset]
-        ticks = self.feed.snapshot(product)
-        if not ticks:
+        opening = self.reference_feed.opening_reference(product, listing.open_time)
+        if opening is None:
             return None
-        opening = min(ticks, key=lambda tick: abs(tick.timestamp.timestamp() - listing.open_time))
-        # Do not invent a price-to-beat when the process started mid-market.
-        if abs(opening.timestamp.timestamp() - listing.open_time) > 5:
-            return None
-        self._targets[listing.slug] = opening.price
+        self._targets[listing.slug] = opening
         logger.warning(
             "OPENING REFERENCE CAPTURED | ticker=%s | price=%.6f | source=%s",
             listing.slug,
-            opening.price,
-            opening.source,
+            opening,
+            "CHAINLINK_TWAP_60S",
         )
-        return opening.price
+        return opening
 
     def _try_fill(self, pending: PendingFill, listing: PolymarketListing, now: float) -> bool:
         ask = listing.yes_ask if pending.signal.side is Side.YES else listing.no_ask
@@ -136,6 +135,7 @@ class PolymarketSimEngine:
             self.strategy.contracts,
         )
         await self.feed.start()
+        await self.reference_feed.start()
         cycle = 0
         try:
             while max_cycles is None or cycle < max_cycles:
@@ -160,6 +160,7 @@ class PolymarketSimEngine:
                             self._target_for(listing),
                             now,
                             self.feed.snapshot(product),
+                            self.reference_feed.snapshot(product),
                         )
                         if signal is not None:
                             pending = PendingFill(
@@ -181,3 +182,4 @@ class PolymarketSimEngine:
                     await asyncio.sleep(self.poll_interval)
         finally:
             await self.feed.stop()
+            await self.reference_feed.stop()
