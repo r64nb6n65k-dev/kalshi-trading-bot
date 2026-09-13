@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from itertools import pairwise
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-balanced-v10"
+STRATEGY_VERSION = "poly-5m-persistent-slope-v11"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +68,10 @@ class PolymarketMomentumStrategy:
         drawdown_limit_cents: int = 4_000,
         loss_cluster_threshold: int = 2,
         loss_cooldown_seconds: float = 600.0,
+        slope_history_seconds: float = 15.0,
+        strong_slope_seconds: float = 10.0,
+        minimum_directional_vwap_slope_bps: float = 0.75,
+        maximum_directional_vwap_distance_bps: float = 5.0,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -99,6 +104,19 @@ class PolymarketMomentumStrategy:
         self.drawdown_limit_cents = drawdown_limit_cents
         self.loss_cluster_threshold = max(1, loss_cluster_threshold)
         self.loss_cooldown_seconds = max(0.0, loss_cooldown_seconds)
+        self.slope_history_seconds = max(1.0, slope_history_seconds)
+        self.strong_slope_seconds = max(
+            1.0,
+            min(self.slope_history_seconds, strong_slope_seconds),
+        )
+        self.minimum_directional_vwap_slope_bps = max(
+            0.0,
+            minimum_directional_vwap_slope_bps,
+        )
+        self.maximum_directional_vwap_distance_bps = max(
+            0.0,
+            maximum_directional_vwap_distance_bps,
+        )
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
         self._last_retry_reason: dict[str, str] = {}
@@ -108,6 +126,7 @@ class PolymarketMomentumStrategy:
         self._candidate_at: dict[str, float] = {}
         self._candidate_price: dict[str, float] = {}
         self._candidate_tick_at: dict[str, float] = {}
+        self._vwap_slope_history: dict[str, deque[tuple[float, float]]] = {}
         self.total_pnl_cents = 0
         self._daily_day: date | None = None
         self._daily_pnl_cents = 0
@@ -153,6 +172,56 @@ class PolymarketMomentumStrategy:
         if confidence < 50.0:
             return self.minimum_entry_price - 1
         return self.maximum_entry_price
+
+    def _remember_vwap_slope(self, slug: str, now: float, slope_bps: float) -> None:
+        history = self._vwap_slope_history.setdefault(slug, deque())
+        history.append((now, slope_bps))
+        cutoff = now - self.slope_history_seconds
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def _persistent_slope_block_reason(
+        self,
+        slug: str,
+        side: Side,
+        now: float,
+        detail: str,
+    ) -> str | None:
+        """Require a sustained, non-exhausted VWAP trend before confirmation."""
+        slope_bps = self._metric(detail, "vwap_slope_bps")
+        distance_bps = self._metric(detail, "vwap_distance_bps")
+        self._remember_vwap_slope(slug, now, slope_bps)
+
+        direction = 1.0 if side is Side.YES else -1.0
+        directional_distance = direction * distance_bps
+        history = self._vwap_slope_history[slug]
+        directional_15 = [direction * value for _, value in history]
+        strong_cutoff = now - self.strong_slope_seconds
+        directional_10 = [
+            direction * value for timestamp, value in history if timestamp >= strong_cutoff
+        ]
+        minimum_15 = min(directional_15)
+        minimum_10 = min(directional_10)
+
+        metrics = (
+            f"predicted={side.value} | directional_vwap_slope_bps="
+            f"{direction * slope_bps:+.2f} minimum_10s={minimum_10:+.2f} "
+            f"minimum_15s={minimum_15:+.2f} directional_vwap_distance_bps="
+            f"{directional_distance:+.2f}"
+        )
+        if directional_distance > self.maximum_directional_vwap_distance_bps:
+            return (
+                f"VWAP_MOVE_OVEREXTENDED | {metrics} maximum="
+                f"{self.maximum_directional_vwap_distance_bps:.2f} | {detail}"
+            )
+        if minimum_15 < 0.0:
+            return f"VWAP_SLOPE_REVERSED_15S | {metrics} required=nonnegative | {detail}"
+        if minimum_10 < self.minimum_directional_vwap_slope_bps:
+            return (
+                f"VWAP_SLOPE_TOO_WEAK_10S | {metrics} required="
+                f"{self.minimum_directional_vwap_slope_bps:.2f} | {detail}"
+            )
+        return None
 
     @staticmethod
     def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
@@ -346,7 +415,23 @@ class PolymarketMomentumStrategy:
         side, detail = self._signal(listing, target, now, ticks)
         if side is None:
             self._clear_candidate(listing.slug)
+            self._vwap_slope_history.pop(listing.slug, None)
             self._snapshot_retryable(listing, seconds_left, target, detail)
+            return None
+        slope_block = self._persistent_slope_block_reason(
+            listing.slug,
+            side,
+            now,
+            detail,
+        )
+        if slope_block is not None:
+            self._clear_candidate(listing.slug)
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                slope_block,
+            )
             return None
         market_ticks = tuple(
             sorted(
@@ -558,6 +643,7 @@ class PolymarketMomentumStrategy:
         self._last_retry_reason.pop(listing.slug, None)
         self._last_evaluation_at.pop(listing.slug, None)
         self._clear_candidate(listing.slug)
+        self._vwap_slope_history.pop(listing.slug, None)
         position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
@@ -635,5 +721,10 @@ class PolymarketMomentumStrategy:
         self._candidate_tick_at = {
             slug: tick_at
             for slug, tick_at in self._candidate_tick_at.items()
+            if slug in keep
+        }
+        self._vwap_slope_history = {
+            slug: history
+            for slug, history in self._vwap_slope_history.items()
             if slug in keep
         }
