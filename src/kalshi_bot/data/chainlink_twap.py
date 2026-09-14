@@ -12,6 +12,8 @@ from collections import defaultdict, deque
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from time import monotonic
+from time import time as unix_time
 
 import websockets
 
@@ -30,6 +32,7 @@ class ChainlinkTwapFeed:
         *,
         ws_url: str = "wss://ws-live-data.polymarket.com",
         history_minutes: int = 30,
+        stale_timeout_seconds: float = 15.0,
     ) -> None:
         self.ws_url = ws_url
         self.product_ids = tuple(dict.fromkeys(product_ids))
@@ -37,6 +40,7 @@ class ChainlinkTwapFeed:
             product.lower().replace("-", "/"): product for product in self.product_ids
         }
         self._history = timedelta(minutes=history_minutes)
+        self._stale_timeout_seconds = max(5.0, stale_timeout_seconds)
         self._ticks: dict[str, deque[UnderlyingTick]] = defaultdict(deque)
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -93,35 +97,36 @@ class ChainlinkTwapFeed:
         while ticks and ticks[0].timestamp < cutoff:
             ticks.popleft()
 
-    def _handle_message(self, raw: str) -> None:
+    def _handle_message(self, raw: str) -> float | None:
+        """Store one update and return its source timestamp in seconds."""
         if raw == "PONG":
-            return
+            return None
         try:
             message = json.loads(raw)
         except (TypeError, ValueError):
-            return
+            return None
         if not isinstance(message, dict) or message.get("type") != "update":
-            return
+            return None
         if message.get("topic") not in {
             "crypto_prices_twap_sixty",
             "prices.crypto.chainlink.twap",
         }:
-            return
+            return None
         payload = message.get("payload")
         if not isinstance(payload, dict):
-            return
+            return None
         symbol = str(payload.get("symbol", "")).lower()
         product_id = self._symbol_to_product.get(symbol)
         if product_id is None:
-            return
+            return None
         try:
             value = Decimal(str(payload["value"]))
             timestamp_ms = int(payload["timestamp"])
             if value <= 0:
-                return
+                return None
         except (KeyError, InvalidOperation, TypeError, ValueError):
             logger.warning("INVALID CHAINLINK TWAP UPDATE | payload=%r", payload)
-            return
+            return None
         self._append(
             product_id,
             UnderlyingTick(
@@ -131,6 +136,7 @@ class ChainlinkTwapFeed:
                 source="CHAINLINK_TWAP_60S",
             ),
         )
+        return timestamp_ms / 1000
 
     async def _heartbeat(self, ws: object) -> None:
         while True:
@@ -158,10 +164,32 @@ class ChainlinkTwapFeed:
                         self.product_ids,
                     )
                     delay = 1.0
+                    last_fresh_update_at = monotonic()
                     try:
-                        async for raw in ws:
+                        while not self._stopping:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), timeout=self._stale_timeout_seconds
+                                )
+                            except TimeoutError as exc:
+                                raise RuntimeError(
+                                    "Chainlink TWAP socket received no messages"
+                                ) from exc
                             if isinstance(raw, str):
-                                self._handle_message(raw)
+                                source_timestamp = self._handle_message(raw)
+                                if (
+                                    source_timestamp is not None
+                                    and unix_time() - source_timestamp
+                                    <= self._stale_timeout_seconds
+                                ):
+                                    last_fresh_update_at = monotonic()
+                            if (
+                                monotonic() - last_fresh_update_at
+                                > self._stale_timeout_seconds
+                            ):
+                                raise RuntimeError(
+                                    "Chainlink TWAP updates became stale while socket stayed open"
+                                )
                     finally:
                         heartbeat.cancel()
                         with suppress(asyncio.CancelledError):
