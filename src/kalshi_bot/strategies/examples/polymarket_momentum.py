@@ -51,6 +51,8 @@ class PolymarketMomentumStrategy:
         take_profit: int = 98,
         minimum_history: float = 45.0,
         minimum_separation_bps: float = 4.0,
+        minimum_entry_price: int = 50,
+        maximum_entry_price: int = 65,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
         final_entry_seconds: float = 60.0,
@@ -65,9 +67,10 @@ class PolymarketMomentumStrategy:
         self.decision_window = decision_window
         self.final_entry_seconds = max(0.0, final_entry_seconds)
         self.drawdown_limit_cents = drawdown_limit_cents
-        # Compatibility attributes used by the Polymarket execution engine.
-        self.minimum_entry_price = 1
-        self.maximum_entry_price = 99
+        self.minimum_entry_price = max(1, min(99, minimum_entry_price))
+        self.maximum_entry_price = max(
+            self.minimum_entry_price, min(99, maximum_entry_price)
+        )
         self.evaluation_interval = 1.0
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
@@ -210,6 +213,15 @@ class PolymarketMomentumStrategy:
                 seconds_left,
                 target,
                 "NO_EXECUTABLE_ASK",
+            )
+            return None
+        if ask < self.minimum_entry_price or ask > self.maximum_entry_price:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                f"ENTRY_PRICE_OUTSIDE_RANGE | predicted={side.value} | ask={ask}c "
+                f"range={self.minimum_entry_price}-{self.maximum_entry_price}c",
             )
             return None
         limit_price = min(99, ask + self.entry_slippage_cents)
