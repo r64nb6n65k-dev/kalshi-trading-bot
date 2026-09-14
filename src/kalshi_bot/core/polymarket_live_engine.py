@@ -330,8 +330,8 @@ class PolymarketLiveEngine:
         self.poll_interval = max(0.25, poll_interval)
         self.execution_window_seconds = max(0.5, execution_window_seconds)
         self.live_enabled = live_enabled and _env_bool("POLY_LIVE")
-        # Use the strategy's tested price band as the single source of truth.
-        # Stale deployment variables must not silently change live execution.
+        # The old 50-75c band is gone. This is only the strategy's technical
+        # ceiling; every signal carries its own probability-derived max price.
         self.maximum_entry_price = self.strategy.maximum_entry_price
         self.auto_redeem = os.getenv("POLY_AUTO_REDEEM", "true").strip().lower() in {
             "1",
@@ -521,6 +521,8 @@ class PolymarketLiveEngine:
                 if quote is None:
                     return False
                 ask, limit, depth = quote
+                live_edge = pending.signal.model_probability * 100.0 - ask
+                live_required_edge = self.strategy._required_edge_cents(ask)
                 record_model_snapshot(
                     ticker=pending.listing.slug,
                     seconds_left=pending.listing.close_time - now,
@@ -530,19 +532,11 @@ class PolymarketLiveEngine:
                     decision=f"CLOB_QUOTE_{pending.signal.side.value.upper()}",
                     reason=(
                         f"fresh_clob_ask={ask}c | limit={limit}c | "
-                        f"minimum={self.strategy.minimum_entry_price}c | "
-                        f"maximum={maximum_entry_price}c | depth={depth:.4f}"
+                        f"p_side={pending.signal.model_probability:.3f} | "
+                        f"edge={live_edge:+.2f}c | required_edge={live_required_edge:.2f}c | "
+                        f"model_maximum={maximum_entry_price}c | depth={depth:.4f}"
                     ),
                 )
-                if ask < self.strategy.minimum_entry_price:
-                    logger.warning(
-                        "LIVE WAIT | ticker=%s | reason=FRESH_CLOB_ASK_BELOW_MIN "
-                        "| ask=%dc | minimum=%dc",
-                        pending.listing.slug,
-                        ask,
-                        self.strategy.minimum_entry_price,
-                    )
-                    return False
                 if ask > maximum_entry_price:
                     logger.warning(
                         "LIVE CANCEL | ticker=%s | reason=FRESH_CLOB_ASK_ABOVE_MAX "
@@ -723,7 +717,7 @@ class PolymarketLiveEngine:
         await self._redeem_wallet_positions(time.time(), force=True)
         logger.warning(
             "POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED | strategy_version=%s "
-            "| contracts=%d | entry=%dc-%dc | take_profit=%dc | "
+            "| contracts=%d | entry_gate=MODEL_PROBABILITY_EDGE | technical_bounds=%dc-%dc | take_profit=%dc | "
             "stop_loss_gap=%dc | stop_loss_confirmations=%d/%ss | "
             "market_selection=ALL_CRYPTO",
             STRATEGY_VERSION,
