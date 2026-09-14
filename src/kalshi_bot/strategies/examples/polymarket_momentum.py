@@ -67,6 +67,7 @@ class PolymarketMomentumStrategy:
         signal_confirmations: int = 2,
         signal_confirmation_seconds: float = 2.0,
         max_probability_deterioration: float = 0.05,
+        minimum_probability_margin: float = 0.08,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -96,6 +97,11 @@ class PolymarketMomentumStrategy:
         self.signal_confirmations = max(1, signal_confirmations)
         self.signal_confirmation_seconds = max(0.0, signal_confirmation_seconds)
         self.max_probability_deterioration = max(0.0, max_probability_deterioration)
+        # Live data shows model confidence barely above the required bar is
+        # close to a coin flip (~50% win rate), while confidence clearing the
+        # bar by 10+ points wins ~71%. Require a real cushion above the bar,
+        # not just any positive margin, before a signal is tradeable.
+        self.minimum_probability_margin = max(0.0, min(0.49, minimum_probability_margin))
 
         self.evaluation_interval = 1.0
         self.decided: set[str] = set()
@@ -247,9 +253,9 @@ class PolymarketMomentumStrategy:
         because a single loss carries much more downside than the remaining upside.
         """
         if entry_price < 60:
-            return max(self.minimum_model_probability, 0.62)
+            return max(self.minimum_model_probability, 0.55)
         if entry_price < 70:
-            return max(self.minimum_model_probability, 0.62)
+            return max(self.minimum_model_probability, 0.58)
         if entry_price < 80:
             return max(self.minimum_model_probability, 0.62)
         if entry_price < 90:
@@ -265,7 +271,7 @@ class PolymarketMomentumStrategy:
     def _maximum_price_for_probability(self, probability: float) -> int:
         max_price = 0
         for price in range(self.minimum_entry_price, self.maximum_entry_price + 1):
-            if probability >= self._required_probability(price):
+            if probability >= self._required_probability(price) + self.minimum_probability_margin:
                 max_price = price
         return max_price
 
@@ -486,9 +492,10 @@ class PolymarketMomentumStrategy:
             return None
 
         required_probability = self._required_probability(ask)
+        required_with_margin = required_probability + self.minimum_probability_margin
         edge_cents = model_probability * 100.0 - ask
         maximum_entry_price = self._maximum_price_for_probability(model_probability)
-        if model_probability < required_probability or maximum_entry_price < self.minimum_entry_price:
+        if model_probability < required_with_margin or maximum_entry_price < self.minimum_entry_price:
             self._snapshot_retryable(
                 listing,
                 seconds_left,
@@ -496,6 +503,7 @@ class PolymarketMomentumStrategy:
                 (
                     f"PRICE_ADJUSTED_CONFIDENCE_TOO_LOW | predicted={side.value} ask={ask}c "
                     f"p_side={model_probability:.3f} required_p={required_probability:.3f} "
+                    f"required_with_margin={required_with_margin:.3f} "
                     f"market_edge={edge_cents:+.2f}c max_confidence_price={maximum_entry_price}c | {detail}"
                 ),
             )
@@ -556,7 +564,8 @@ class PolymarketMomentumStrategy:
             f"BUY_{side.value.upper()}",
             (
                 f"p_side={model_probability:.3f} ask={ask}c market_edge={edge_cents:+.2f}c "
-                f"required_p={required_probability:.3f} max_confidence_price={maximum_entry_price}c "
+                f"required_p={required_probability:.3f} required_with_margin={required_with_margin:.3f} "
+                f"max_confidence_price={maximum_entry_price}c "
                 f"probability_confirmed={streak}/{self.signal_confirmations} | {detail}"
             ),
         )
@@ -673,10 +682,20 @@ class PolymarketMomentumStrategy:
         if position is None:
             return None
         bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
-        if bid is None:
+        ask = listing.yes_ask if position.side is Side.YES else listing.no_ask
+        # A vanished bid (no resting buy orders) is not "no information" --
+        # in a fast-resolving market it usually means the book has cleared
+        # out because the outcome is becoming obvious against us. Previously
+        # a missing bid caused this method to return early without even
+        # resetting the streak, freezing the stop indefinitely and letting
+        # the position ride unprotected all the way to settlement. Fall back
+        # to the ask (still live even when the bid disappears) so the stop
+        # keeps evaluating instead of going inert.
+        effective_price = bid if bid is not None else ask
+        if effective_price is None:
             return None
         threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
-        if bid > threshold:
+        if effective_price > threshold:
             self._stop_streak[listing.slug] = 0
             return None
         last = self._stop_last_confirmed_at.get(listing.slug)
@@ -687,7 +706,9 @@ class PolymarketMomentumStrategy:
         self._stop_streak[listing.slug] = streak
         if streak < self.stop_loss_confirmations:
             return None
-        return max(1, bid - 1)
+        # If we only have an ask (no bid to sell into), exit at that price
+        # rather than subtracting a cent we have no basis for.
+        return max(1, effective_price - 1) if bid is not None else max(1, effective_price)
 
     def close_position(self, slug: str, exit_price: int, reason: str, now: float) -> None:
         position = self.positions.pop(slug, None)
