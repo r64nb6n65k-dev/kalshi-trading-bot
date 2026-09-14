@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-focused-exhaustion-v15"
+STRATEGY_VERSION = "poly-5m-focused-exhaustion-v16-stoploss-exposure-cap"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +36,7 @@ class SimPosition:
     side: Side
     entry_price: int
     count: int
+    close_time: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,10 @@ class PolymarketMomentumStrategy:
         market_exhaustion_momentum_bps: float = 1.5,
         preferred_entry_start_seconds: float = 210.0,
         preferred_entry_end_seconds: float = 150.0,
+        stop_loss_gap_cents: int = 15,
+        stop_loss_confirmations: int = 3,
+        stop_loss_confirmation_seconds: float = 6.0,
+        max_concurrent_correlated: int = 1,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -116,8 +121,29 @@ class PolymarketMomentumStrategy:
             preferred_entry_start_seconds,
         )
         self.preferred_entry_end_seconds = max(0.0, preferred_entry_end_seconds)
+
+        # Stop-loss: exit is NOT triggered by a single adverse tick. The bid
+        # must stay at or below (entry_price - stop_loss_gap_cents) for
+        # `stop_loss_confirmations` separate reads, each read separated by at
+        # least `stop_loss_confirmation_seconds`, before we cut the position.
+        # This is what protects against the 5-min market jitter that was
+        # stopping out trades that would have recovered, while still capping
+        # the loss on a genuinely adverse move instead of riding it to zero.
+        self.stop_loss_gap_cents = max(1, stop_loss_gap_cents)
+        self.stop_loss_confirmations = max(1, stop_loss_confirmations)
+        self.stop_loss_confirmation_seconds = max(0.0, stop_loss_confirmation_seconds)
+
+        # Correlated exposure cap: BTC/ETH/SOL/XRP 5-minute markets that
+        # settle at the same close_time move together. Without this, "four
+        # independent trades" is really one leveraged directional bet wearing
+        # four hats. Default of 1 means only one position open per shared
+        # settlement window across all assets.
+        self.max_concurrent_correlated = max(1, max_concurrent_correlated)
+
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
+        self._stop_streak: dict[str, int] = {}
+        self._stop_last_confirmed_at: dict[str, float] = {}
         self._last_retry_reason: dict[str, str] = {}
         self._last_evaluation_at: dict[str, float] = {}
         self._candidate_side: dict[str, Side] = {}
@@ -658,6 +684,8 @@ class PolymarketMomentumStrategy:
         block = self.entry_block_reason(now)
         if self.reserved_cents() + limit_price * self.contracts > self.bankroll_cents:
             block = "BANKROLL_CAP"
+        if self.correlated_positions_open(listing) >= self.max_concurrent_correlated:
+            block = "CORRELATED_EXPOSURE_CAP"
         if block:
             self._snapshot_retryable(
                 listing,
@@ -760,7 +788,14 @@ class PolymarketMomentumStrategy:
         self._prediction_memory.pop(listing.slug, None)
         self._preferred_side.pop(listing.slug, None)
         self._contrarian_side.pop(listing.slug, None)
-        position = SimPosition(side=side, entry_price=price, count=actual_count)
+        self._stop_streak.pop(listing.slug, None)
+        self._stop_last_confirmed_at.pop(listing.slug, None)
+        position = SimPosition(
+            side=side,
+            entry_price=price,
+            count=actual_count,
+            close_time=listing.close_time,
+        )
         self.positions[listing.slug] = position
         record_entry(
             ticker=listing.slug,
@@ -774,6 +809,8 @@ class PolymarketMomentumStrategy:
 
     def close_position(self, slug: str, exit_price: int, reason: str, now: float) -> None:
         position = self.positions.pop(slug, None)
+        self._stop_streak.pop(slug, None)
+        self._stop_last_confirmed_at.pop(slug, None)
         if position is None:
             return
         pnl = (exit_price - position.entry_price) * position.count
@@ -787,6 +824,57 @@ class PolymarketMomentumStrategy:
             count=position.count,
             pnl_cents=pnl,
             total_pnl_cents=self.total_pnl_cents,
+        )
+
+    def stop_loss_exit_price(
+        self, listing: PolymarketListing, now: float
+    ) -> int | None:
+        """Return a sell price if a confirmed stop-loss should fire, else None.
+
+        Deliberately NOT a single-tick trigger. A single bad print in a 5-min
+        market is often noise, not information. We only cut the position once
+        the bid has stayed at/under the stop threshold for
+        `stop_loss_confirmations` reads that are each at least
+        `stop_loss_confirmation_seconds` apart, so the position has to be
+        underwater for a real stretch of wall-clock time before we act.
+        """
+        position = self.positions.get(listing.slug)
+        if position is None:
+            return None
+        bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
+        if bid is None:
+            return None
+        stop_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        if bid > stop_threshold:
+            self._stop_streak[listing.slug] = 0
+            return None
+        last_confirmed = self._stop_last_confirmed_at.get(listing.slug)
+        if (
+            last_confirmed is not None
+            and now - last_confirmed < self.stop_loss_confirmation_seconds
+        ):
+            # Same adverse stretch, but too soon after the last confirmed
+            # read to count as an independent observation.
+            return None
+        self._stop_last_confirmed_at[listing.slug] = now
+        streak = self._stop_streak.get(listing.slug, 0) + 1
+        self._stop_streak[listing.slug] = streak
+        if streak < self.stop_loss_confirmations:
+            return None
+        # Confirmed: exit at (or just under) the current bid so the order
+        # actually fills, rather than dumping at a fixed floor price.
+        return max(1, bid - 1)
+
+    def correlated_positions_open(self, listing: PolymarketListing) -> int:
+        """Count open positions settling in the same window as `listing`.
+
+        BTC/ETH/SOL/XRP 5-minute markets sharing a close_time move together;
+        this is used to cap how many of them can be open at once.
+        """
+        return sum(
+            1
+            for slug, position in self.positions.items()
+            if slug != listing.slug and abs(position.close_time - listing.close_time) < 1.0
         )
 
     def prune(self, keep: set[str]) -> None:
@@ -819,4 +907,10 @@ class PolymarketMomentumStrategy:
         }
         self._contrarian_side = {
             slug: contrarian for slug, contrarian in self._contrarian_side.items() if slug in keep
+        }
+        self._stop_streak = {
+            slug: streak for slug, streak in self._stop_streak.items() if slug in keep
+        }
+        self._stop_last_confirmed_at = {
+            slug: at for slug, at in self._stop_last_confirmed_at.items() if slug in keep
         }
