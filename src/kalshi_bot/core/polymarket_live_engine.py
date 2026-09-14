@@ -754,6 +754,10 @@ class PolymarketLiveEngine:
                     self._known.update({x.slug: x for x in listings})
                     await self._settle_missing({x.slug for x in listings}, now)
                     for listing in listings:
+                        if listing.slug in self.strategy.positions:
+                            self.strategy.log_open_position(
+                                listing, self._target(listing), now
+                            )
                         await self._take_profit(listing, now)
                         await self._stop_loss(listing, now)
                         pending = self._pending.get(listing.slug)
