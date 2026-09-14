@@ -247,9 +247,9 @@ class PolymarketMomentumStrategy:
         because a single loss carries much more downside than the remaining upside.
         """
         if entry_price < 60:
-            return max(self.minimum_model_probability, 0.55)
+            return max(self.minimum_model_probability, 0.62)
         if entry_price < 70:
-            return max(self.minimum_model_probability, 0.58)
+            return max(self.minimum_model_probability, 0.62)
         if entry_price < 80:
             return max(self.minimum_model_probability, 0.62)
         if entry_price < 90:
