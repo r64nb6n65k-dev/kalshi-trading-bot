@@ -111,9 +111,14 @@ class PolymarketMomentumStrategy:
         self._signal_last_confirmed_at: dict[str, float] = {}
         self._signal_probability: dict[str, float] = {}
 
-        # Retain the existing confirmed entry-relative stop unchanged.
+        # Stop-loss: react on the first confirmation instead of waiting for
+        # three (previously stop_loss_confirmations = 3). In fast-moving 5-min
+        # markets, requiring 3 confirmations spaced 6s apart let price keep
+        # falling during the confirmation window, causing exits well below the
+        # intended 15c threshold (avg ~19c extra slippage, worst case ~56c
+        # observed in live trading). Gap and confirmation spacing are unchanged.
         self.stop_loss_gap_cents = 15
-        self.stop_loss_confirmations = 3
+        self.stop_loss_confirmations = 1
         self.stop_loss_confirmation_seconds = 6.0
         self._stop_streak: dict[str, int] = {}
         self._stop_last_confirmed_at: dict[str, float] = {}
@@ -660,7 +665,7 @@ class PolymarketMomentumStrategy:
     def stop_loss_exit_price(
         self, listing: PolymarketListing, now: float
     ) -> int | None:
-        """Trigger the retained 15-cent stop after three confirmations."""
+        """Trigger the retained 15-cent stop after the first confirmation."""
         position = self.positions.get(listing.slug)
         if position is None:
             return None
