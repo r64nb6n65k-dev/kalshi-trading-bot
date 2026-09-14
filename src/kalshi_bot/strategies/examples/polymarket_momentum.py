@@ -111,15 +111,18 @@ class PolymarketMomentumStrategy:
         self._signal_last_confirmed_at: dict[str, float] = {}
         self._signal_probability: dict[str, float] = {}
 
-        # Stop-loss: react on the first confirmation instead of waiting for
-        # three (previously stop_loss_confirmations = 3). In fast-moving 5-min
-        # markets, requiring 3 confirmations spaced 6s apart let price keep
-        # falling during the confirmation window, causing exits well below the
-        # intended 15c threshold (avg ~19c extra slippage, worst case ~56c
-        # observed in live trading). Gap and confirmation spacing are unchanged.
+        # Stop-loss: require two confirmations spaced ~1s apart instead of
+        # three spaced 6s apart (previously confirmations=3, seconds=6.0).
+        # A single-confirmation stop (confirmations=1) reacted to one-tick
+        # noise and closed positions that would have recovered above the
+        # threshold. Two quick confirmations filter that noise out while
+        # still exiting in ~1-2s instead of the original 12-18s, which was
+        # letting price keep falling during the confirmation window (avg
+        # ~19c extra slippage beyond the intended 15c threshold, worst case
+        # ~56c observed in live trading).
         self.stop_loss_gap_cents = 15
-        self.stop_loss_confirmations = 1
-        self.stop_loss_confirmation_seconds = 6.0
+        self.stop_loss_confirmations = 2
+        self.stop_loss_confirmation_seconds = 1.0
         self._stop_streak: dict[str, int] = {}
         self._stop_last_confirmed_at: dict[str, float] = {}
 
@@ -665,7 +668,7 @@ class PolymarketMomentumStrategy:
     def stop_loss_exit_price(
         self, listing: PolymarketListing, now: float
     ) -> int | None:
-        """Trigger the retained 15-cent stop after the first confirmation."""
+        """Trigger the retained 15-cent stop after two quick confirmations."""
         position = self.positions.get(listing.slug)
         if position is None:
             return None
