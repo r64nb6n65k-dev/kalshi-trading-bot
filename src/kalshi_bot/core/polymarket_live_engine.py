@@ -522,7 +522,7 @@ class PolymarketLiveEngine:
                     return False
                 ask, limit, depth = quote
                 live_edge = pending.signal.model_probability * 100.0 - ask
-                live_required_edge = self.strategy._required_edge_cents(ask)
+                live_required_probability = self.strategy._required_probability(ask)
                 record_model_snapshot(
                     ticker=pending.listing.slug,
                     seconds_left=pending.listing.close_time - now,
@@ -533,13 +533,23 @@ class PolymarketLiveEngine:
                     reason=(
                         f"fresh_clob_ask={ask}c | limit={limit}c | "
                         f"p_side={pending.signal.model_probability:.3f} | "
-                        f"edge={live_edge:+.2f}c | required_edge={live_required_edge:.2f}c | "
-                        f"model_maximum={maximum_entry_price}c | depth={depth:.4f}"
+                        f"market_edge={live_edge:+.2f}c | required_p={live_required_probability:.3f} | "
+                        f"confidence_maximum={maximum_entry_price}c | depth={depth:.4f}"
                     ),
                 )
+                if pending.signal.model_probability < live_required_probability:
+                    logger.warning(
+                        "LIVE CANCEL | ticker=%s | reason=FRESH_PRICE_REQUIRES_MORE_CONFIDENCE "
+                        "| ask=%dc | p_side=%.3f | required_p=%.3f",
+                        pending.listing.slug,
+                        ask,
+                        pending.signal.model_probability,
+                        live_required_probability,
+                    )
+                    return True
                 if ask > maximum_entry_price:
                     logger.warning(
-                        "LIVE CANCEL | ticker=%s | reason=FRESH_CLOB_ASK_ABOVE_MAX "
+                        "LIVE CANCEL | ticker=%s | reason=FRESH_CLOB_ASK_ABOVE_CONFIDENCE_MAX "
                         "| ask=%dc | maximum=%dc",
                         pending.listing.slug,
                         ask,
@@ -717,7 +727,7 @@ class PolymarketLiveEngine:
         await self._redeem_wallet_positions(time.time(), force=True)
         logger.warning(
             "POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED | strategy_version=%s "
-            "| contracts=%d | entry_gate=MODEL_PROBABILITY_EDGE | technical_bounds=%dc-%dc | take_profit=%dc | "
+            "| contracts=%d | entry_gate=PRICE_ADJUSTED_CONFIDENCE | technical_bounds=%dc-%dc | take_profit=%dc | "
             "stop_loss_gap=%dc | stop_loss_confirmations=%d/%ss | "
             "market_selection=ALL_CRYPTO",
             STRATEGY_VERSION,
