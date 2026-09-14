@@ -60,7 +60,7 @@ class PolymarketMomentumStrategy:
         minimum_entry_price: int = 50,
         maximum_entry_price: int = 65,
         minimum_history: float = 45.0,
-        confirmations: int = 2,
+        confirmations: int = 1,
         confirmation_seconds: float = 2.0,
         evaluation_interval: float = 2.0,
         maximum_tick_age_seconds: float = 12.0,
@@ -446,44 +446,13 @@ class PolymarketMomentumStrategy:
             momentum_60_bps=momentum_60_bps,
         )
 
+        # Exhaustion/contrarian override disabled: it was reversing the
+        # model's own raw directional read (see STRATEGY_VERSION history)
+        # and then locking that reversal in for the rest of the market's
+        # life via _contrarian_side. We now always trade the raw read.
         override_reasons: list[str] = []
-        if (
-            self.exhaustion_reference_60_bps
-            <= aligned_reference_60
-            <= self.maximum_exhaustion_reference_60_bps
-        ):
-            override_reasons.append("EXTENDED_REFERENCE_60")
-        if self._market_exhaustion(listing, now, raw_side):
-            override_reasons.append("SYNCHRONIZED_MARKET_EXHAUSTION")
-        if override_reasons and self._memory_reversal(history, raw_side):
-            override_reasons.append("MEMORY_CONFIRMED_EXHAUSTION")
-
-        locked_contrarian = self._contrarian_side.get(listing.slug)
-        if locked_contrarian is not None:
-            side, selected_probability, locked_reason = locked_contrarian
-            override_reasons = [f"LOCKED_{locked_reason}"]
-        elif override_reasons:
-            side = self._opposite(raw_side)
-            # Calibrated conservatively below the in-sample reversal rate.  The
-            # stronger the overextension and the more independent warnings,
-            # the more room the contrarian entry has beneath the 65c cap.
-            selected_probability = min(
-                0.78,
-                max(
-                    0.62,
-                    0.62
-                    + 0.015 * max(0.0, aligned_reference_60 - self.exhaustion_reference_60_bps)
-                    + 0.02 * (len(override_reasons) - 1),
-                ),
-            )
-            self._contrarian_side[listing.slug] = (
-                side,
-                selected_probability,
-                ",".join(override_reasons),
-            )
-        else:
-            side = raw_side
-            selected_probability = raw_selected_probability
+        side = raw_side
+        selected_probability = raw_selected_probability
 
         seconds_left = max(1.0, listing.close_time - now)
         if self.preferred_entry_end_seconds <= seconds_left <= self.preferred_entry_start_seconds:
