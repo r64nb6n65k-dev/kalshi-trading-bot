@@ -157,6 +157,14 @@ class PolymarketMomentumStrategy:
         if s120 * s30 < 0: regime = "RETRACE" if retrace else "REVERSAL"
         elif efficiency < .12: regime = "RANGE"
         selected = up if side is Side.YES else 1 - up
+        # Narrow veto for marginal forecasts whose target, spot, and trend
+        # disagree. Strong signals continue to trade; the confirmed stop is
+        # unchanged.
+        directions = (sep, move, r10 + r30, s30)
+        votes = sum(1 if value > 0 else -1 if value < 0 else 0 for value in directions)
+        agreement = votes if side is Side.YES else -votes
+        if confidence < 60.0 and agreement < 2:
+            return None, f"CONFLICTING_DIRECTIONAL_SIGNAL | confidence={confidence:.1f} | agreement={agreement}/4", selected
         detail = (f"reference={lr.price:.6f} reference_source={lr.source} spot={ls.price:.6f} spot_source={ls.source} target={target:.6f} "
                   f"predicted={side.value} confidence={confidence:.1f} model_up={up*100:.1f} projected_finish_bps={projected:+.2f} expected_noise_bps={noise:.2f} regime={regime} "
                   f"reference_separation_bps={sep:+.2f} spot_move_bps={move:+.2f} reference_10_bps={r10:+.2f} reference_30_bps={r30:+.2f} reference_60_bps={r60:+.2f} "
