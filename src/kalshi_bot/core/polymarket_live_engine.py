@@ -646,6 +646,35 @@ class PolymarketLiveEngine:
             self.strategy.close_position(listing.slug, fill, "TAKE_PROFIT_98", now)
             logger.warning("POLYMARKET LIVE EXIT | ticker=%s | fill=%dc", listing.slug, fill)
 
+    async def _stop_loss(self, listing: PolymarketListing, now: float) -> None:
+        position = self.strategy.positions.get(listing.slug)
+        if position is None or listing.slug in self._exit_uncertain:
+            return
+        exit_price = self.strategy.stop_loss_exit_price(listing, now)
+        if exit_price is None:
+            return
+        try:
+            order = await self.trading_client.build_limit_order(
+                listing,
+                position.side,
+                action="SELL",
+                price_cents=exit_price,
+                shares=position.count,
+            )
+            response = await self.trading_client.post_fok(order)
+        except Exception as exc:
+            if self._no_fill_exception(exc):
+                return
+            self._exit_uncertain.add(listing.slug)
+            logger.exception("EXIT RESPONSE UNCERTAIN | ticker=%s", listing.slug)
+            return
+        if self._ok(response) and self._status(response) == "matched":
+            fill = _fill_cents(response, "SELL", exit_price)
+            self.strategy.close_position(listing.slug, fill, "CONFIRMED_STOP_LOSS", now)
+            logger.warning(
+                "POLYMARKET LIVE STOP LOSS | ticker=%s | fill=%dc", listing.slug, fill
+            )
+
     async def _settle_missing(self, active: set[str], now: float) -> None:
         for slug in set(self.strategy.positions) - active:
             listing = self._known.get(slug)
@@ -694,12 +723,18 @@ class PolymarketLiveEngine:
         await self._redeem_wallet_positions(time.time(), force=True)
         logger.warning(
             "POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED | strategy_version=%s "
-            "| contracts=%d | entry=%dc-%dc | take_profit=%dc",
+            "| contracts=%d | entry=%dc-%dc | take_profit=%dc | "
+            "stop_loss_gap=%dc | stop_loss_confirmations=%d/%ss | "
+            "max_concurrent_correlated=%d",
             STRATEGY_VERSION,
             self.strategy.contracts,
             self.strategy.minimum_entry_price,
             self.strategy.maximum_entry_price,
             self.strategy.take_profit,
+            self.strategy.stop_loss_gap_cents,
+            self.strategy.stop_loss_confirmations,
+            self.strategy.stop_loss_confirmation_seconds,
+            self.strategy.max_concurrent_correlated,
         )
         await self.feed.start()
         await self.reference_feed.start()
@@ -720,6 +755,7 @@ class PolymarketLiveEngine:
                     await self._settle_missing({x.slug for x in listings}, now)
                     for listing in listings:
                         await self._take_profit(listing, now)
+                        await self._stop_loss(listing, now)
                         pending = self._pending.get(listing.slug)
                         if pending:
                             if await self._submit(pending, now):
