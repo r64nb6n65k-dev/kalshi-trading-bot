@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-exhaustion-memory-v14"
+STRATEGY_VERSION = "poly-5m-focused-exhaustion-v15"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +70,7 @@ class PolymarketMomentumStrategy:
         signal_memory_size: int = 4,
         signal_memory_interval_seconds: float = 8.0,
         exhaustion_reference_60_bps: float = 4.0,
+        maximum_exhaustion_reference_60_bps: float = 5.5,
         market_exhaustion_reference_bps: float = 3.0,
         market_exhaustion_momentum_bps: float = 1.5,
         preferred_entry_start_seconds: float = 210.0,
@@ -104,6 +105,10 @@ class PolymarketMomentumStrategy:
         self.signal_memory_size = max(4, signal_memory_size)
         self.signal_memory_interval_seconds = max(2.0, signal_memory_interval_seconds)
         self.exhaustion_reference_60_bps = max(0.5, exhaustion_reference_60_bps)
+        self.maximum_exhaustion_reference_60_bps = max(
+            self.exhaustion_reference_60_bps,
+            maximum_exhaustion_reference_60_bps,
+        )
         self.market_exhaustion_reference_bps = max(0.5, market_exhaustion_reference_bps)
         self.market_exhaustion_momentum_bps = max(0.0, market_exhaustion_momentum_bps)
         self.preferred_entry_start_seconds = max(
@@ -416,12 +421,16 @@ class PolymarketMomentumStrategy:
         )
 
         override_reasons: list[str] = []
-        if aligned_reference_60 >= self.exhaustion_reference_60_bps:
+        if (
+            self.exhaustion_reference_60_bps
+            <= aligned_reference_60
+            <= self.maximum_exhaustion_reference_60_bps
+        ):
             override_reasons.append("EXTENDED_REFERENCE_60")
-        if self._memory_reversal(history, raw_side):
-            override_reasons.append("UNSTABLE_4_SNAPSHOT_SIGNAL")
         if self._market_exhaustion(listing, now, raw_side):
             override_reasons.append("SYNCHRONIZED_MARKET_EXHAUSTION")
+        if override_reasons and self._memory_reversal(history, raw_side):
+            override_reasons.append("MEMORY_CONFIRMED_EXHAUSTION")
 
         locked_contrarian = self._contrarian_side.get(listing.slug)
         if locked_contrarian is not None:
@@ -453,11 +462,6 @@ class PolymarketMomentumStrategy:
         seconds_left = max(1.0, listing.close_time - now)
         if self.preferred_entry_end_seconds <= seconds_left <= self.preferred_entry_start_seconds:
             self._preferred_side[listing.slug] = (side, selected_probability)
-        elif seconds_left < self.preferred_entry_end_seconds:
-            preferred = self._preferred_side.get(listing.slug)
-            if not override_reasons and preferred is not None and preferred[0] is not side:
-                side, selected_probability = preferred
-                override_reasons.append("PREFERRED_WINDOW_DIRECTION_LOCK")
 
         up_probability = selected_probability if side is Side.YES else 1 - selected_probability
         confidence = 100 * selected_probability
