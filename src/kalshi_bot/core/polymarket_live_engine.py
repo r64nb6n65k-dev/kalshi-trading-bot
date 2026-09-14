@@ -725,7 +725,7 @@ class PolymarketLiveEngine:
             "POLYMARKET LIVE STARTED | LIVE_ORDERS=ENABLED | strategy_version=%s "
             "| contracts=%d | entry=%dc-%dc | take_profit=%dc | "
             "stop_loss_gap=%dc | stop_loss_confirmations=%d/%ss | "
-            "max_concurrent_correlated=%d",
+            "market_selection=ALL_CRYPTO",
             STRATEGY_VERSION,
             self.strategy.contracts,
             self.strategy.minimum_entry_price,
@@ -734,7 +734,6 @@ class PolymarketLiveEngine:
             self.strategy.stop_loss_gap_cents,
             self.strategy.stop_loss_confirmations,
             self.strategy.stop_loss_confirmation_seconds,
-            self.strategy.max_concurrent_correlated,
         )
         await self.feed.start()
         await self.reference_feed.start()
