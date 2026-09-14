@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
-from statistics import fmean, pstdev
+from statistics import fmean, median, pstdev
 
 from kalshi_bot.dashboard import record_entry, record_exit, record_model_snapshot
 from kalshi_bot.exchange.models import Side
@@ -18,7 +19,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-chainlink-forecast-v13"
+STRATEGY_VERSION = "poly-5m-exhaustion-memory-v14"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,15 @@ class SimPosition:
     side: Side
     entry_price: int
     count: int
+
+
+@dataclass(frozen=True, slots=True)
+class MarketPulse:
+    observed_at: float
+    close_time: float
+    side: Side
+    reference_60_bps: float
+    momentum_60_bps: float
 
 
 class PolymarketMomentumStrategy:
@@ -57,6 +67,13 @@ class PolymarketMomentumStrategy:
         entry_slippage_cents: int = 2,
         final_entry_seconds: float = 60.0,
         minimum_model_edge: float = 0.02,
+        signal_memory_size: int = 4,
+        signal_memory_interval_seconds: float = 8.0,
+        exhaustion_reference_60_bps: float = 4.0,
+        market_exhaustion_reference_bps: float = 3.0,
+        market_exhaustion_momentum_bps: float = 1.5,
+        preferred_entry_start_seconds: float = 210.0,
+        preferred_entry_end_seconds: float = 150.0,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -84,6 +101,16 @@ class PolymarketMomentumStrategy:
         self.entry_slippage_cents = entry_slippage_cents
         self.final_entry_seconds = max(0.0, final_entry_seconds)
         self.minimum_model_edge = max(0.0, minimum_model_edge)
+        self.signal_memory_size = max(4, signal_memory_size)
+        self.signal_memory_interval_seconds = max(2.0, signal_memory_interval_seconds)
+        self.exhaustion_reference_60_bps = max(0.5, exhaustion_reference_60_bps)
+        self.market_exhaustion_reference_bps = max(0.5, market_exhaustion_reference_bps)
+        self.market_exhaustion_momentum_bps = max(0.0, market_exhaustion_momentum_bps)
+        self.preferred_entry_start_seconds = max(
+            preferred_entry_end_seconds,
+            preferred_entry_start_seconds,
+        )
+        self.preferred_entry_end_seconds = max(0.0, preferred_entry_end_seconds)
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
         self._last_retry_reason: dict[str, str] = {}
@@ -92,6 +119,10 @@ class PolymarketMomentumStrategy:
         self._candidate_readings: dict[str, int] = {}
         self._candidate_at: dict[str, float] = {}
         self._candidate_tick_at: dict[str, float] = {}
+        self._prediction_memory: dict[str, deque[tuple[float, Side]]] = {}
+        self._preferred_side: dict[str, tuple[Side, float]] = {}
+        self._contrarian_side: dict[str, tuple[Side, float, str]] = {}
+        self._market_pulses: dict[tuple[str, int], MarketPulse] = {}
         self.total_pnl_cents = 0
 
     @staticmethod
@@ -115,6 +146,55 @@ class PolymarketMomentumStrategy:
             if model_probability >= self.fee_adjusted_break_even(price) + self.minimum_model_edge
         ]
         return max(affordable, default=self.minimum_entry_price - 1)
+
+    @staticmethod
+    def _opposite(side: Side) -> Side:
+        return Side.NO if side is Side.YES else Side.YES
+
+    def _remember_prediction(self, slug: str, now: float, side: Side) -> tuple[Side, ...]:
+        history = self._prediction_memory.setdefault(
+            slug,
+            deque(maxlen=self.signal_memory_size),
+        )
+        if (
+            not history
+            or history[-1][1] is not side
+            or now - history[-1][0] >= self.signal_memory_interval_seconds
+        ):
+            history.append((now, side))
+        return tuple(row[1] for row in history)
+
+    def _memory_reversal(self, history: tuple[Side, ...], current: Side) -> bool:
+        """Identify the 3-to-1 late direction flip that lost 7 of 10 observed trades."""
+        if len(history) < 4:
+            return False
+        recent = history[-4:]
+        counts = Counter(recent)
+        return counts[current] == 3 and counts[self._opposite(current)] == 1
+
+    def _market_exhaustion(
+        self,
+        listing: PolymarketListing,
+        now: float,
+        current: Side,
+    ) -> bool:
+        """Detect a synchronized crypto move that is more likely exhausted than confirming."""
+        peers = [
+            pulse
+            for pulse in self._market_pulses.values()
+            if abs(pulse.close_time - listing.close_time) < 1.0
+            and now - pulse.observed_at <= 6.0
+            and pulse.side is current
+        ]
+        if len(peers) < 3:
+            return False
+        direction = 1.0 if current is Side.YES else -1.0
+        aligned_reference = [direction * pulse.reference_60_bps for pulse in peers]
+        aligned_momentum = [direction * pulse.momentum_60_bps for pulse in peers]
+        return (
+            median(aligned_reference) >= self.market_exhaustion_reference_bps
+            and median(aligned_momentum) >= self.market_exhaustion_momentum_bps
+        )
 
     @staticmethod
     def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
@@ -310,25 +390,87 @@ class PolymarketMomentumStrategy:
         chop_factor = max(0.55, 1.0 - 0.05 * crossings)
         efficiency_factor = 0.75 + 0.25 * min(1.0, efficiency / 0.35)
         projected_bps = raw_projection_bps * chop_factor * efficiency_factor
-        up_probability = max(
+        raw_up_probability = max(
             0.02,
             min(0.98, self._normal_cdf(projected_bps / expected_noise_bps)),
         )
-        side = Side.YES if up_probability >= 0.5 else Side.NO
-        confidence = 100 * (up_probability if side is Side.YES else 1 - up_probability)
+        raw_side = Side.YES if raw_up_probability >= 0.5 else Side.NO
+        raw_selected_probability = (
+            raw_up_probability if raw_side is Side.YES else 1 - raw_up_probability
+        )
         regime = "TREND"
         if slope_120 * slope_30 < 0:
             regime = "RETRACE" if retrace_projection else "REVERSAL"
         elif efficiency < 0.12:
             regime = "RANGE"
-        selected_probability = up_probability if side is Side.YES else 1 - up_probability
+
+        direction = 1.0 if raw_side is Side.YES else -1.0
+        aligned_reference_60 = direction * reference_60_bps
+        history = self._remember_prediction(listing.slug, now, raw_side)
+        self._market_pulses[(listing.asset, listing.interval_minutes)] = MarketPulse(
+            observed_at=now,
+            close_time=listing.close_time,
+            side=raw_side,
+            reference_60_bps=reference_60_bps,
+            momentum_60_bps=momentum_60_bps,
+        )
+
+        override_reasons: list[str] = []
+        if aligned_reference_60 >= self.exhaustion_reference_60_bps:
+            override_reasons.append("EXTENDED_REFERENCE_60")
+        if self._memory_reversal(history, raw_side):
+            override_reasons.append("UNSTABLE_4_SNAPSHOT_SIGNAL")
+        if self._market_exhaustion(listing, now, raw_side):
+            override_reasons.append("SYNCHRONIZED_MARKET_EXHAUSTION")
+
+        locked_contrarian = self._contrarian_side.get(listing.slug)
+        if locked_contrarian is not None:
+            side, selected_probability, locked_reason = locked_contrarian
+            override_reasons = [f"LOCKED_{locked_reason}"]
+        elif override_reasons:
+            side = self._opposite(raw_side)
+            # Calibrated conservatively below the in-sample reversal rate.  The
+            # stronger the overextension and the more independent warnings,
+            # the more room the contrarian entry has beneath the 65c cap.
+            selected_probability = min(
+                0.78,
+                max(
+                    0.62,
+                    0.62
+                    + 0.015 * max(0.0, aligned_reference_60 - self.exhaustion_reference_60_bps)
+                    + 0.02 * (len(override_reasons) - 1),
+                ),
+            )
+            self._contrarian_side[listing.slug] = (
+                side,
+                selected_probability,
+                ",".join(override_reasons),
+            )
+        else:
+            side = raw_side
+            selected_probability = raw_selected_probability
+
+        seconds_left = max(1.0, listing.close_time - now)
+        if self.preferred_entry_end_seconds <= seconds_left <= self.preferred_entry_start_seconds:
+            self._preferred_side[listing.slug] = (side, selected_probability)
+        elif seconds_left < self.preferred_entry_end_seconds:
+            preferred = self._preferred_side.get(listing.slug)
+            if not override_reasons and preferred is not None and preferred[0] is not side:
+                side, selected_probability = preferred
+                override_reasons.append("PREFERRED_WINDOW_DIRECTION_LOCK")
+
+        up_probability = selected_probability if side is Side.YES else 1 - selected_probability
+        confidence = 100 * selected_probability
 
         # Chainlink determines settlement.  Forecasting a side opposite the
         # current Chainlink-to-target position is not an executable signal;
         # keep watching until the settlement reference agrees.
         reference_direction = 1.0 if reference_separation_bps > 0 else -1.0
         predicted_direction = 1.0 if side is Side.YES else -1.0
-        if reference_separation_bps == 0 or reference_direction != predicted_direction:
+        if (
+            not override_reasons
+            and (reference_separation_bps == 0 or reference_direction != predicted_direction)
+        ):
             return (
                 None,
                 (
@@ -345,7 +487,9 @@ class PolymarketMomentumStrategy:
                 f"reference={latest_reference.price:.6f} "
                 f"reference_source={latest_reference.source} "
                 f"spot={latest_spot.price:.6f} spot_source={latest_spot.source} "
-                f"target={target:.6f} predicted={side.value} confidence={confidence:.1f} "
+                f"target={target:.6f} predicted={side.value} raw_predicted={raw_side.value} "
+                f"prediction_override={','.join(override_reasons) if override_reasons else 'NONE'} "
+                f"confidence={confidence:.1f} "
                 f"model_up={up_probability * 100:.1f} projected_finish_bps={projected_bps:+.2f} "
                 f"expected_noise_bps={expected_noise_bps:.2f} regime={regime} "
                 f"reference_separation_bps={reference_separation_bps:+.2f} "
@@ -609,6 +753,9 @@ class PolymarketMomentumStrategy:
         self._last_retry_reason.pop(listing.slug, None)
         self._last_evaluation_at.pop(listing.slug, None)
         self._clear_candidate(listing.slug)
+        self._prediction_memory.pop(listing.slug, None)
+        self._preferred_side.pop(listing.slug, None)
+        self._contrarian_side.pop(listing.slug, None)
         position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
@@ -659,4 +806,13 @@ class PolymarketMomentumStrategy:
         }
         self._candidate_tick_at = {
             slug: tick_at for slug, tick_at in self._candidate_tick_at.items() if slug in keep
+        }
+        self._prediction_memory = {
+            slug: history for slug, history in self._prediction_memory.items() if slug in keep
+        }
+        self._preferred_side = {
+            slug: preferred for slug, preferred in self._preferred_side.items() if slug in keep
+        }
+        self._contrarian_side = {
+            slug: contrarian for slug, contrarian in self._contrarian_side.items() if slug in keep
         }
