@@ -52,7 +52,7 @@ class PolymarketMomentumStrategy:
         minimum_history: float = 45.0,
         minimum_separation_bps: float = 4.0,
         minimum_entry_price: int = 50,
-        maximum_entry_price: int = 65,
+        maximum_entry_price: int = 75,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
         final_entry_seconds: float = 60.0,
