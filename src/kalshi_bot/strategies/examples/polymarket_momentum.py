@@ -16,7 +16,7 @@ from kalshi_bot.telemetry.logging import get_logger
 
 logger = get_logger(__name__)
 
-STRATEGY_VERSION = "poly-5m-chainlink-probability-edge-v3-stop-loss"
+STRATEGY_VERSION = "poly-5m-chainlink-price-confidence-v4-stop-loss"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +27,7 @@ class SimSignal:
     detail: str
     model_probability: float
     required_edge_cents: float
+    required_probability: float
     maximum_entry_price: int
 
 
@@ -61,11 +62,11 @@ class PolymarketMomentumStrategy:
         decision_window: float = 15.0,
         final_entry_seconds: float = 60.0,
         drawdown_limit_cents: int = 4_000,
-        minimum_model_probability: float = 0.60,
-        base_required_edge_cents: float = 4.0,
+        minimum_model_probability: float = 0.55,
+        base_required_edge_cents: float = 0.0,
         signal_confirmations: int = 2,
         signal_confirmation_seconds: float = 2.0,
-        max_probability_deterioration: float = 0.03,
+        max_probability_deterioration: float = 0.05,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -230,19 +231,33 @@ class PolymarketMomentumStrategy:
             return 1.0
         return max(0.25, min(4.0, recent_volume / baseline))
 
+    def _required_probability(self, entry_price: int) -> float:
+        """Minimum directional confidence required at a given contract price.
+
+        Cheap and mid-priced contracts can be entered on a modest directional
+        advantage. Expensive contracts require substantially stronger evidence
+        because a single loss carries much more downside than the remaining upside.
+        """
+        if entry_price < 60:
+            return max(self.minimum_model_probability, 0.55)
+        if entry_price < 70:
+            return max(self.minimum_model_probability, 0.58)
+        if entry_price < 80:
+            return max(self.minimum_model_probability, 0.62)
+        if entry_price < 90:
+            return max(self.minimum_model_probability, 0.72)
+        # Ninety-cent-plus entries are intentionally rare. A 90c loser erases
+        # several ordinary winners, so demand near-certainty from the model.
+        return max(self.minimum_model_probability, 0.94)
+
     def _required_edge_cents(self, entry_price: int) -> float:
-        """Demand more model advantage as downside grows at expensive prices."""
-        edge = self.base_required_edge_cents
-        if entry_price > 70:
-            edge += (entry_price - 70) * 0.20
-        if entry_price > 85:
-            edge += (entry_price - 85) * 0.25
-        return min(12.0, edge)
+        """Compatibility helper: edge is logged, but no longer gates entry."""
+        return 0.0
 
     def _maximum_price_for_probability(self, probability: float) -> int:
         max_price = 0
         for price in range(self.minimum_entry_price, self.maximum_entry_price + 1):
-            if probability * 100.0 - price >= self._required_edge_cents(price):
+            if probability >= self._required_probability(price):
                 max_price = price
         return max_price
 
@@ -256,27 +271,24 @@ class PolymarketMomentumStrategy:
     ) -> tuple[float | None, str]:
         if target <= 0:
             return None, "MISSING_OPENING_REFERENCE"
-        if len(ticks) < 2:
-            return None, "NO_COINBASE_HISTORY"
         if not reference_ticks:
             return None, "NO_CHAINLINK_TWAP_HISTORY"
 
-        latest_spot = ticks[-1]
         latest_ref = reference_ticks[-1]
-        first_time = ticks[0].timestamp.timestamp()
-        if now - latest_spot.timestamp.timestamp() > 5:
-            return None, "STALE_COINBASE_PRICE"
         if now - latest_ref.timestamp.timestamp() > 15:
             return None, "STALE_CHAINLINK_TWAP"
-        if now - first_time < self.minimum_history:
+
+        ref_first_time = reference_ticks[0].timestamp.timestamp()
+        spot_fresh = bool(ticks) and now - ticks[-1].timestamp.timestamp() <= 5
+        spot_history_ok = len(ticks) >= 2
+        history_start = min(
+            ref_first_time,
+            ticks[0].timestamp.timestamp() if ticks else ref_first_time,
+        )
+        if now - history_start < self.minimum_history:
             return None, "INSUFFICIENT_PRICE_HISTORY"
 
         separation_bps = (latest_ref.price - target) / target * 10_000
-
-        spot_30 = self._at_or_before(ticks, now - 30)
-        spot_60 = self._at_or_before(ticks, now - 60)
-        spot_momentum_30 = (latest_spot.price - spot_30.price) / target * 10_000
-        spot_momentum_60 = (latest_spot.price - spot_60.price) / target * 10_000
 
         if len(reference_ticks) >= 2:
             ref_60 = self._at_or_before(reference_ticks, now - 60)
@@ -284,17 +296,48 @@ class PolymarketMomentumStrategy:
         else:
             twap_momentum_60 = 0.0
 
-        sigma = self._realized_volatility_bps_per_sqrt_second(ticks, now)
-        volume_ratio = self._volume_ratio(ticks, now)
+        if spot_history_ok and spot_fresh:
+            latest_spot = ticks[-1]
+            spot_30 = self._at_or_before(ticks, now - 30)
+            spot_60 = self._at_or_before(ticks, now - 60)
+            spot_momentum_30 = (latest_spot.price - spot_30.price) / target * 10_000
+            spot_momentum_60 = (latest_spot.price - spot_60.price) / target * 10_000
+            sigma_source = ticks
+            volume_ratio = self._volume_ratio(ticks, now)
+            spot_price = latest_spot.price
+            spot_source = latest_spot.source
+            spot_status = "FRESH"
+            confidence_shrink = 0.85
+        else:
+            # Chainlink determines settlement, so a temporarily stale Coinbase
+            # helper feed should not kill an otherwise valid setup. Fall back to
+            # Chainlink-only direction/volatility and shrink confidence toward 50%.
+            spot_momentum_30 = 0.0
+            spot_momentum_60 = 0.0
+            sigma_source = reference_ticks if len(reference_ticks) >= 4 else ticks
+            volume_ratio = 1.0
+            spot_price = ticks[-1].price if ticks else float("nan")
+            spot_source = ticks[-1].source if ticks else "UNAVAILABLE"
+            spot_status = "STALE_FALLBACK_CHAINLINK" if ticks else "MISSING_FALLBACK_CHAINLINK"
+            confidence_shrink = 0.65
 
-        # Estimate a conservative drift from both the settlement feed and spot.
-        # Volume can strengthen a move slightly but cannot dominate target distance.
-        raw_drift_per_second = (
-            0.50 * (twap_momentum_60 / 60.0)
-            + 0.30 * (spot_momentum_30 / 30.0)
-            + 0.20 * (spot_momentum_60 / 60.0)
+        sigma = self._realized_volatility_bps_per_sqrt_second(
+            sigma_source if sigma_source else reference_ticks, now
         )
-        volume_multiplier = max(0.80, min(1.20, 0.90 + 0.10 * volume_ratio))
+
+        # Chainlink is the settlement feed and therefore gets most of the drift
+        # weight. Coinbase only refines the estimate when it is actually fresh.
+        if spot_fresh and spot_history_ok:
+            raw_drift_per_second = (
+                0.60 * (twap_momentum_60 / 60.0)
+                + 0.25 * (spot_momentum_30 / 30.0)
+                + 0.15 * (spot_momentum_60 / 60.0)
+            )
+            volume_multiplier = max(0.80, min(1.20, 0.90 + 0.10 * volume_ratio))
+        else:
+            raw_drift_per_second = twap_momentum_60 / 60.0
+            volume_multiplier = 1.0
+
         drift_horizon = min(max(0.0, seconds_left), 60.0)
         drift_adjustment = raw_drift_per_second * drift_horizon * 0.40 * volume_multiplier
         drift_adjustment = max(-8.0, min(8.0, drift_adjustment))
@@ -304,29 +347,26 @@ class PolymarketMomentumStrategy:
         z_score = forecast_separation_bps / max(1.0, remaining_sigma_bps)
         raw_yes_probability = self._normal_cdf(z_score)
 
-        # Price persistence nudges probability only slightly. It is supporting
-        # information rather than another hard filter.
         direction = 1 if forecast_separation_bps >= 0 else -1
-        persistence = self._persistence_ratio(ticks, now, direction)
+        persistence_source = ticks if spot_fresh and len(ticks) >= 3 else reference_ticks
+        persistence = self._persistence_ratio(persistence_source, now, direction)
         persistence_adjustment = direction * (persistence - 0.50) * 0.08
         raw_yes_probability = max(
             0.01, min(0.99, raw_yes_probability + persistence_adjustment)
         )
 
-        # Shrink model confidence toward 50% because this is deliberately a
-        # lightweight online model, not a fully calibrated institutional forecast.
-        yes_probability = 0.50 + (raw_yes_probability - 0.50) * 0.85
+        yes_probability = 0.50 + (raw_yes_probability - 0.50) * confidence_shrink
         yes_probability = max(0.05, min(0.95, yes_probability))
 
         detail = (
             f"chainlink_twap={latest_ref.price:.6f} target={target:.6f} "
             f"chainlink_sep_bps={separation_bps:+.2f} forecast_sep_bps={forecast_separation_bps:+.2f} "
-            f"spot={latest_spot.price:.6f} spot_source={latest_spot.source} "
+            f"spot={spot_price:.6f} spot_source={spot_source} spot_status={spot_status} "
             f"spot_mom_30_bps={spot_momentum_30:+.2f} spot_mom_60_bps={spot_momentum_60:+.2f} "
             f"twap_mom_60_bps={twap_momentum_60:+.2f} sigma_bps_sqrt_s={sigma:.3f} "
             f"remaining_sigma_bps={remaining_sigma_bps:.2f} drift_adj_bps={drift_adjustment:+.2f} "
             f"persistence={persistence:.2f} volume_ratio={volume_ratio:.2f} "
-            f"p_yes={yes_probability:.3f}"
+            f"confidence_shrink={confidence_shrink:.2f} p_yes={yes_probability:.3f}"
         )
         return yes_probability, detail
 
@@ -419,20 +459,6 @@ class PolymarketMomentumStrategy:
         model_probability = (
             yes_probability if side is Side.YES else 1.0 - yes_probability
         )
-        if model_probability < self.minimum_model_probability:
-            self._clear_signal_confirmation(listing.slug)
-            self._snapshot_retryable(
-                listing,
-                seconds_left,
-                target,
-                (
-                    f"MODEL_PROBABILITY_TOO_LOW | predicted={side.value} "
-                    f"p_side={model_probability:.3f} "
-                    f"minimum={self.minimum_model_probability:.3f} | {detail}"
-                ),
-            )
-            return None
-
         ask = listing.yes_ask if side is Side.YES else listing.no_ask
         if ask is None or not 1 <= ask <= 99:
             self._snapshot_retryable(
@@ -451,18 +477,18 @@ class PolymarketMomentumStrategy:
             )
             return None
 
-        required_edge = self._required_edge_cents(ask)
+        required_probability = self._required_probability(ask)
         edge_cents = model_probability * 100.0 - ask
         maximum_entry_price = self._maximum_price_for_probability(model_probability)
-        if maximum_entry_price < self.minimum_entry_price or edge_cents < required_edge:
+        if model_probability < required_probability or maximum_entry_price < self.minimum_entry_price:
             self._snapshot_retryable(
                 listing,
                 seconds_left,
                 target,
                 (
-                    f"INSUFFICIENT_MODEL_EDGE | predicted={side.value} ask={ask}c "
-                    f"p_side={model_probability:.3f} edge={edge_cents:+.2f}c "
-                    f"required={required_edge:.2f}c max_model_price={maximum_entry_price}c | {detail}"
+                    f"PRICE_ADJUSTED_CONFIDENCE_TOO_LOW | predicted={side.value} ask={ask}c "
+                    f"p_side={model_probability:.3f} required_p={required_probability:.3f} "
+                    f"market_edge={edge_cents:+.2f}c max_confidence_price={maximum_entry_price}c | {detail}"
                 ),
             )
             return None
@@ -478,7 +504,7 @@ class PolymarketMomentumStrategy:
                 target,
                 (
                     f"{reason} | predicted={side.value} p_side={model_probability:.3f} "
-                    f"edge={edge_cents:+.2f}c streak={streak}/{self.signal_confirmations} | {detail}"
+                    f"market_edge={edge_cents:+.2f}c required_p={required_probability:.3f} streak={streak}/{self.signal_confirmations} | {detail}"
                 ),
             )
             return None
@@ -508,7 +534,7 @@ class PolymarketMomentumStrategy:
                 target,
                 (
                     f"{block} | intended_side={side.value} p_side={model_probability:.3f} "
-                    f"edge={edge_cents:+.2f}c | {detail}"
+                    f"market_edge={edge_cents:+.2f}c required_p={required_probability:.3f} | {detail}"
                 ),
                 decision=f"SHADOW_BUY_{side.value.upper()}",
             )
@@ -521,8 +547,8 @@ class PolymarketMomentumStrategy:
             target,
             f"BUY_{side.value.upper()}",
             (
-                f"p_side={model_probability:.3f} ask={ask}c edge={edge_cents:+.2f}c "
-                f"required_edge={required_edge:.2f}c model_max_price={maximum_entry_price}c "
+                f"p_side={model_probability:.3f} ask={ask}c market_edge={edge_cents:+.2f}c "
+                f"required_p={required_probability:.3f} max_confidence_price={maximum_entry_price}c "
                 f"probability_confirmed={streak}/{self.signal_confirmations} | {detail}"
             ),
         )
@@ -532,7 +558,8 @@ class PolymarketMomentumStrategy:
             limit_price=limit_price,
             detail=detail,
             model_probability=model_probability,
-            required_edge_cents=required_edge,
+            required_edge_cents=0.0,
+            required_probability=required_probability,
             maximum_entry_price=maximum_entry_price,
         )
 
