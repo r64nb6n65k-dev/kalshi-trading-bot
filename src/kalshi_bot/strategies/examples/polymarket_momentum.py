@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 
 # Printed by the live engine at startup so deployment logs prove which strategy
 # Northflank actually installed.
-STRATEGY_VERSION = "poly-5m-focused-exhaustion-v16-stoploss-exposure-cap"
+STRATEGY_VERSION = "poly-target-line-all-crypto-v17-confirmed-stop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,23 +296,21 @@ class PolymarketMomentumStrategy:
         ticks: tuple[UnderlyingTick, ...],
         reference_ticks: tuple[UnderlyingTick, ...],
     ) -> tuple[Side | None, str, float]:
+        """Make one plain target-line forecast from the live price feeds.
+
+        The settlement question is whether the closing Chainlink reference is
+        above or below the opening target.  Coinbase supplies the faster
+        live direction; Chainlink supplies the settlement-aligned direction.
+        No market-price history, cross-asset veto, or learned trade history is
+        used to choose a side.
+        """
         if target <= 0:
             return None, "MISSING_OPENING_REFERENCE", 0.5
-        spot = tuple(
-            sorted(
-                (tick for tick in ticks if tick.timestamp.timestamp() <= now),
-                key=lambda x: x.timestamp,
-            )
-        )
+        spot = tuple(tick for tick in ticks if tick.timestamp.timestamp() <= now)
         reference = tuple(
-            sorted(
-                (tick for tick in reference_ticks if tick.timestamp.timestamp() <= now),
-                key=lambda tick: tick.timestamp,
-            )
+            tick for tick in reference_ticks if tick.timestamp.timestamp() <= now
         )
-        market_spot = tuple(
-            tick for tick in spot if tick.timestamp.timestamp() >= listing.open_time
-        )
+        market_spot = tuple(tick for tick in spot if tick.timestamp.timestamp() >= listing.open_time)
         market_reference = tuple(
             tick for tick in reference if tick.timestamp.timestamp() >= listing.open_time - 0.5
         )
@@ -330,182 +328,40 @@ class PolymarketMomentumStrategy:
             return None, "INSUFFICIENT_PRICE_HISTORY", 0.5
 
         opening_spot = self._at_or_before(spot, listing.open_time)
-        reference_separation_bps = (latest_reference.price - target) / target * 10_000
-        spot_move_bps = (latest_spot.price - opening_spot.price) / opening_spot.price * 10_000
-        reference_10_bps = self._change_bps(reference, now, 10)
-        reference_30_bps = self._change_bps(reference, now, 30)
-        reference_60_bps = self._change_bps(reference, now, 60)
-        momentum_5_bps = self._change_bps(spot, now, 5)
-        momentum_15_bps = self._change_bps(spot, now, 15)
-        momentum_30_bps = self._change_bps(spot, now, 30)
-        momentum_60_bps = self._change_bps(spot, now, 60)
-        momentum_120_bps = self._change_bps(spot, now, 120)
+        target_distance_bps = (latest_reference.price - target) / target * 10_000
+        spot_distance_bps = (latest_spot.price - opening_spot.price) / opening_spot.price * 10_000
+        spot_momentum_bps = self._change_bps(self._window(spot, now, 30), now, 30)
+        reference_momentum_bps = self._change_bps(self._window(reference, now, 30), now, 30)
 
-        elapsed = now - market_spot[0].timestamp.timestamp()
-        volume_window = max(1.0, min(45.0, elapsed / 2))
-        recent_start = now - volume_window
-        baseline_start = recent_start - volume_window
-        recent_volume = sum(
-            tick.size for tick in spot if tick.timestamp.timestamp() >= recent_start
+        # Target distance is primary. The live spot and recent reference trend
+        # break ties when the Chainlink value is close to the target.
+        projected_bps = (
+            0.55 * target_distance_bps
+            + 0.30 * spot_distance_bps
+            + 0.10 * spot_momentum_bps
+            + 0.05 * reference_momentum_bps
         )
-        baseline_volume = sum(
-            tick.size
-            for tick in spot
-            if baseline_start <= tick.timestamp.timestamp() < recent_start
-        )
-        volume_ratio = recent_volume / baseline_volume if baseline_volume > 0 else 1.0
-        prices = [tick.price for tick in market_spot]
-        path = sum(abs(right - left) for left, right in pairwise(prices))
-        efficiency = abs(latest_spot.price - market_spot[0].price) / path if path > 0 else 0.0
-        crossings = sum(
-            1
-            for left, right in pairwise(prices)
-            if (left - opening_spot.price) * (right - opening_spot.price) < 0
-        )
-        market_vwap = self._weighted_price(market_spot)
-        vwap_distance_bps = (latest_spot.price - market_vwap) / latest_spot.price * 10_000
-        midpoint = listing.open_time + elapsed / 2
-        early = tuple(tick for tick in market_spot if tick.timestamp.timestamp() < midpoint)
-        late = tuple(tick for tick in market_spot if tick.timestamp.timestamp() >= midpoint)
-        early_vwap = self._weighted_price(early) if early else market_spot[0].price
-        late_vwap = self._weighted_price(late) if late else latest_spot.price
-        vwap_slope_bps = (late_vwap - early_vwap) / early_vwap * 10_000
-
-        recent_ticks = self._window(spot, now, 45)
-        signed_volume = 0.0
-        total_volume = 0.0
-        for left, right in pairwise(recent_ticks):
-            size = max(0.0, right.size)
-            total_volume += size
-            signed_volume += size * (
-                1.0 if right.price > left.price else -1.0 if right.price < left.price else 0.0
-            )
-        volume_imbalance = signed_volume / total_volume if total_volume > 0 else 0.0
-
+        recent = self._window(spot, now, 120)
         returns_bps = [
             (right.price - left.price) / left.price * 10_000
-            for left, right in pairwise(self._window(spot, now, 120))
+            for left, right in pairwise(recent)
             if left.price > 0
         ]
-        one_second_volatility_bps = pstdev(returns_bps) if len(returns_bps) > 1 else 0.0
-        seconds_left = max(1.0, listing.close_time - now)
-        expected_noise_bps = max(0.75, one_second_volatility_bps * math.sqrt(seconds_left))
-
-        slope_30 = self._slope_bps_per_minute(self._window(spot, now, 30))
-        slope_60 = self._slope_bps_per_minute(self._window(spot, now, 60))
-        slope_120 = self._slope_bps_per_minute(self._window(spot, now, 120))
-        trend_per_minute = 0.50 * slope_30 + 0.30 * slope_60 + 0.20 * slope_120
-        horizon_minutes = min(1.5, seconds_left / 60)
-        trend_projection = 0.35 * trend_per_minute * horizon_minutes
-
-        # If a short move opposes an established trend while price remains on
-        # the trend side of VWAP, treat it as a retrace rather than a reversal.
-        retrace_projection = 0.0
-        if slope_120 * slope_30 < 0 and vwap_distance_bps * slope_120 > 0:
-            retrace_projection = 0.12 * slope_120 * horizon_minutes
-
-        anchor = 0.72 * reference_separation_bps + 0.28 * spot_move_bps
-        vwap_projection = 0.12 * vwap_distance_bps + 0.08 * vwap_slope_bps
-        flow_projection = 0.18 * expected_noise_bps * volume_imbalance
-        reference_projection = 0.18 * reference_10_bps + 0.10 * reference_30_bps
-        raw_projection_bps = (
-            anchor
-            + trend_projection
-            + retrace_projection
-            + vwap_projection
-            + flow_projection
-            + reference_projection
-        )
-        # Chop is uncertainty, not a veto. It pulls the estimate toward 50/50
-        # without preventing a decision on the market.
-        chop_factor = max(0.55, 1.0 - 0.05 * crossings)
-        efficiency_factor = 0.75 + 0.25 * min(1.0, efficiency / 0.35)
-        projected_bps = raw_projection_bps * chop_factor * efficiency_factor
-        raw_up_probability = max(
-            0.02,
-            min(0.98, self._normal_cdf(projected_bps / expected_noise_bps)),
-        )
-        raw_side = Side.YES if raw_up_probability >= 0.5 else Side.NO
-        raw_selected_probability = (
-            raw_up_probability if raw_side is Side.YES else 1 - raw_up_probability
-        )
-        regime = "TREND"
-        if slope_120 * slope_30 < 0:
-            regime = "RETRACE" if retrace_projection else "REVERSAL"
-        elif efficiency < 0.12:
-            regime = "RANGE"
-
-        direction = 1.0 if raw_side is Side.YES else -1.0
-        aligned_reference_60 = direction * reference_60_bps
-        history = self._remember_prediction(listing.slug, now, raw_side)
-        self._market_pulses[(listing.asset, listing.interval_minutes)] = MarketPulse(
-            observed_at=now,
-            close_time=listing.close_time,
-            side=raw_side,
-            reference_60_bps=reference_60_bps,
-            momentum_60_bps=momentum_60_bps,
-        )
-
-        # Exhaustion/contrarian override disabled: it was reversing the
-        # model's own raw directional read (see STRATEGY_VERSION history)
-        # and then locking that reversal in for the rest of the market's
-        # life via _contrarian_side. We now always trade the raw read.
-        override_reasons: list[str] = []
-        side = raw_side
-        selected_probability = raw_selected_probability
-
-        seconds_left = max(1.0, listing.close_time - now)
-        if self.preferred_entry_end_seconds <= seconds_left <= self.preferred_entry_start_seconds:
-            self._preferred_side[listing.slug] = (side, selected_probability)
-
-        up_probability = selected_probability if side is Side.YES else 1 - selected_probability
-        confidence = 100 * selected_probability
-
-        # Chainlink determines settlement.  Forecasting a side opposite the
-        # current Chainlink-to-target position is not an executable signal;
-        # keep watching until the settlement reference agrees.
-        reference_direction = 1.0 if reference_separation_bps > 0 else -1.0
-        predicted_direction = 1.0 if side is Side.YES else -1.0
-        if (
-            not override_reasons
-            and (reference_separation_bps == 0 or reference_direction != predicted_direction)
-        ):
-            return (
-                None,
-                (
-                    f"REFERENCE_SIDE_DISAGREEMENT | predicted={side.value} "
-                    f"reference_separation_bps={reference_separation_bps:+.2f} "
-                    f"target={target:.6f} reference={latest_reference.price:.6f}"
-                ),
-                selected_probability,
-            )
-
+        noise_bps = max(1.0, pstdev(returns_bps) * math.sqrt(max(1.0, listing.close_time - now))) if len(returns_bps) > 1 else 1.0
+        up_probability = max(0.02, min(0.98, self._normal_cdf(projected_bps / noise_bps)))
+        side = Side.YES if projected_bps >= 0 else Side.NO
+        selected_probability = up_probability if side is Side.YES else 1 - up_probability
+        confidence = selected_probability * 100
         return (
             side,
             (
-                f"reference={latest_reference.price:.6f} "
-                f"reference_source={latest_reference.source} "
-                f"spot={latest_spot.price:.6f} spot_source={latest_spot.source} "
-                f"target={target:.6f} predicted={side.value} raw_predicted={raw_side.value} "
-                f"prediction_override={','.join(override_reasons) if override_reasons else 'NONE'} "
-                f"confidence={confidence:.1f} "
-                f"model_up={up_probability * 100:.1f} projected_finish_bps={projected_bps:+.2f} "
-                f"expected_noise_bps={expected_noise_bps:.2f} regime={regime} "
-                f"reference_separation_bps={reference_separation_bps:+.2f} "
-                f"spot_move_bps={spot_move_bps:+.2f} "
-                f"reference_10_bps={reference_10_bps:+.2f} "
-                f"reference_30_bps={reference_30_bps:+.2f} "
-                f"reference_60_bps={reference_60_bps:+.2f} "
-                f"momentum_5_bps={momentum_5_bps:+.2f} "
-                f"momentum_15_bps={momentum_15_bps:+.2f} "
-                f"momentum_30_bps={momentum_30_bps:+.2f} "
-                f"momentum_60_bps={momentum_60_bps:+.2f} "
-                f"momentum_120_bps={momentum_120_bps:+.2f} "
-                f"slope_30={slope_30:+.2f} slope_60={slope_60:+.2f} slope_120={slope_120:+.2f} "
-                f"vwap={market_vwap:.6f} vwap_distance_bps={vwap_distance_bps:+.2f} "
-                f"vwap_slope_bps={vwap_slope_bps:+.2f} "
-                f"volume_ratio={volume_ratio:.2f} volume_imbalance={volume_imbalance:+.2f} "
-                f"crossings={crossings} efficiency={efficiency:.2f}"
+                f"reference={latest_reference.price:.6f} spot={latest_spot.price:.6f} "
+                f"target={target:.6f} predicted={side.value} confidence={confidence:.1f} "
+                f"target_distance_bps={target_distance_bps:+.2f} "
+                f"spot_distance_bps={spot_distance_bps:+.2f} "
+                f"spot_momentum_30_bps={spot_momentum_bps:+.2f} "
+                f"reference_momentum_30_bps={reference_momentum_bps:+.2f} "
+                f"projected_finish_bps={projected_bps:+.2f} noise_bps={noise_bps:.2f}"
             ),
             selected_probability,
         )
@@ -653,8 +509,6 @@ class PolymarketMomentumStrategy:
         block = self.entry_block_reason(now)
         if self.reserved_cents() + limit_price * self.contracts > self.bankroll_cents:
             block = "BANKROLL_CAP"
-        if self.correlated_positions_open(listing) >= self.max_concurrent_correlated:
-            block = "CORRELATED_EXPOSURE_CAP"
         if block:
             self._snapshot_retryable(
                 listing,
