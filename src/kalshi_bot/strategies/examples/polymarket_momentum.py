@@ -826,6 +826,45 @@ class PolymarketMomentumStrategy:
             total_pnl_cents=self.total_pnl_cents,
         )
 
+    def log_open_position(
+        self, listing: PolymarketListing, target: float | None, now: float
+    ) -> None:
+        """Record a snapshot every cycle a position is open.
+
+        Entry-side snapshots stop the moment a position opens (evaluate()
+        returns early once `listing.slug in self.positions`), which means
+        there was previously no bid history at all between entry and exit.
+        That made it impossible to check after the fact whether a stop-loss
+        would have fired, or how close a losing trade came to recovering.
+        This fills that gap with one row per poll cycle for every open
+        position, independent of whether take-profit/stop-loss action fires.
+        """
+        position = self.positions.get(listing.slug)
+        if position is None:
+            return
+        bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
+        seconds_left = max(0.0, listing.close_time - now)
+        stop_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        streak = self._stop_streak.get(listing.slug, 0)
+        reason = (
+            f"market_source={listing.source} | side={position.side.value} "
+            f"entry={position.entry_price}c current_bid={bid}c count={position.count} "
+            f"stop_threshold={stop_threshold}c "
+            f"stop_streak={streak}/{self.stop_loss_confirmations} "
+            f"take_profit={self.take_profit}c"
+        )
+        record_model_snapshot(
+            ticker=listing.slug,
+            seconds_left=seconds_left,
+            target_price=target,
+            yes_bid=listing.yes_bid,
+            yes_ask=listing.yes_ask,
+            no_bid=listing.no_bid,
+            no_ask=listing.no_ask,
+            decision="HOLD_OPEN_POSITION",
+            reason=reason,
+        )
+
     def stop_loss_exit_price(
         self, listing: PolymarketListing, now: float
     ) -> int | None:
