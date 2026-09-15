@@ -42,11 +42,12 @@ class PolymarketMomentumStrategy:
     """Predict settlement from Chainlink TWAP, volatility and momentum, then buy edge."""
 
     _CENTRAL: ClassVar[ZoneInfo] = ZoneInfo("America/Chicago")
-    _NO_ENTRY_WINDOWS: ClassVar[tuple[tuple[int, int], ...]] = (
-        (0, 2 * 60),
-        (8 * 60, 10 * 60),
-        (19 * 60, 20 * 60),
-    )
+    # Previously blocked 00:00-02:00, 08:00-10:00, and 19:00-20:00 Central
+    # (5 hours/day). Removed: no data showed those hours performed worse,
+    # so the block was just cutting volume for no proven reason. Runs 24/7
+    # now; revisit if overnight/off-peak hours turn out to actually be bad
+    # once there's real data on them.
+    _NO_ENTRY_WINDOWS: ClassVar[tuple[tuple[int, int], ...]] = ()
 
     def __init__(
         self,
@@ -60,13 +61,13 @@ class PolymarketMomentumStrategy:
         maximum_entry_price: int = 97,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
-        final_entry_seconds: float = 60.0,
+        final_entry_seconds: float = 45.0,
         drawdown_limit_cents: int = 4_000,
         minimum_model_probability: float = 0.55,
         base_required_edge_cents: float = 0.0,
         signal_confirmations: int = 2,
         signal_confirmation_seconds: float = 2.0,
-        max_probability_deterioration: float = 0.05,
+        max_probability_deterioration: float = 0.08,
         minimum_probability_margin: float = 0.10,
     ) -> None:
         self.contracts = contracts
