@@ -1,27 +1,4 @@
-"""Original momentum-score Polymarket strategy, with the validated stop-loss added.
-
-This restores the entry/signal logic from the earlier version of the bot
-(separation + volume-weighted momentum score, single-shot decision window,
-no probability-tier price bands) instead of the Chainlink-TWAP probability
-model used in between. The stop-loss and its fixes -- bid-fallback when the
-book goes empty, fast 2-tick confirmation, and the trailing stop that locks
-in gains once a position gets deep into winning territory -- carry over
-unchanged from the version that was validated today, since the original
-version had *no* stop-loss at all (it held every position to take-profit or
-settlement, which is why single losing trades could be very large).
-
-Compatibility note: the live engine (polymarket_live_engine.py) does a
-"recheck the edge right before filling" step that calls
-`strategy.model_probability` on the pending signal and
-`strategy._required_probability(ask)`, and reads `strategy.maximum_entry_price`
-to cap fill prices. The original version predates that recheck and has no
-such concept. To avoid changing behavior versus what this strategy actually
-did, `_required_probability()` always returns 0.0 and signals report
-model_probability=1.0, so that recheck can never reject a fill on its own --
-it's satisfied, not meaningfully enabled. maximum_entry_price defaults to
-take_profit - 1 (effectively unrestricted, matching the original having no
-price-band cap at all).
-"""
+"""Probability/edge strategy for Polymarket rolling crypto markets."""
 
 from __future__ import annotations
 
@@ -39,7 +16,7 @@ from kalshi_bot.telemetry.logging import get_logger
 
 logger = get_logger(__name__)
 
-STRATEGY_VERSION = "poly-5m-momentum-score-v20-plus-stop-loss"
+STRATEGY_VERSION = "poly-5m-chainlink-price-confidence-v4-stop-loss"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,13 +25,10 @@ class SimSignal:
     signal_ask: int
     limit_price: int
     detail: str
-    # Compatibility fields for the v37 engine's fill-time edge recheck.
-    # See module docstring: these are set to always-pass values so the
-    # recheck can't reject anything the original strategy would have taken.
-    model_probability: float = 1.0
-    required_edge_cents: float = 0.0
-    required_probability: float = 0.0
-    maximum_entry_price: int = 97
+    model_probability: float
+    required_edge_cents: float
+    required_probability: float
+    maximum_entry_price: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,12 +39,14 @@ class SimPosition:
 
 
 class PolymarketMomentumStrategy:
-    """Separation + volume-weighted momentum score, with a protective stop-loss."""
+    """Predict settlement from Chainlink TWAP, volatility and momentum, then buy edge."""
 
     _CENTRAL: ClassVar[ZoneInfo] = ZoneInfo("America/Chicago")
-    # Left empty (24/7) per today's testing -- no data showed the previously
-    # blocked hours performed worse. Restore to the original three windows
-    # ((0, 120), (480, 600), (1140, 1200)) if you want that back.
+    # Previously blocked 00:00-02:00, 08:00-10:00, and 19:00-20:00 Central
+    # (5 hours/day). Removed: no data showed those hours performed worse,
+    # so the block was just cutting volume for no proven reason. Runs 24/7
+    # now; revisit if overnight/off-peak hours turn out to actually be bad
+    # once there's real data on them.
     _NO_ENTRY_WINDOWS: ClassVar[tuple[tuple[int, int], ...]] = ()
 
     def __init__(
@@ -80,62 +56,112 @@ class PolymarketMomentumStrategy:
         bankroll_cents: int = 50_000,
         take_profit: int = 98,
         minimum_history: float = 45.0,
-        minimum_separation_bps: float = 4.0,
+        minimum_separation_bps: float = 0.0,
+        minimum_entry_price: int = 1,
+        maximum_entry_price: int = 97,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
+        final_entry_seconds: float = 45.0,
         drawdown_limit_cents: int = 4_000,
+        minimum_model_probability: float = 0.55,
+        base_required_edge_cents: float = 0.0,
+        signal_confirmations: int = 2,
+        signal_confirmation_seconds: float = 2.0,
+        max_probability_deterioration: float = 0.08,
+        minimum_probability_margin: float = 0.10,
+        minimum_confirmed_entry_seconds: float = 0.0,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
         self.take_profit = take_profit
         self.minimum_history = minimum_history
-        self.minimum_separation_bps = minimum_separation_bps
+        # Retained only for constructor compatibility. Probability/volatility now
+        # replaces the old fixed 4-bps entry gate.
+        self.minimum_separation_bps = max(0.0, minimum_separation_bps)
         self.entry_slippage_cents = entry_slippage_cents
         self.decision_window = decision_window
+        self.final_entry_seconds = max(0.0, final_entry_seconds)
         self.drawdown_limit_cents = drawdown_limit_cents
-        # Unrestricted price band, matching the original having none. Kept
-        # as an attribute (not a fixed constant) because the live engine
-        # reads self.strategy.maximum_entry_price directly.
-        self.maximum_entry_price = max(1, min(99, take_profit - 1))
-        self.minimum_entry_price = 1
 
-        # Compatibility for the v37 engine, which wasn't built assuming
-        # these existed. evaluation_interval throttles the live-quote
-        # cache; final_entry_seconds gates when the engine starts pulling
-        # live CLOB quotes ahead of a possible entry. Set permissively (0)
-        # so live quotes are available through the strategy's actual
-        # decision window, rather than trying to replicate v37's separate
-        # final-entry-cutoff concept that v20 never had.
+        # There is no longer a 50-75c strategy band. These are only technical
+        # exchange/economic bounds. The model edge determines the usable price.
+        self.minimum_entry_price = max(1, min(99, minimum_entry_price))
+        economic_max = max(self.minimum_entry_price, min(99, self.take_profit - 1))
+        self.maximum_entry_price = max(
+            self.minimum_entry_price,
+            min(economic_max, maximum_entry_price),
+        )
+
+        self.minimum_model_probability = min(
+            0.95, max(0.50, minimum_model_probability)
+        )
+        self.base_required_edge_cents = max(0.0, base_required_edge_cents)
+        self.signal_confirmations = max(1, signal_confirmations)
+        self.signal_confirmation_seconds = max(0.0, signal_confirmation_seconds)
+        self.max_probability_deterioration = max(0.0, max_probability_deterioration)
+        # Live data shows model confidence barely above the required bar is
+        # close to a coin flip (~50% win rate), while confidence clearing the
+        # bar by 10+ points wins ~71%. Raised from 0.08 -> 0.10: whatever the
+        # cutoff, trades that barely clear it underperform (that cohort just
+        # moves with the cutoff), so 0.08 still had a coin-flip band right
+        # above it. 0.10 is the point where win rate and trade volume both
+        # hold up -- going higher (0.15+) trims volume faster than it adds
+        # win rate and nets less total profit despite a higher win rate.
+        self.minimum_probability_margin = max(0.0, min(0.49, minimum_probability_margin))
+        # Live data: signals that confirm quickly (early in the decision
+        # window, 170-200s still left) win ~74% of the time. Signals that
+        # take a long time to confirm (under 110s left when they finally
+        # do) win only ~33% -- a slow confirmation isn't a signal that
+        # "eventually got good," it's usually a weak/noisy setup that kept
+        # resetting until it limped through once. Require a real
+        # confirmation within the first part of the window; abandon slow
+        # ones rather than keep retrying them.
+        self.minimum_confirmed_entry_seconds = max(0.0, minimum_confirmed_entry_seconds)
+
         self.evaluation_interval = 1.0
-        self.final_entry_seconds = 0.0
-
         self.decided: set[str] = set()
         self.positions: dict[str, SimPosition] = {}
+        self._last_retry_reason: dict[str, str] = {}
         self.total_pnl_cents = 0
         self._daily_day: date | None = None
         self._daily_pnl_cents = 0
         self._daily_peak_cents = 0
 
-        # --- Stop-loss (validated today; the original version had none) ---
+        self._signal_side: dict[str, Side] = {}
+        self._signal_streak: dict[str, int] = {}
+        self._signal_last_confirmed_at: dict[str, float] = {}
+        self._signal_probability: dict[str, float] = {}
+
+        # Stop-loss: require two confirmations spaced ~1s apart instead of
+        # three spaced 6s apart (previously confirmations=3, seconds=6.0).
+        # A single-confirmation stop (confirmations=1) reacted to one-tick
+        # noise and closed positions that would have recovered above the
+        # threshold. Two quick confirmations filter that noise out while
+        # still exiting in ~1-2s instead of the original 12-18s, which was
+        # letting price keep falling during the confirmation window (avg
+        # ~19c extra slippage beyond the intended 15c threshold, worst case
+        # ~56c observed in live trading).
         self.stop_loss_gap_cents = 15
         self.stop_loss_confirmations = 2
         self.stop_loss_confirmation_seconds = 1.0
         self._stop_streak: dict[str, int] = {}
         self._stop_last_confirmed_at: dict[str, float] = {}
 
-        # Trailing stop removed for this strategy. Live data: two trades
-        # ran 10-14c into genuine profit (78->88, 79->93), got tightened by
-        # the trail, then a normal pullback -- not a flash crash -- took
-        # them out before they recovered. This strategy has no entry
-        # confirmation and a much looser separation gate than the one the
-        # 15c trail was tuned against, so price action around its entries
-        # is choppier and needs more room. Back to a flat 15c stop from
-        # entry only.
+        # Trailing stop: once a position has genuinely gotten deep into
+        # winning territory, protect that gain instead of leaving the stop
+        # anchored only to entry. Tested against full historical price
+        # paths with realistic confirmation delay before shipping: a 10c
+        # gap was too tight and clipped normal chop more often than it
+        # saved real reversals (net worse than no trailing stop at all).
+        # 15c gap tested as a modest, real improvement (+$0.28 / +21% on
+        # a 77-trade sample) without cutting winners short unnecessarily.
+        self.trailing_stop_arm_price = 85
+        self.trailing_stop_gap_cents = 15
+        self._position_peak_bid: dict[str, int] = {}
 
     @staticmethod
     def decision_seconds(interval_minutes: int) -> float:
-        # The live 15-minute bot observes the first third (5 minutes), then
-        # decides with two thirds remaining. Preserve that timing on 5m too.
+        # Five-minute markets begin evaluating at 3:20 remaining.
         return interval_minutes * 60 * (2 / 3)
 
     @classmethod
@@ -163,44 +189,77 @@ class PolymarketMomentumStrategy:
         return sum(p.entry_price * p.count for p in self.positions.values())
 
     @staticmethod
-    def _at_or_before(ticks: tuple[UnderlyingTick, ...], timestamp: float) -> UnderlyingTick:
+    def _at_or_before(
+        ticks: tuple[UnderlyingTick, ...], timestamp: float
+    ) -> UnderlyingTick:
         return min(ticks, key=lambda row: abs(row.timestamp.timestamp() - timestamp))
 
-    def _required_probability(self, entry_price: int) -> float:  # noqa: ARG002
-        """Compatibility shim for the v37 engine's fill-time edge recheck.
+    @staticmethod
+    def _normal_cdf(value: float) -> float:
+        return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
-        The original strategy has no probability-tier concept, so this
-        always returns 0.0 -- combined with SimSignal.model_probability
-        defaulting to 1.0, the recheck can never reject a fill, matching
-        how this strategy actually behaved.
-        """
-        return 0.0
-
-    def _signal(
-        self,
-        target: float,
-        now: float,
+    @staticmethod
+    def _persistence_ratio(
         ticks: tuple[UnderlyingTick, ...],
-    ) -> tuple[Side | None, str]:
-        if target <= 0:
-            return None, "MISSING_OPENING_REFERENCE"
-        if len(ticks) < 2:
-            return None, "NO_UNDERLYING_FEED_OR_HISTORY"
-        latest = ticks[-1]
+        now: float,
+        direction: int,
+        window_seconds: float = 45.0,
+    ) -> float:
+        recent = [
+            tick
+            for tick in ticks
+            if tick.timestamp.timestamp() >= now - window_seconds
+        ]
+        if len(recent) < 3:
+            return 0.50
+        aligned = 0
+        moves = 0
+        for previous, current in zip(recent, recent[1:]):
+            delta = current.price - previous.price
+            if delta == 0:
+                continue
+            moves += 1
+            if delta * direction > 0:
+                aligned += 1
+        return aligned / moves if moves else 0.50
+
+    @staticmethod
+    def _realized_volatility_bps_per_sqrt_second(
+        ticks: tuple[UnderlyingTick, ...],
+        now: float,
+        window_seconds: float = 90.0,
+    ) -> float:
+        """RMS log-return volatility normalized to one sqrt-second."""
+        recent = [
+            tick
+            for tick in ticks
+            if tick.timestamp.timestamp() >= now - window_seconds
+        ]
+        if len(recent) < 4:
+            return 0.75
+
+        normalized_sq: list[float] = []
+        for previous, current in zip(recent, recent[1:]):
+            dt = current.timestamp.timestamp() - previous.timestamp.timestamp()
+            if dt <= 0 or previous.price <= 0 or current.price <= 0:
+                continue
+            ret_bps = math.log(current.price / previous.price) * 10_000
+            normalized_sq.append((ret_bps / math.sqrt(dt)) ** 2)
+        if not normalized_sq:
+            return 0.75
+
+        sigma = math.sqrt(sum(normalized_sq) / len(normalized_sq))
+        # Avoid false certainty during an unusually quiet few seconds, and cap
+        # corrupted/noisy bursts from making every market untradeable.
+        return max(0.45, min(4.0, sigma))
+
+    @staticmethod
+    def _volume_ratio(
+        ticks: tuple[UnderlyingTick, ...], now: float
+    ) -> float:
+        if not ticks:
+            return 1.0
         first_time = ticks[0].timestamp.timestamp()
-        if now - latest.timestamp.timestamp() > 5 or now - first_time < self.minimum_history:
-            return None, "STALE_OR_INSUFFICIENT_PRICE_HISTORY"
-        short = self._at_or_before(ticks, now - 60)
-        long = ticks[0]
-        short_bps = (latest.price - short.price) / target * 10_000
-        long_bps = (latest.price - long.price) / target * 10_000
-        separation_bps = (latest.price - target) / target * 10_000
-        if abs(separation_bps) < self.minimum_separation_bps:
-            return (
-                None,
-                f"INSUFFICIENT_SEPARATION | separation_bps={separation_bps:+.2f} "
-                f"minimum={self.minimum_separation_bps:.2f}",
-            )
         recent_volume = sum(
             tick.size for tick in ticks if tick.timestamp.timestamp() >= now - 60
         )
@@ -208,20 +267,188 @@ class PolymarketMomentumStrategy:
             tick.size for tick in ticks if tick.timestamp.timestamp() < now - 60
         )
         older_seconds = max(1.0, now - first_time - 60)
-        baseline_volume = older_volume * 60 / older_seconds
-        volume_ratio = recent_volume / baseline_volume if baseline_volume > 0 else 1.0
-        volume_weight = max(0.5, min(2.0, volume_ratio))
-        score = 0.55 * separation_bps + volume_weight * (
-            0.30 * short_bps + 0.15 * long_bps
+        baseline = older_volume * 60 / older_seconds
+        if baseline <= 0:
+            return 1.0
+        return max(0.25, min(4.0, recent_volume / baseline))
+
+    def _required_probability(self, entry_price: int) -> float:
+        """Minimum directional confidence required at a given contract price.
+
+        Cheap and mid-priced contracts can be entered on a modest directional
+        advantage. Expensive contracts require substantially stronger evidence
+        because a single loss carries much more downside than the remaining upside.
+        """
+        if entry_price < 60:
+            return max(self.minimum_model_probability, 0.55)
+        if entry_price < 70:
+            return max(self.minimum_model_probability, 0.58)
+        if entry_price < 80:
+            return max(self.minimum_model_probability, 0.62)
+        if entry_price < 90:
+            return max(self.minimum_model_probability, 0.72)
+        # Ninety-cent-plus entries are intentionally rare. A 90c loser erases
+        # several ordinary winners, so demand near-certainty from the model.
+        return max(self.minimum_model_probability, 0.94)
+
+    def _required_edge_cents(self, entry_price: int) -> float:
+        """Compatibility helper: edge is logged, but no longer gates entry."""
+        return 0.0
+
+    def _maximum_price_for_probability(self, probability: float) -> int:
+        max_price = 0
+        for price in range(self.minimum_entry_price, self.maximum_entry_price + 1):
+            if probability >= self._required_probability(price) + self.minimum_probability_margin:
+                max_price = price
+        return max_price
+
+    def _probability(
+        self,
+        target: float,
+        now: float,
+        seconds_left: float,
+        ticks: tuple[UnderlyingTick, ...],
+        reference_ticks: tuple[UnderlyingTick, ...],
+    ) -> tuple[float | None, str]:
+        if target <= 0:
+            return None, "MISSING_OPENING_REFERENCE"
+        if not reference_ticks:
+            return None, "NO_CHAINLINK_TWAP_HISTORY"
+
+        latest_ref = reference_ticks[-1]
+        if now - latest_ref.timestamp.timestamp() > 15:
+            return None, "STALE_CHAINLINK_TWAP"
+
+        ref_first_time = reference_ticks[0].timestamp.timestamp()
+        spot_fresh = bool(ticks) and now - ticks[-1].timestamp.timestamp() <= 5
+        spot_history_ok = len(ticks) >= 2
+        history_start = min(
+            ref_first_time,
+            ticks[0].timestamp.timestamp() if ticks else ref_first_time,
         )
-        side = Side.YES if score >= 0 else Side.NO
-        return side, (
-            f"underlying={latest.price:.6f} source={latest.source} "
-            f"target={target:.6f} score={score:+.2f} "
-            f"separation_bps={separation_bps:+.2f} "
-            f"momentum_60_bps={short_bps:+.2f} "
-            f"momentum_long_bps={long_bps:+.2f} volume_ratio={volume_ratio:.2f}"
+        if now - history_start < self.minimum_history:
+            return None, "INSUFFICIENT_PRICE_HISTORY"
+
+        separation_bps = (latest_ref.price - target) / target * 10_000
+
+        if len(reference_ticks) >= 2:
+            ref_60 = self._at_or_before(reference_ticks, now - 60)
+            twap_momentum_60 = (latest_ref.price - ref_60.price) / target * 10_000
+        else:
+            twap_momentum_60 = 0.0
+
+        if spot_history_ok and spot_fresh:
+            latest_spot = ticks[-1]
+            spot_30 = self._at_or_before(ticks, now - 30)
+            spot_60 = self._at_or_before(ticks, now - 60)
+            spot_momentum_30 = (latest_spot.price - spot_30.price) / target * 10_000
+            spot_momentum_60 = (latest_spot.price - spot_60.price) / target * 10_000
+            sigma_source = ticks
+            volume_ratio = self._volume_ratio(ticks, now)
+            spot_price = latest_spot.price
+            spot_source = latest_spot.source
+            spot_status = "FRESH"
+            confidence_shrink = 0.85
+        else:
+            # Chainlink determines settlement, so a temporarily stale Coinbase
+            # helper feed should not kill an otherwise valid setup. Fall back to
+            # Chainlink-only direction/volatility and shrink confidence toward 50%.
+            spot_momentum_30 = 0.0
+            spot_momentum_60 = 0.0
+            sigma_source = reference_ticks if len(reference_ticks) >= 4 else ticks
+            volume_ratio = 1.0
+            spot_price = ticks[-1].price if ticks else float("nan")
+            spot_source = ticks[-1].source if ticks else "UNAVAILABLE"
+            spot_status = "STALE_FALLBACK_CHAINLINK" if ticks else "MISSING_FALLBACK_CHAINLINK"
+            confidence_shrink = 0.65
+
+        sigma = self._realized_volatility_bps_per_sqrt_second(
+            sigma_source if sigma_source else reference_ticks, now
         )
+
+        # Chainlink is the settlement feed and therefore gets most of the drift
+        # weight. Coinbase only refines the estimate when it is actually fresh.
+        if spot_fresh and spot_history_ok:
+            raw_drift_per_second = (
+                0.60 * (twap_momentum_60 / 60.0)
+                + 0.25 * (spot_momentum_30 / 30.0)
+                + 0.15 * (spot_momentum_60 / 60.0)
+            )
+            volume_multiplier = max(0.80, min(1.20, 0.90 + 0.10 * volume_ratio))
+        else:
+            raw_drift_per_second = twap_momentum_60 / 60.0
+            volume_multiplier = 1.0
+
+        drift_horizon = min(max(0.0, seconds_left), 60.0)
+        drift_adjustment = raw_drift_per_second * drift_horizon * 0.40 * volume_multiplier
+        drift_adjustment = max(-8.0, min(8.0, drift_adjustment))
+
+        forecast_separation_bps = separation_bps + drift_adjustment
+        remaining_sigma_bps = sigma * math.sqrt(max(1.0, seconds_left))
+        z_score = forecast_separation_bps / max(1.0, remaining_sigma_bps)
+        raw_yes_probability = self._normal_cdf(z_score)
+
+        direction = 1 if forecast_separation_bps >= 0 else -1
+        persistence_source = ticks if spot_fresh and len(ticks) >= 3 else reference_ticks
+        persistence = self._persistence_ratio(persistence_source, now, direction)
+        persistence_adjustment = direction * (persistence - 0.50) * 0.08
+        raw_yes_probability = max(
+            0.01, min(0.99, raw_yes_probability + persistence_adjustment)
+        )
+
+        yes_probability = 0.50 + (raw_yes_probability - 0.50) * confidence_shrink
+        yes_probability = max(0.05, min(0.95, yes_probability))
+
+        detail = (
+            f"chainlink_twap={latest_ref.price:.6f} target={target:.6f} "
+            f"chainlink_sep_bps={separation_bps:+.2f} forecast_sep_bps={forecast_separation_bps:+.2f} "
+            f"spot={spot_price:.6f} spot_source={spot_source} spot_status={spot_status} "
+            f"spot_mom_30_bps={spot_momentum_30:+.2f} spot_mom_60_bps={spot_momentum_60:+.2f} "
+            f"twap_mom_60_bps={twap_momentum_60:+.2f} sigma_bps_sqrt_s={sigma:.3f} "
+            f"remaining_sigma_bps={remaining_sigma_bps:.2f} drift_adj_bps={drift_adjustment:+.2f} "
+            f"persistence={persistence:.2f} volume_ratio={volume_ratio:.2f} "
+            f"confidence_shrink={confidence_shrink:.2f} p_yes={yes_probability:.3f}"
+        )
+        return yes_probability, detail
+
+    def _confirm_probability(
+        self,
+        slug: str,
+        side: Side,
+        probability: float,
+        now: float,
+    ) -> tuple[bool, int, str | None]:
+        previous_side = self._signal_side.get(slug)
+        previous_probability = self._signal_probability.get(slug)
+
+        if previous_side is not side:
+            self._signal_side[slug] = side
+            self._signal_streak[slug] = 1
+            self._signal_last_confirmed_at[slug] = now
+            self._signal_probability[slug] = probability
+            return self.signal_confirmations <= 1, 1, None
+
+        if (
+            previous_probability is not None
+            and probability + self.max_probability_deterioration < previous_probability
+        ):
+            self._signal_streak[slug] = 1
+            self._signal_last_confirmed_at[slug] = now
+            self._signal_probability[slug] = probability
+            return False, 1, (
+                f"PROBABILITY_DETERIORATING | previous={previous_probability:.3f} "
+                f"current={probability:.3f}"
+            )
+
+        last = self._signal_last_confirmed_at.get(slug)
+        if last is not None and now - last < self.signal_confirmation_seconds:
+            return False, self._signal_streak.get(slug, 1), None
+
+        self._signal_last_confirmed_at[slug] = now
+        self._signal_probability[slug] = probability
+        streak = self._signal_streak.get(slug, 0) + 1
+        self._signal_streak[slug] = streak
+        return streak >= self.signal_confirmations, streak, None
 
     def evaluate(
         self,
@@ -229,31 +456,131 @@ class PolymarketMomentumStrategy:
         target: float | None,
         now: float,
         ticks: tuple[UnderlyingTick, ...],
-        reference_ticks: tuple[UnderlyingTick, ...] | None = None,  # noqa: ARG002
+        reference_ticks: tuple[UnderlyingTick, ...] | None = None,
     ) -> SimSignal | None:
-        # reference_ticks (Chainlink TWAP) accepted for call-signature
-        # compatibility with the v37 engine, but unused -- the original
-        # strategy only ever looked at the single underlying feed.
         self._ensure_day(now)
         if listing.slug in self.decided or listing.slug in self.positions:
             return None
+
         seconds_left = listing.close_time - now
         decision = self.decision_seconds(listing.interval_minutes)
-        if not decision - self.decision_window <= seconds_left <= decision:
+        if seconds_left > decision:
             return None
-        self.decided.add(listing.slug)
+        if seconds_left <= self.final_entry_seconds:
+            self.decided.add(listing.slug)
+            self._last_retry_reason.pop(listing.slug, None)
+            self._clear_signal_confirmation(listing.slug)
+            self._snapshot(
+                listing,
+                seconds_left,
+                target,
+                "SKIP",
+                f"ENTRY_WINDOW_EXPIRED | final_entry_seconds={self.final_entry_seconds:.0f}",
+            )
+            return None
         if target is None:
-            self._snapshot(listing, seconds_left, None, "SKIP", "MISSING_OPENING_REFERENCE")
+            self._snapshot_retryable(
+                listing, seconds_left, None, "MISSING_OPENING_REFERENCE"
+            )
             return None
-        side, detail = self._signal(target, now, ticks)
-        if side is None:
-            self._snapshot(listing, seconds_left, target, "SKIP", detail)
+
+        yes_probability, detail = self._probability(
+            target,
+            now,
+            seconds_left,
+            ticks,
+            reference_ticks or (),
+        )
+        if yes_probability is None:
+            self._clear_signal_confirmation(listing.slug)
+            self._snapshot_retryable(listing, seconds_left, target, detail)
             return None
+
+        side = Side.YES if yes_probability >= 0.50 else Side.NO
+        model_probability = (
+            yes_probability if side is Side.YES else 1.0 - yes_probability
+        )
         ask = listing.yes_ask if side is Side.YES else listing.no_ask
         if ask is None or not 1 <= ask <= 99:
-            self._snapshot(listing, seconds_left, target, "SKIP", "NO_EXECUTABLE_ASK")
+            self._snapshot_retryable(
+                listing, seconds_left, target, "NO_EXECUTABLE_ASK"
+            )
             return None
-        limit_price = min(99, ask + self.entry_slippage_cents)
+        if ask < self.minimum_entry_price or ask > self.maximum_entry_price:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"TECHNICAL_PRICE_BOUND | predicted={side.value} ask={ask}c "
+                    f"bounds={self.minimum_entry_price}-{self.maximum_entry_price}c"
+                ),
+            )
+            return None
+
+        required_probability = self._required_probability(ask)
+        required_with_margin = required_probability + self.minimum_probability_margin
+        edge_cents = model_probability * 100.0 - ask
+        maximum_entry_price = self._maximum_price_for_probability(model_probability)
+        if model_probability < required_with_margin or maximum_entry_price < self.minimum_entry_price:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"PRICE_ADJUSTED_CONFIDENCE_TOO_LOW | predicted={side.value} ask={ask}c "
+                    f"p_side={model_probability:.3f} required_p={required_probability:.3f} "
+                    f"required_with_margin={required_with_margin:.3f} "
+                    f"market_edge={edge_cents:+.2f}c max_confidence_price={maximum_entry_price}c | {detail}"
+                ),
+            )
+            return None
+
+        confirmed, streak, confirmation_reason = self._confirm_probability(
+            listing.slug, side, model_probability, now
+        )
+        if not confirmed:
+            reason = confirmation_reason or "PROBABILITY_CONFIRMING"
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"{reason} | predicted={side.value} p_side={model_probability:.3f} "
+                    f"market_edge={edge_cents:+.2f}c required_p={required_probability:.3f} streak={streak}/{self.signal_confirmations} | {detail}"
+                ),
+            )
+            return None
+
+        if seconds_left < self.minimum_confirmed_entry_seconds:
+            # Confirmed, but took too long to get there -- data shows these
+            # are the weak setups, not late bloomers. Abandon rather than
+            # keep retrying; more time passing only pushes it later.
+            self.decided.add(listing.slug)
+            self._clear_signal_confirmation(listing.slug)
+            self._snapshot(
+                listing,
+                seconds_left,
+                target,
+                "SKIP",
+                (
+                    f"CONFIRMATION_TOO_SLOW | predicted={side.value} p_side={model_probability:.3f} "
+                    f"seconds_left={seconds_left:.0f} minimum_confirmed_entry_seconds="
+                    f"{self.minimum_confirmed_entry_seconds:.0f} | {detail}"
+                ),
+            )
+            return None
+
+        limit_price = min(maximum_entry_price, ask + self.entry_slippage_cents)
+        if limit_price < ask:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                "MODEL_EDGE_MOVED_BELOW_EXECUTABLE_PRICE",
+            )
+            return None
+
         block = self.entry_block_reason(now)
         if self.drawdown_cents >= self.drawdown_limit_cents:
             block = (
@@ -263,25 +590,63 @@ class PolymarketMomentumStrategy:
         if self.reserved_cents() + limit_price * self.contracts > self.bankroll_cents:
             block = "BANKROLL_CAP"
         if block:
-            self._snapshot(
+            self._snapshot_retryable(
                 listing,
                 seconds_left,
                 target,
-                f"SHADOW_BUY_{side.value.upper()}",
-                f"{block} | intended_side={side.value} | {detail}",
+                (
+                    f"{block} | intended_side={side.value} p_side={model_probability:.3f} "
+                    f"market_edge={edge_cents:+.2f}c required_p={required_probability:.3f} | {detail}"
+                ),
+                decision=f"SHADOW_BUY_{side.value.upper()}",
             )
             return None
-        self._snapshot(listing, seconds_left, target, f"BUY_{side.value.upper()}", detail)
+
+        self._last_retry_reason.pop(listing.slug, None)
+        self._snapshot(
+            listing,
+            seconds_left,
+            target,
+            f"BUY_{side.value.upper()}",
+            (
+                f"p_side={model_probability:.3f} ask={ask}c market_edge={edge_cents:+.2f}c "
+                f"required_p={required_probability:.3f} required_with_margin={required_with_margin:.3f} "
+                f"max_confidence_price={maximum_entry_price}c "
+                f"probability_confirmed={streak}/{self.signal_confirmations} | {detail}"
+            ),
+        )
         return SimSignal(
             side=side,
             signal_ask=ask,
             limit_price=limit_price,
             detail=detail,
-            model_probability=1.0,
+            model_probability=model_probability,
             required_edge_cents=0.0,
-            required_probability=0.0,
-            maximum_entry_price=self.maximum_entry_price,
+            required_probability=required_probability,
+            maximum_entry_price=maximum_entry_price,
         )
+
+    def _clear_signal_confirmation(self, slug: str) -> None:
+        self._signal_side.pop(slug, None)
+        self._signal_streak.pop(slug, None)
+        self._signal_last_confirmed_at.pop(slug, None)
+        self._signal_probability.pop(slug, None)
+
+    def _snapshot_retryable(
+        self,
+        listing: PolymarketListing,
+        seconds_left: float,
+        target: float | None,
+        reason: str,
+        *,
+        decision: str = "SKIP_RETRYING",
+    ) -> None:
+        """Record a temporary skip once per reason while leaving the market eligible."""
+        reason_code = reason.split(" | ", 1)[0]
+        if self._last_retry_reason.get(listing.slug) == reason_code:
+            return
+        self._last_retry_reason[listing.slug] = reason_code
+        self._snapshot(listing, seconds_left, target, decision, reason)
 
     def _snapshot(
         self,
@@ -314,6 +679,9 @@ class PolymarketMomentumStrategy:
         execution_mode: str = "polymarket_paper",
     ) -> None:
         actual_count = self.contracts if count is None else count
+        self.decided.add(listing.slug)
+        self._last_retry_reason.pop(listing.slug, None)
+        self._clear_signal_confirmation(listing.slug)
         position = SimPosition(side=side, entry_price=price, count=actual_count)
         self.positions[listing.slug] = position
         record_entry(
@@ -327,13 +695,18 @@ class PolymarketMomentumStrategy:
         )
 
     def log_open_position(
-        self, listing: PolymarketListing, target: float | None, now: float  # noqa: ARG002
+        self, listing: PolymarketListing, target: float | None, now: float
     ) -> None:
         position = self.positions.get(listing.slug)
         if position is None:
             return
         bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
-        threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        entry_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        peak = self._position_peak_bid.get(listing.slug, position.entry_price)
+        if peak >= self.trailing_stop_arm_price:
+            threshold = max(entry_threshold, max(1, peak - self.trailing_stop_gap_cents))
+        else:
+            threshold = entry_threshold
         record_model_snapshot(
             ticker=listing.slug,
             seconds_left=max(0.0, listing.close_time - now),
@@ -346,7 +719,7 @@ class PolymarketMomentumStrategy:
             reason=(
                 f"market_source={listing.source} | side={position.side.value} "
                 f"entry={position.entry_price}c current_bid={bid}c count={position.count} "
-                f"stop_threshold={threshold}c "
+                f"stop_threshold={threshold}c peak={peak}c "
                 f"stop_streak={self._stop_streak.get(listing.slug, 0)}"
                 f"/{self.stop_loss_confirmations} take_profit={self.take_profit}c"
             ),
@@ -355,49 +728,36 @@ class PolymarketMomentumStrategy:
     def stop_loss_exit_price(
         self, listing: PolymarketListing, now: float
     ) -> int | None:
-        """Flat 15-cent stop from entry (no trailing -- see init comment)."""
+        """Trigger the retained 15-cent stop after two quick confirmations."""
         position = self.positions.get(listing.slug)
         if position is None:
             return None
-
-        def _valid(value: float | None) -> float | None:
-            # A missing quote can arrive as None OR as NaN depending on the
-            # data path. `nan is not None` is True in Python, so a bare
-            # `is not None` check silently lets NaN through as if it were
-            # a real price -- which produces garbage downstream (NaN exit
-            # prices, order submission failures) instead of falling back,
-            # and looks from the logs like the stop simply went inert.
-            # This was the actual cause of a position riding all the way
-            # to settlement with the streak frozen at 0 despite an ask
-            # price being genuinely available the whole time.
-            if value is None:
-                return None
-            if isinstance(value, float) and math.isnan(value):
-                return None
-            return value
-
-        bid = _valid(listing.yes_bid if position.side is Side.YES else listing.no_bid)
-        ask = _valid(listing.yes_ask if position.side is Side.YES else listing.no_ask)
-        opposite_bid = _valid(
-            listing.no_bid if position.side is Side.YES else listing.yes_bid
-        )
-
-        effective_price = bid
-        used_bid = bid is not None
-        if effective_price is None:
-            effective_price = ask
-        if effective_price is None and opposite_bid is not None:
-            # Our own side's book is completely empty (no bid, no ask).
-            # The opposite side almost always still has a live quote in a
-            # binary market, and yes+no prices are complementary -- so a
-            # dominant opposite price (e.g. 99c) tells us our side is
-            # worth about 1c even with nothing directly quoted for it.
-            # This is a last-resort backstop, not a precise fill price.
-            effective_price = max(1, 100 - opposite_bid)
+        bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
+        ask = listing.yes_ask if position.side is Side.YES else listing.no_ask
+        # A vanished bid (no resting buy orders) is not "no information" --
+        # in a fast-resolving market it usually means the book has cleared
+        # out because the outcome is becoming obvious against us. Previously
+        # a missing bid caused this method to return early without even
+        # resetting the streak, freezing the stop indefinitely and letting
+        # the position ride unprotected all the way to settlement. Fall back
+        # to the ask (still live even when the bid disappears) so the stop
+        # keeps evaluating instead of going inert.
+        effective_price = bid if bid is not None else ask
         if effective_price is None:
             return None
 
-        threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        # Track the peak favorable price and tighten the stop once armed.
+        peak = self._position_peak_bid.get(listing.slug, position.entry_price)
+        if effective_price > peak:
+            peak = effective_price
+            self._position_peak_bid[listing.slug] = peak
+
+        entry_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        if peak >= self.trailing_stop_arm_price:
+            trailing_threshold = max(1, peak - self.trailing_stop_gap_cents)
+            threshold = max(entry_threshold, trailing_threshold)
+        else:
+            threshold = entry_threshold
 
         if effective_price > threshold:
             self._stop_streak[listing.slug] = 0
@@ -410,12 +770,16 @@ class PolymarketMomentumStrategy:
         self._stop_streak[listing.slug] = streak
         if streak < self.stop_loss_confirmations:
             return None
-        return max(1, effective_price - 1) if used_bid else max(1, int(effective_price))
+        # If we only have an ask (no bid to sell into), exit at that price
+        # rather than subtracting a cent we have no basis for.
+        return max(1, effective_price - 1) if bid is not None else max(1, effective_price)
 
     def close_position(self, slug: str, exit_price: int, reason: str, now: float) -> None:
         position = self.positions.pop(slug, None)
         self._stop_streak.pop(slug, None)
         self._stop_last_confirmed_at.pop(slug, None)
+        self._position_peak_bid.pop(slug, None)
+        self._clear_signal_confirmation(slug)
         if position is None:
             return
         pnl = (exit_price - position.entry_price) * position.count
@@ -436,11 +800,37 @@ class PolymarketMomentumStrategy:
 
     def prune(self, keep: set[str]) -> None:
         self.decided.intersection_update(keep | set(self.positions))
+        self._last_retry_reason = {
+            slug: reason
+            for slug, reason in self._last_retry_reason.items()
+            if slug in keep
+        }
+        self._signal_side = {
+            slug: side for slug, side in self._signal_side.items() if slug in keep
+        }
+        self._signal_streak = {
+            slug: streak for slug, streak in self._signal_streak.items() if slug in keep
+        }
+        self._signal_last_confirmed_at = {
+            slug: at
+            for slug, at in self._signal_last_confirmed_at.items()
+            if slug in keep
+        }
+        self._signal_probability = {
+            slug: probability
+            for slug, probability in self._signal_probability.items()
+            if slug in keep
+        }
         self._stop_streak = {
             slug: streak for slug, streak in self._stop_streak.items() if slug in keep
         }
         self._stop_last_confirmed_at = {
             slug: at
             for slug, at in self._stop_last_confirmed_at.items()
+            if slug in keep
+        }
+        self._position_peak_bid = {
+            slug: peak
+            for slug, peak in self._position_peak_bid.items()
             if slug in keep
         }
