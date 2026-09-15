@@ -69,6 +69,7 @@ class PolymarketMomentumStrategy:
         signal_confirmation_seconds: float = 2.0,
         max_probability_deterioration: float = 0.08,
         minimum_probability_margin: float = 0.10,
+        minimum_confirmed_entry_seconds: float = 140.0,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -107,6 +108,15 @@ class PolymarketMomentumStrategy:
         # hold up -- going higher (0.15+) trims volume faster than it adds
         # win rate and nets less total profit despite a higher win rate.
         self.minimum_probability_margin = max(0.0, min(0.49, minimum_probability_margin))
+        # Live data: signals that confirm quickly (early in the decision
+        # window, 170-200s still left) win ~74% of the time. Signals that
+        # take a long time to confirm (under 110s left when they finally
+        # do) win only ~33% -- a slow confirmation isn't a signal that
+        # "eventually got good," it's usually a weak/noisy setup that kept
+        # resetting until it limped through once. Require a real
+        # confirmation within the first part of the window; abandon slow
+        # ones rather than keep retrying them.
+        self.minimum_confirmed_entry_seconds = max(0.0, minimum_confirmed_entry_seconds)
 
         self.evaluation_interval = 1.0
         self.decided: set[str] = set()
@@ -526,6 +536,25 @@ class PolymarketMomentumStrategy:
                 (
                     f"{reason} | predicted={side.value} p_side={model_probability:.3f} "
                     f"market_edge={edge_cents:+.2f}c required_p={required_probability:.3f} streak={streak}/{self.signal_confirmations} | {detail}"
+                ),
+            )
+            return None
+
+        if seconds_left < self.minimum_confirmed_entry_seconds:
+            # Confirmed, but took too long to get there -- data shows these
+            # are the weak setups, not late bloomers. Abandon rather than
+            # keep retrying; more time passing only pushes it later.
+            self.decided.add(listing.slug)
+            self._clear_signal_confirmation(listing.slug)
+            self._snapshot(
+                listing,
+                seconds_left,
+                target,
+                "SKIP",
+                (
+                    f"CONFIRMATION_TOO_SLOW | predicted={side.value} p_side={model_probability:.3f} "
+                    f"seconds_left={seconds_left:.0f} minimum_confirmed_entry_seconds="
+                    f"{self.minimum_confirmed_entry_seconds:.0f} | {detail}"
                 ),
             )
             return None
