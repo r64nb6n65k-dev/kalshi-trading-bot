@@ -68,8 +68,8 @@ class PolymarketMomentumStrategy:
         signal_confirmations: int = 2,
         signal_confirmation_seconds: float = 2.0,
         max_probability_deterioration: float = 0.08,
-        minimum_probability_margin: float = 0.10,
-        minimum_confirmed_entry_seconds: float = 140.0,
+        minimum_probability_margin: float = 0.08,
+        minimum_confirmed_entry_seconds: float = 0.0,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -146,6 +146,18 @@ class PolymarketMomentumStrategy:
         self.stop_loss_confirmation_seconds = 1.0
         self._stop_streak: dict[str, int] = {}
         self._stop_last_confirmed_at: dict[str, float] = {}
+
+        # Trailing stop: once a position has genuinely gotten deep into
+        # winning territory, protect that gain instead of leaving the stop
+        # anchored only to entry. Live data: 30% of stop-losses had touched
+        # 85c+ before reversing all the way back to a loss -- $37.58 of
+        # today's losses came from positions that were essentially winners
+        # and were allowed to ride all the way back down. This only ever
+        # tightens the stop (never loosens it), so it can't hurt a trade
+        # that goes straight to take-profit.
+        self.trailing_stop_arm_price = 85
+        self.trailing_stop_gap_cents = 10
+        self._position_peak_bid: dict[str, int] = {}
 
     @staticmethod
     def decision_seconds(interval_minutes: int) -> float:
@@ -689,7 +701,12 @@ class PolymarketMomentumStrategy:
         if position is None:
             return
         bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
-        threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        entry_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        peak = self._position_peak_bid.get(listing.slug, position.entry_price)
+        if peak >= self.trailing_stop_arm_price:
+            threshold = max(entry_threshold, max(1, peak - self.trailing_stop_gap_cents))
+        else:
+            threshold = entry_threshold
         record_model_snapshot(
             ticker=listing.slug,
             seconds_left=max(0.0, listing.close_time - now),
@@ -702,7 +719,7 @@ class PolymarketMomentumStrategy:
             reason=(
                 f"market_source={listing.source} | side={position.side.value} "
                 f"entry={position.entry_price}c current_bid={bid}c count={position.count} "
-                f"stop_threshold={threshold}c "
+                f"stop_threshold={threshold}c peak={peak}c "
                 f"stop_streak={self._stop_streak.get(listing.slug, 0)}"
                 f"/{self.stop_loss_confirmations} take_profit={self.take_profit}c"
             ),
@@ -728,7 +745,20 @@ class PolymarketMomentumStrategy:
         effective_price = bid if bid is not None else ask
         if effective_price is None:
             return None
-        threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+
+        # Track the peak favorable price and tighten the stop once armed.
+        peak = self._position_peak_bid.get(listing.slug, position.entry_price)
+        if effective_price > peak:
+            peak = effective_price
+            self._position_peak_bid[listing.slug] = peak
+
+        entry_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
+        if peak >= self.trailing_stop_arm_price:
+            trailing_threshold = max(1, peak - self.trailing_stop_gap_cents)
+            threshold = max(entry_threshold, trailing_threshold)
+        else:
+            threshold = entry_threshold
+
         if effective_price > threshold:
             self._stop_streak[listing.slug] = 0
             return None
@@ -748,6 +778,7 @@ class PolymarketMomentumStrategy:
         position = self.positions.pop(slug, None)
         self._stop_streak.pop(slug, None)
         self._stop_last_confirmed_at.pop(slug, None)
+        self._position_peak_bid.pop(slug, None)
         self._clear_signal_confirmation(slug)
         if position is None:
             return
@@ -796,5 +827,10 @@ class PolymarketMomentumStrategy:
         self._stop_last_confirmed_at = {
             slug: at
             for slug, at in self._stop_last_confirmed_at.items()
+            if slug in keep
+        }
+        self._position_peak_bid = {
+            slug: peak
+            for slug, peak in self._position_peak_bid.items()
             if slug in keep
         }
