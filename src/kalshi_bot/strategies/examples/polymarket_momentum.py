@@ -1,4 +1,3 @@
-
 """Original momentum-score Polymarket strategy, with the validated stop-loss added.
 
 This restores the entry/signal logic from the earlier version of the bot
@@ -123,12 +122,14 @@ class PolymarketMomentumStrategy:
         self._stop_streak: dict[str, int] = {}
         self._stop_last_confirmed_at: dict[str, float] = {}
 
-        # Trailing stop: once a position is deep into winning territory,
-        # protect that gain instead of leaving the stop anchored only to
-        # entry. Only ever tightens the stop, never loosens it.
-        self.trailing_stop_arm_price = 85
-        self.trailing_stop_gap_cents = 15
-        self._position_peak_bid: dict[str, int] = {}
+        # Trailing stop removed for this strategy. Live data: two trades
+        # ran 10-14c into genuine profit (78->88, 79->93), got tightened by
+        # the trail, then a normal pullback -- not a flash crash -- took
+        # them out before they recovered. This strategy has no entry
+        # confirmation and a much looser separation gate than the one the
+        # 15c trail was tuned against, so price action around its entries
+        # is choppier and needs more room. Back to a flat 15c stop from
+        # entry only.
 
     @staticmethod
     def decision_seconds(interval_minutes: int) -> float:
@@ -331,12 +332,7 @@ class PolymarketMomentumStrategy:
         if position is None:
             return
         bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
-        entry_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
-        peak = self._position_peak_bid.get(listing.slug, position.entry_price)
-        if peak >= self.trailing_stop_arm_price:
-            threshold = max(entry_threshold, max(1, peak - self.trailing_stop_gap_cents))
-        else:
-            threshold = entry_threshold
+        threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
         record_model_snapshot(
             ticker=listing.slug,
             seconds_left=max(0.0, listing.close_time - now),
@@ -349,7 +345,7 @@ class PolymarketMomentumStrategy:
             reason=(
                 f"market_source={listing.source} | side={position.side.value} "
                 f"entry={position.entry_price}c current_bid={bid}c count={position.count} "
-                f"stop_threshold={threshold}c peak={peak}c "
+                f"stop_threshold={threshold}c "
                 f"stop_streak={self._stop_streak.get(listing.slug, 0)}"
                 f"/{self.stop_loss_confirmations} take_profit={self.take_profit}c"
             ),
