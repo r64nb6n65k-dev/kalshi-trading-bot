@@ -25,6 +25,7 @@ price-band cap at all).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import ClassVar
@@ -354,31 +355,49 @@ class PolymarketMomentumStrategy:
     def stop_loss_exit_price(
         self, listing: PolymarketListing, now: float
     ) -> int | None:
-        """15-cent stop from entry, tightened by a trailing stop once deep in profit."""
+        """Flat 15-cent stop from entry (no trailing -- see init comment)."""
         position = self.positions.get(listing.slug)
         if position is None:
             return None
-        bid = listing.yes_bid if position.side is Side.YES else listing.no_bid
-        ask = listing.yes_ask if position.side is Side.YES else listing.no_ask
-        # A vanished bid (no resting buy orders) is not "no information" --
-        # in a fast-resolving market it usually means the book has cleared
-        # out because the outcome is becoming obvious against us. Fall back
-        # to the ask so the stop keeps evaluating instead of going inert.
-        effective_price = bid if bid is not None else ask
+
+        def _valid(value: float | None) -> float | None:
+            # A missing quote can arrive as None OR as NaN depending on the
+            # data path. `nan is not None` is True in Python, so a bare
+            # `is not None` check silently lets NaN through as if it were
+            # a real price -- which produces garbage downstream (NaN exit
+            # prices, order submission failures) instead of falling back,
+            # and looks from the logs like the stop simply went inert.
+            # This was the actual cause of a position riding all the way
+            # to settlement with the streak frozen at 0 despite an ask
+            # price being genuinely available the whole time.
+            if value is None:
+                return None
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            return value
+
+        bid = _valid(listing.yes_bid if position.side is Side.YES else listing.no_bid)
+        ask = _valid(listing.yes_ask if position.side is Side.YES else listing.no_ask)
+        opposite_bid = _valid(
+            listing.no_bid if position.side is Side.YES else listing.yes_bid
+        )
+
+        effective_price = bid
+        used_bid = bid is not None
+        if effective_price is None:
+            effective_price = ask
+        if effective_price is None and opposite_bid is not None:
+            # Our own side's book is completely empty (no bid, no ask).
+            # The opposite side almost always still has a live quote in a
+            # binary market, and yes+no prices are complementary -- so a
+            # dominant opposite price (e.g. 99c) tells us our side is
+            # worth about 1c even with nothing directly quoted for it.
+            # This is a last-resort backstop, not a precise fill price.
+            effective_price = max(1, 100 - opposite_bid)
         if effective_price is None:
             return None
 
-        peak = self._position_peak_bid.get(listing.slug, position.entry_price)
-        if effective_price > peak:
-            peak = effective_price
-            self._position_peak_bid[listing.slug] = peak
-
-        entry_threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
-        if peak >= self.trailing_stop_arm_price:
-            trailing_threshold = max(1, peak - self.trailing_stop_gap_cents)
-            threshold = max(entry_threshold, trailing_threshold)
-        else:
-            threshold = entry_threshold
+        threshold = max(1, position.entry_price - self.stop_loss_gap_cents)
 
         if effective_price > threshold:
             self._stop_streak[listing.slug] = 0
@@ -391,13 +410,12 @@ class PolymarketMomentumStrategy:
         self._stop_streak[listing.slug] = streak
         if streak < self.stop_loss_confirmations:
             return None
-        return max(1, effective_price - 1) if bid is not None else max(1, effective_price)
+        return max(1, effective_price - 1) if used_bid else max(1, int(effective_price))
 
     def close_position(self, slug: str, exit_price: int, reason: str, now: float) -> None:
         position = self.positions.pop(slug, None)
         self._stop_streak.pop(slug, None)
         self._stop_last_confirmed_at.pop(slug, None)
-        self._position_peak_bid.pop(slug, None)
         if position is None:
             return
         pnl = (exit_price - position.entry_price) * position.count
@@ -425,7 +443,4 @@ class PolymarketMomentumStrategy:
             slug: at
             for slug, at in self._stop_last_confirmed_at.items()
             if slug in keep
-        }
-        self._position_peak_bid = {
-            slug: peak for slug, peak in self._position_peak_bid.items() if slug in keep
         }
