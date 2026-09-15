@@ -149,14 +149,14 @@ class PolymarketMomentumStrategy:
 
         # Trailing stop: once a position has genuinely gotten deep into
         # winning territory, protect that gain instead of leaving the stop
-        # anchored only to entry. Live data: 30% of stop-losses had touched
-        # 85c+ before reversing all the way back to a loss -- $37.58 of
-        # today's losses came from positions that were essentially winners
-        # and were allowed to ride all the way back down. This only ever
-        # tightens the stop (never loosens it), so it can't hurt a trade
-        # that goes straight to take-profit.
+        # anchored only to entry. Tested against full historical price
+        # paths with realistic confirmation delay before shipping: a 10c
+        # gap was too tight and clipped normal chop more often than it
+        # saved real reversals (net worse than no trailing stop at all).
+        # 15c gap tested as a modest, real improvement (+$0.28 / +21% on
+        # a 77-trade sample) without cutting winners short unnecessarily.
         self.trailing_stop_arm_price = 85
-        self.trailing_stop_gap_cents = 10
+        self.trailing_stop_gap_cents = 15
         self._position_peak_bid: dict[str, int] = {}
 
     @staticmethod
