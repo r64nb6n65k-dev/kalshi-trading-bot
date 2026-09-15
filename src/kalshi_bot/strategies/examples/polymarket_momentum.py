@@ -67,7 +67,7 @@ class PolymarketMomentumStrategy:
         signal_confirmations: int = 2,
         signal_confirmation_seconds: float = 2.0,
         max_probability_deterioration: float = 0.05,
-        minimum_probability_margin: float = 0.08,
+        minimum_probability_margin: float = 0.10,
     ) -> None:
         self.contracts = contracts
         self.bankroll_cents = bankroll_cents
@@ -99,8 +99,12 @@ class PolymarketMomentumStrategy:
         self.max_probability_deterioration = max(0.0, max_probability_deterioration)
         # Live data shows model confidence barely above the required bar is
         # close to a coin flip (~50% win rate), while confidence clearing the
-        # bar by 10+ points wins ~71%. Require a real cushion above the bar,
-        # not just any positive margin, before a signal is tradeable.
+        # bar by 10+ points wins ~71%. Raised from 0.08 -> 0.10: whatever the
+        # cutoff, trades that barely clear it underperform (that cohort just
+        # moves with the cutoff), so 0.08 still had a coin-flip band right
+        # above it. 0.10 is the point where win rate and trade volume both
+        # hold up -- going higher (0.15+) trims volume faster than it adds
+        # win rate and nets less total profit despite a higher win rate.
         self.minimum_probability_margin = max(0.0, min(0.49, minimum_probability_margin))
 
         self.evaluation_interval = 1.0
