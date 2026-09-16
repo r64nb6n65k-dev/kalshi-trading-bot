@@ -58,7 +58,7 @@ class PolymarketMomentumStrategy:
         minimum_history: float = 45.0,
         minimum_separation_bps: float = 0.0,
         minimum_entry_price: int = 1,
-        maximum_entry_price: int = 97,
+        maximum_entry_price: int = 85,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
         final_entry_seconds: float = 45.0,
@@ -810,4 +810,3 @@ class PolymarketMomentumStrategy:
             for slug, at in self._stop_last_confirmed_at.items()
             if slug in keep
         }
-
