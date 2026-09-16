@@ -58,7 +58,7 @@ class PolymarketMomentumStrategy:
         minimum_history: float = 45.0,
         minimum_separation_bps: float = 0.0,
         minimum_entry_price: int = 1,
-        maximum_entry_price: int = 85,
+        maximum_entry_price: int = 97,
         entry_slippage_cents: int = 2,
         decision_window: float = 15.0,
         final_entry_seconds: float = 45.0,
@@ -146,6 +146,19 @@ class PolymarketMomentumStrategy:
         self.stop_loss_confirmation_seconds = 1.0
         self._stop_streak: dict[str, int] = {}
         self._stop_last_confirmed_at: dict[str, float] = {}
+
+        # Liquidity failsafe: if the bid disappears entirely for several
+        # consecutive ticks while we're holding a position, the book has
+        # gone dead -- there's no one to sell to. Waiting for the normal
+        # 2-confirmation stop can fail here: an oscillating ask (seen live
+        # swinging 1c/99c/29c/71c tick to tick) keeps resetting the stop
+        # streak before it ever confirms, and the position rides unprotected
+        # to settlement (observed twice: -$1.38 and -$1.70, both starting
+        # with the bid vanishing for 5+ consecutive ticks). This does NOT
+        # touch the normal stop path -- it only fires when there's no bid
+        # at all, which never happens on a healthy trade.
+        self.liquidity_failsafe_ticks = 3
+        self._bid_missing_streak: dict[str, int] = {}
 
         # Trailing stop removed. It tested well on a looser trade pool
         # (0.08 margin, +$0.28/+21%), but retested against the pool that's
@@ -270,24 +283,46 @@ class PolymarketMomentumStrategy:
         return max(0.25, min(4.0, recent_volume / baseline))
 
     def _required_probability(self, entry_price: int) -> float:
-        """Directional-confidence gate from the 2026-09-15 trade replay.
+        """Minimum directional confidence required at a given contract price.
 
-        Normal entries at 70c+ require p_side >= 0.74. Cheaper entries are
-        allowed only when the model is substantially stronger (>= 0.80);
-        those sub-70c entries must also have positive model edge.
+        Cheap and mid-priced contracts can be entered on a modest directional
+        advantage. Expensive contracts require substantially stronger evidence
+        because a single loss carries much more downside than the remaining upside.
         """
+        if entry_price < 60:
+            return max(self.minimum_model_probability, 0.55)
         if entry_price < 70:
-            return max(self.minimum_model_probability, 0.80)
-        return max(self.minimum_model_probability, 0.74)
+            return max(self.minimum_model_probability, 0.58)
+        if entry_price < 80:
+            return max(self.minimum_model_probability, 0.62)
+        if entry_price < 90:
+            return max(self.minimum_model_probability, 0.72)
+        # Ninety-cent-plus entries are intentionally rare. A 90c loser erases
+        # several ordinary winners, so demand near-certainty from the model.
+        return max(self.minimum_model_probability, 0.94)
 
     def _required_edge_cents(self, entry_price: int) -> float:
         """Compatibility helper: edge is logged, but no longer gates entry."""
         return 0.0
 
+    @staticmethod
+    def _taker_fee_cents_per_contract(price_cents: int) -> float:
+        """Polymarket crypto-market taker fee, per contract.
+
+        fee = shares * price * feeRate * (price * (1 - price))^exponent,
+        with feeRate=0.07 and exponent=1 for crypto (confirmed against
+        Polymarket's live event data). Peaks at 50c, shrinks toward the
+        extremes. Only taker (spread-crossing) orders pay this; resting
+        maker orders pay nothing and earn a rebate instead -- see the
+        note on entry order type where this is used.
+        """
+        p = max(0.0, min(1.0, price_cents / 100.0))
+        return p * 0.07 * (p * (1.0 - p)) * 100.0
+
     def _maximum_price_for_probability(self, probability: float) -> int:
         max_price = 0
         for price in range(self.minimum_entry_price, self.maximum_entry_price + 1):
-            if probability >= self._required_probability(price):
+            if probability >= self._required_probability(price) + self.minimum_probability_margin:
                 max_price = price
         return max_price
 
@@ -508,18 +543,10 @@ class PolymarketMomentumStrategy:
             return None
 
         required_probability = self._required_probability(ask)
-        # The replay thresholds are absolute p_side gates. Do not stack the
-        # older probability-margin rule on top of them or 74% would silently
-        # become 84%.
-        required_with_margin = required_probability
+        required_with_margin = required_probability + self.minimum_probability_margin
         edge_cents = model_probability * 100.0 - ask
         maximum_entry_price = self._maximum_price_for_probability(model_probability)
-        low_price_edge_failed = ask < 70 and edge_cents <= 0.0
-        if (
-            model_probability < required_probability
-            or low_price_edge_failed
-            or maximum_entry_price < self.minimum_entry_price
-        ):
+        if model_probability < required_with_margin or maximum_entry_price < self.minimum_entry_price:
             self._snapshot_retryable(
                 listing,
                 seconds_left,
@@ -528,8 +555,29 @@ class PolymarketMomentumStrategy:
                     f"PRICE_ADJUSTED_CONFIDENCE_TOO_LOW | predicted={side.value} ask={ask}c "
                     f"p_side={model_probability:.3f} required_p={required_probability:.3f} "
                     f"required_with_margin={required_with_margin:.3f} "
-                    f"market_edge={edge_cents:+.2f}c low_price_positive_edge_required={ask < 70} "
-                    f"max_confidence_price={maximum_entry_price}c | {detail}"
+                    f"market_edge={edge_cents:+.2f}c max_confidence_price={maximum_entry_price}c | {detail}"
+                ),
+            )
+            return None
+
+        # Live data: avg round-trip fee (2.6c) exceeded avg gross edge
+        # (2.2c) across 94 real trades, turning +$2.06 gross into -$0.40
+        # net. The probability margin above doesn't know fees exist.
+        # Require the edge to actually clear the toll, not just the bar.
+        entry_fee = self._taker_fee_cents_per_contract(ask)
+        # Conservative estimate: exit fee is usually cheaper (take-profit
+        # exits sit near 98c, where fees are tiny), but stop-loss exits
+        # land mid-range (30-60c) where fees are near their worst. Use
+        # the entry fee again rather than assume the cheap case.
+        estimated_round_trip_fee = entry_fee * 2
+        if edge_cents < estimated_round_trip_fee:
+            self._snapshot_retryable(
+                listing,
+                seconds_left,
+                target,
+                (
+                    f"EDGE_BELOW_FEE_COST | predicted={side.value} ask={ask}c "
+                    f"market_edge={edge_cents:+.2f}c estimated_fee={estimated_round_trip_fee:.2f}c | {detail}"
                 ),
             )
             return None
@@ -735,6 +783,23 @@ class PolymarketMomentumStrategy:
         # the position ride unprotected all the way to settlement. Fall back
         # to the ask (still live even when the bid disappears) so the stop
         # keeps evaluating instead of going inert.
+        if bid is None:
+            self._bid_missing_streak[listing.slug] = (
+                self._bid_missing_streak.get(listing.slug, 0) + 1
+            )
+        else:
+            self._bid_missing_streak[listing.slug] = 0
+
+        # Liquidity failsafe -- fires only when the bid has been genuinely
+        # absent for several straight ticks (a dead/collapsed book), not on
+        # a single missing read. Bypasses the normal threshold/confirmation
+        # streak, which an oscillating ask can defeat indefinitely. Exits
+        # at whatever is executable (ask if present, else the last-known
+        # bid floor of 1c) rather than letting the position ride to zero.
+        if self._bid_missing_streak.get(listing.slug, 0) >= self.liquidity_failsafe_ticks:
+            self._stop_streak[listing.slug] = 0
+            return max(1, ask) if ask is not None else 1
+
         effective_price = bid if bid is not None else ask
         if effective_price is None:
             return None
@@ -760,6 +825,7 @@ class PolymarketMomentumStrategy:
         position = self.positions.pop(slug, None)
         self._stop_streak.pop(slug, None)
         self._stop_last_confirmed_at.pop(slug, None)
+        self._bid_missing_streak.pop(slug, None)
         self._clear_signal_confirmation(slug)
         if position is None:
             return
@@ -808,5 +874,10 @@ class PolymarketMomentumStrategy:
         self._stop_last_confirmed_at = {
             slug: at
             for slug, at in self._stop_last_confirmed_at.items()
+            if slug in keep
+        }
+        self._bid_missing_streak = {
+            slug: streak
+            for slug, streak in self._bid_missing_streak.items()
             if slug in keep
         }
