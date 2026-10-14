@@ -290,6 +290,16 @@ def side_depth(book: BinaryOrderBook, outcome: str, band: int) -> int:
     return sum(size for price, size in levels.items() if price > best - band)
 
 
+def book_crossed(book: BinaryOrderBook) -> bool:
+    """A real binary book always has best YES bid + best NO bid < 100.
+
+    If not, the local book is corrupt (wrong price convention, missed delta)
+    and nothing may be traded or exited against it.
+    """
+    yes, no = book.bid("yes"), book.bid("no")
+    return yes is not None and no is not None and yes + no >= 100
+
+
 def ask_levels(book: BinaryOrderBook, outcome: str) -> list[tuple[int, int]]:
     """Ascending (price, size) levels a buyer of ``outcome`` can lift."""
     opposite = book.no if outcome == "yes" else book.yes
@@ -396,7 +406,7 @@ class SeriesProfile:
             return
         mid = state.mid()
         spread = state.book.spread
-        if mid is None or spread is None:
+        if mid is None or spread is None or spread <= 0:
             return
         depth = side_depth(state.book, "yes", band) + side_depth(state.book, "no", band)
         self._samples.append((now, state.info.ticker, mid, spread, depth))
@@ -577,6 +587,8 @@ def evaluate(
         return None, "BOOK_ONE_SIDED"
     if f.move is None or f.move_fast is None:
         return None, "HISTORY_SHORT"
+    if f.spread <= 0:
+        return None, f"BOOK_CROSSED spread={f.spread}c"
     if f.spread > rules.max_spread_cents:
         return None, f"SPREAD_WIDE {f.spread}c>{rules.max_spread_cents}c"
 
@@ -739,6 +751,7 @@ class ScalperCore:
         self._paused_until = 0.0
         self.last_reason: dict[str, str] = {}
         self._entry_context: dict[int, dict[str, Any]] = {}
+        self._crossed_logged: dict[str, float] = {}
 
     # ------------------------------------------------------------------ io
     def _emit(self, kind: str, data: dict[str, Any]) -> None:
@@ -797,6 +810,18 @@ class ScalperCore:
             if state.book.ready:
                 self.profiles[state.info.series].sample(state, now, self.cfg.depth_band_cents)
             if ticker in self.pending_orders:
+                continue
+            if state.book.ready and book_crossed(state.book):
+                self.last_reason[ticker] = (
+                    f"BOOK_CROSSED yes_bid={state.book.bid('yes')} no_bid={state.book.bid('no')}"
+                )
+                self.pending_signals.pop(ticker, None)
+                if now - self._crossed_logged.get(ticker, 0.0) > 60:
+                    self._crossed_logged[ticker] = now
+                    logger.error(
+                        "CROSSED ORDER BOOK | %s | yes_bid=%s no_bid=%s | not trading this market",
+                        ticker, state.book.bid("yes"), state.book.bid("no"),
+                    )
                 continue
             position = self.positions.get(ticker)
             if position is not None:
@@ -1004,7 +1029,8 @@ class ScalperCore:
             state = self.markets.get(ticker)
             if pos.awaiting_settlement or ticker in self.pending_orders or state is None:
                 continue
-            bid = state.book.bid(pos.side) if state.book.ready else None
+            ok = state.book.ready and not book_crossed(state.book)
+            bid = state.book.bid(pos.side) if ok else None
             if bid is None:
                 continue
             pos.last_exit_reason = reason
@@ -1211,6 +1237,8 @@ class Broker(Protocol):
 
 def simulate_ioc(intent: Intent, book: BinaryOrderBook, fee_rate: float = 0.07) -> Fill:
     """Fill against displayed liquidity only, never beyond the limit price."""
+    if book_crossed(book):
+        return Fill(0, 0.0, 0)
     if intent.action == "buy":
         levels = [(p, s) for p, s in ask_levels(book, intent.side) if p <= intent.limit_price]
     else:
@@ -1737,7 +1765,14 @@ class ScalperRunner:
         await self._ws.send(json.dumps({
             "id": self._ws_ids,
             "cmd": "subscribe",
-            "params": {"channels": ["orderbook_delta", "trade"], "market_tickers": tickers},
+            "params": {
+                "channels": ["orderbook_delta", "trade"],
+                "market_tickers": tickers,
+                # NO-side levels must arrive as NO prices: the book derives
+                # YES asks as 100 - best NO bid. Without this flag Kalshi sends
+                # NO levels in YES terms and the book comes out crossed.
+                "use_yes_price": False,
+            },
         }))
         self._subscribed.update(tickers)
 
