@@ -41,12 +41,16 @@ from kalshi_bot.strategies.examples.market_maker import MarketMaker
 from kalshi_bot.strategies.examples.mean_reversion import MeanReversion
 from kalshi_bot.strategies.examples.momentum import Momentum
 from kalshi_bot.strategies.examples.polymarket_momentum import PolymarketMomentumStrategy
+from kalshi_bot.weather.cli_commands import register_weather_commands
 
 app = typer.Typer(
     add_completion=False,
     help="Kalshi Trading Bot â open-source framework by Viprasol Tech.",
 )
 console = Console()
+
+# weather-check / weather-calibrate / weather-show / weather-run / weather-report
+register_weather_commands(app, console)
 
 
 STRATEGIES: dict[str, type[Strategy]] = {
