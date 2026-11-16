@@ -13,6 +13,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from kalshi_bot.weather.settings import WeatherSettings
+
 
 class Environment(str, Enum):
     """Kalshi trading environments."""
@@ -101,6 +103,9 @@ class Settings(BaseSettings):
     )
 
     risk: RiskSettings = Field(default_factory=RiskSettings)
+
+    # Weather bot settings (KALSHI_WEATHER__*). See WEATHER_BOT.md.
+    weather: WeatherSettings = Field(default_factory=WeatherSettings)
 
     @field_validator("api_key_id")
     @classmethod
