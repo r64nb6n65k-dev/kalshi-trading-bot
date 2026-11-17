@@ -89,8 +89,8 @@ Code: `src/kalshi_bot/weather/model.py`
 Code: `src/kalshi_bot/weather/strategy.py`
 
 * **Probability used for trading** = `confidence × model + (1 − confidence) × market mid`
-  (default 0.7). This hedges against model error and keeps Kelly sizing sane.
-* **Entry:** buy YES if `p − ask − fee ≥ min_edge` (default 6c), or buy NO if
+  (default 0.5 before the day starts, 0.25 once it's under way, because traders watch the same observations). This hedges against model error and keeps Kelly sizing sane.
+* **Entry:** buy YES if `p − ask − fee ≥ min_edge` (default 8c), or buy NO if
   `(1 − p) − no_ask − fee ≥ min_edge`. Fee = `0.07 × P × (1 − P)` per contract.
 * **Size:** quarter-Kelly (from `KALSHI_RISK__KELLY_FRACTION`), then capped by:
   * 50 contracts per order;
@@ -118,9 +118,9 @@ Code: `src/kalshi_bot/weather/strategy.py`
 | `USER_AGENT` | placeholder | **Set this** (NWS requires contact info) |
 | `DATA_DIR` | `./data/weather` | Logs, ledger, calibration |
 | `OPENMETEO_API_KEY` | empty | Paid key (see data-source notes) |
-| `MIN_EDGE` | `0.06` | Edge after fees required to trade |
-| `CONFIDENCE` | `0.7` | Model vs. market-mid weight |
-| `MIN_PRICE` / `MAX_PRICE` | `3` / `95` | Don't trade outside this price range (cents) |
+| `MIN_EDGE` | `0.08` | Edge after fees required to trade |
+| `CONFIDENCE` / `INTRADAY_CONFIDENCE` | `0.5` / `0.25` | Model vs. market-mid weight before / during the day |
+| `MIN_PRICE` / `MAX_PRICE` | `12` / `88` | Never buy long shots (either side) priced outside this range |
 | `MAX_CONTRACTS_PER_ORDER` | `50` | |
 | `MAX_COST_PER_MARKET_CENTS` | `1500` | |
 | `MAX_COST_PER_EVENT_CENTS` | `2500` | |

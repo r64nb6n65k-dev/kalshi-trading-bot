@@ -308,7 +308,7 @@ class WeatherEngine:
                     decisions: list[Decision] = []
                     if self._can_trade(ev, now):
                         decisions = self.strategy.decide(
-                            ev, probs, positions, budget, bankroll, now
+                            ev, probs, positions, budget, bankroll, now, intraday=res.intraday
                         )
                         for d in decisions:
                             await self._execute(d, positions, ev)

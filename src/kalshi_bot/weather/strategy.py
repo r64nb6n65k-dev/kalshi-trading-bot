@@ -110,9 +110,11 @@ class WeatherStrategy:
         budget: Budget,
         bankroll_cents: int,
         now: datetime,
+        intraday: bool = False,
     ) -> list[Decision]:
         ws = self.ws
         day = event.day.isoformat()
+        weight = ws.intraday_confidence if intraday else ws.confidence
         out: list[Decision] = []
 
         if ws.partition_arb and event.valid:
@@ -129,7 +131,7 @@ class WeatherStrategy:
             mid: float | None = None
             if m.yes_bid and m.yes_ask and m.yes_ask > m.yes_bid:
                 mid = (m.yes_bid + m.yes_ask) / 200.0
-            p_used = ws.confidence * p + (1 - ws.confidence) * mid if mid is not None else p
+            p_used = weight * p + (1 - weight) * mid if mid is not None else p
             pos = positions.get(m.ticker, 0)
 
             # ---- exits ------------------------------------------------
@@ -139,6 +141,8 @@ class WeatherStrategy:
                 )
                 if ex is not None:
                     out.append(ex)
+                    # Don't flip straight back in after selling.
+                    self.last_entry[m.ticker] = now
                     continue
 
             # ---- entries ----------------------------------------------

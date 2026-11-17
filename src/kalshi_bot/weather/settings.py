@@ -74,7 +74,7 @@ class WeatherSettings(BaseModel):
     # --- Model --------------------------------------------------------------
     samples: int = Field(default=40_000, ge=1_000)
     tail_weight: float = Field(
-        default=0.10,
+        default=0.05,
         ge=0,
         le=0.5,
         description="Share of samples drawn with doubled spread (fat tails).",
@@ -88,18 +88,29 @@ class WeatherSettings(BaseModel):
 
     # --- Strategy -----------------------------------------------------------
     min_edge: float = Field(
-        default=0.06,
+        default=0.08,
         ge=0,
-        description="Required edge after fees, in probability units (0.06 = 6c).",
+        description="Required edge after fees, in probability units (0.08 = 8c).",
     )
     confidence: float = Field(
-        default=0.7,
+        default=0.5,
         ge=0,
         le=1,
-        description="Weight on the model vs the market mid when sizing (1 = trust model).",
+        description="Weight on the model vs the market mid before the day starts (1 = model only).",
     )
-    min_price: int = Field(default=3, ge=1, le=99)
-    max_price: int = Field(default=95, ge=1, le=99)
+    intraday_confidence: float = Field(
+        default=0.25,
+        ge=0,
+        le=1,
+        description=(
+            "Weight on the model once the climate day is under way. Traders watch the same "
+            "observations, so the market mid gets more say."
+        ),
+    )
+    # Never buy a contract priced below min_price: cheap long shots (either side)
+    # are where the market is usually right and the model most often wrong.
+    min_price: int = Field(default=12, ge=1, le=99)
+    max_price: int = Field(default=88, ge=1, le=99)
     fee_rate: float = Field(default=0.07, ge=0)
     max_contracts_per_order: int = Field(default=50, gt=0)
     max_cost_per_market_cents: int = Field(default=1_500, gt=0)
@@ -110,9 +121,11 @@ class WeatherSettings(BaseModel):
         description="Cap across ALL cities for one date (weather systems are correlated).",
     )
     paper_bankroll_cents: int = Field(default=50_000, gt=0)
-    reentry_cooldown_s: float = Field(default=600.0, ge=0)
+    reentry_cooldown_s: float = Field(
+        default=3600.0, ge=0, description="No new entry on a market this soon after any trade."
+    )
     exit_on_reversal: bool = True
-    exit_margin: float = Field(default=0.04, ge=0)
+    exit_margin: float = Field(default=0.08, ge=0)
     partition_arb: bool = True
     stop_trading_minutes_before_close: float = Field(default=5.0, ge=0)
 
