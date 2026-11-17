@@ -42,6 +42,17 @@ already has.
 **The go/no-go gate is step 5.** If `Brier model` isn't clearly below `Brier
 market` for a lead bucket, the model has no edge there, so don't trade it.
 
+## Dashboard
+
+`weather-run` serves a phone-friendly dashboard on `$PORT` (Railway sets it;
+default 8080). It shows P&L, open bets marked to the current bid, the
+model-vs-market table for every open event, recent trades and settlements,
+plus CSV downloads. Use `--no-dashboard` to turn it off.
+
+On Railway, attach a **volume**: the bot then keeps its logs, paper ledger and
+calibration in `<volume>/weather`, so they survive redeploys. Without one,
+every redeploy starts from zero.
+
 ## 3. How the model works
 
 Code: `src/kalshi_bot/weather/model.py`

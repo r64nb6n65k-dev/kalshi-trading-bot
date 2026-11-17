@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from typing import Any
 
 from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Action, Side
@@ -25,7 +26,7 @@ from kalshi_bot.telemetry.logging import get_logger
 from kalshi_bot.weather.brackets import WeatherEvent, group_events
 from kalshi_bot.weather.calibration import CalibrationStore
 from kalshi_bot.weather.datalog import DataLog
-from kalshi_bot.weather.fees import fee_cents
+from kalshi_bot.weather.fees import fee_cents, fee_per_contract
 from kalshi_bot.weather.forecasts import ForecastBundle, OpenMeteoClient
 from kalshi_bot.weather.ledger import PaperLedger, budget_from_live, day_of
 from kalshi_bot.weather.model import ModelResult, build_distribution
@@ -66,6 +67,48 @@ class EventSnapshot:
     decisions: list[Decision]
 
 
+def snapshot_dict(s: EventSnapshot, fee_rate: float) -> dict[str, Any]:
+    """JSON-safe summary of one modeled event (for the dashboard)."""
+    m = s.model
+    rows = []
+    for bm in s.event.brackets:
+        mk = bm.market
+        p = s.probs[bm.ticker]
+        no_ask = mk.no_ask or (100 - mk.yes_bid if mk.yes_bid else None)
+        rows.append(
+            {
+                "ticker": bm.ticker,
+                "label": bm.bracket.label(),
+                "p": round(p, 4),
+                "yes_bid": mk.yes_bid,
+                "yes_ask": mk.yes_ask,
+                "no_bid": mk.no_bid,
+                "no_ask": no_ask,
+                "edge_yes": None
+                if not mk.yes_ask
+                else round(p - mk.yes_ask / 100 - fee_per_contract(mk.yes_ask, fee_rate), 4),
+                "edge_no": None
+                if not no_ask
+                else round((1 - p) - no_ask / 100 - fee_per_contract(no_ask, fee_rate), 4),
+            }
+        )
+    return {
+        "event": s.event.event_ticker,
+        "station": s.station.code,
+        "city": s.station.name,
+        "kind": s.kind.value,
+        "day": s.event.day.isoformat(),
+        "mean": round(m.mean, 1),
+        "std": round(m.std, 1),
+        "lead_hours": round(m.lead_hours, 1),
+        "intraday": m.intraday,
+        "obs_lo": None if m.obs_lo is None else round(m.obs_lo, 1),
+        "obs_hi": None if m.obs_hi is None else round(m.obs_hi, 1),
+        "brackets": rows,
+        "decisions": [d.reason for d in s.decisions],
+    }
+
+
 class WeatherEngine:
     def __init__(
         self,
@@ -86,7 +129,7 @@ class WeatherEngine:
         self.risk = risk
         self.mode = mode
         self.now_fn = now_fn or (lambda: datetime.now(UTC))
-        self.data_dir = Path(settings.data_dir)
+        self.data_dir = settings.data_path()
         self.stations = resolve_stations(settings.station_codes(), settings.series_overrides)
         self.kinds = [Kind(k) for k in settings.kind_names()]
         self.calibration = CalibrationStore(self.data_dir / "calibration.json")
@@ -103,6 +146,13 @@ class WeatherEngine:
         self._warned: set[str] = set()
         self._last_settle = float("-inf")  # monotonic clock can start near 0
         self._running = False
+        # Read by the dashboard thread; replaced wholesale, never mutated.
+        self.started_at = datetime.now(UTC)
+        self.cycles = 0
+        self.last_cycle_at: datetime | None = None
+        self.last_error: str | None = None
+        self.last_snapshots: list[dict[str, Any]] = []
+        self.live_account: dict[str, Any] | None = None
 
     async def aclose(self) -> None:
         await self.openmeteo.aclose()
@@ -192,6 +242,19 @@ class WeatherEngine:
         if self.mode == "live":
             live = await self.client.get_positions()
             balance = (await self.client.get_balance()).balance
+            self.live_account = {
+                "balance_cents": balance,
+                "positions": [
+                    {
+                        "ticker": p.ticker,
+                        "count": p.position,
+                        "cost_cents": abs(p.market_exposure),
+                        "realized_cents": p.realized_pnl,
+                    }
+                    for p in live
+                    if p.position
+                ],
+            }
             return {p.ticker: p.position for p in live}, budget_from_live(live), balance
         return self.ledger.signed_positions(), self.ledger.budget(), self.ledger.bankroll_cents()
 
@@ -253,6 +316,9 @@ class WeatherEngine:
                     snapshots.append(EventSnapshot(st, kind, ev, res, probs, decisions))
         if self.mode == "paper":
             await self._settle_paper()
+        self.last_snapshots = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots]
+        self.last_cycle_at = datetime.now(UTC)
+        self.cycles += 1
         return snapshots
 
     def _maybe_log(
@@ -378,6 +444,9 @@ class WeatherEngine:
                     logger.info("cycle %d: %d events modeled", n + 1, len(snaps))
                 except Exception:
                     logger.exception("cycle failed; continuing")
+                    self.last_error = (
+                        f"{datetime.now(UTC):%H:%M:%S} UTC: {traceback.format_exc(limit=1)}"
+                    )
                 n += 1
                 if max_cycles is not None and n >= max_cycles:
                     break

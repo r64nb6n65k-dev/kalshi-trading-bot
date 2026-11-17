@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -25,6 +24,7 @@ from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.weather.brackets import group_events
 from kalshi_bot.weather.calibration import CalibrationStore
 from kalshi_bot.weather.climate import fetch_cli
+from kalshi_bot.weather.dashboard import start_weather_dashboard
 from kalshi_bot.weather.datalog import DataLog
 from kalshi_bot.weather.engine import WeatherEngine
 from kalshi_bot.weather.fees import fee_per_contract
@@ -126,8 +126,8 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
                             f"{ok(bool(sets))} open-meteo: "
                             + (", ".join(f"{h.source}({h.n_members})" for h in sets) or "nothing")
                         )
-                        for e in errs[:4]:
-                            say(f"     tried {e[:160]}")
+                        for err in errs[:4]:
+                            say(f"     tried {err[:160]}")
                         try:
                             cli = await fetch_cli(st.icao, [now.year], ws.user_agent)
                             last = max(cli) if cli else None
@@ -158,12 +158,12 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
             ws = load_settings().weather
             stations = resolve_stations(ws.station_codes(), ws.series_overrides)
             kinds = [Kind(k) for k in ws.kind_names()]
-            store = CalibrationStore(Path(ws.data_dir) / "calibration.json")
+            store = CalibrationStore(ws.data_path() / "calibration.json")
             if source == "history":
                 outcomes = await calibrate_history(stations, kinds, ws, store, days=days)
             elif source == "log":
                 outcomes = await calibrate_from_log(
-                    stations, kinds, ws, store, DataLog(Path(ws.data_dir))
+                    stations, kinds, ws, store, DataLog(ws.data_path())
                 )
             else:
                 raise typer.BadParameter("source must be 'history' or 'log'")
@@ -249,8 +249,11 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
         log_only: bool = typer.Option(False, "--log-only", help="Collect data; never trade."),
         live: bool = typer.Option(False, "--live", help="Send real orders."),
         cycles: int = typer.Option(0, help="Stop after N cycles (0 = forever)."),
+        dashboard: bool = typer.Option(
+            True, "--dashboard/--no-dashboard", help="Serve the web dashboard on $PORT."
+        ),
     ) -> None:
-        """Run the weather engine (paper by default)."""
+        """Run the weather engine (paper by default) with its web dashboard."""
         settings = load_settings()
         if live and log_only:
             raise typer.BadParameter("--live and --log-only are mutually exclusive")
@@ -264,6 +267,8 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
                 engine = WeatherEngine(
                     client, settings.weather, RiskManager.from_settings(settings.risk), mode=mode
                 )
+                if dashboard:
+                    start_weather_dashboard(engine)
                 await engine.run(max_cycles=None if cycles == 0 else cycles)
 
         asyncio.run(_run())
@@ -275,7 +280,7 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
         async def _run() -> None:
             settings = load_settings()
             ws = settings.weather
-            data_dir = Path(ws.data_dir)
+            data_dir = ws.data_path()
             async with KalshiClient.from_settings(settings) as client:
                 rep = await evaluate(client, DataLog(data_dir), data_dir, ws)
             t = Table(title=f"Model vs market ({rep.tickers_scored} settled brackets)")

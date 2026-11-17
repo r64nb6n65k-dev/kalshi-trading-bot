@@ -6,7 +6,12 @@ weather package can be used and tested without the full app config.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from pydantic import BaseModel, Field
+
+DEFAULT_DATA_DIR = "./data/weather"
 
 
 class WeatherSettings(BaseModel):
@@ -30,7 +35,10 @@ class WeatherSettings(BaseModel):
         default="kalshi-weather-bot (set KALSHI_WEATHER__USER_AGENT to your email)",
         description="api.weather.gov requires a User-Agent that identifies you.",
     )
-    data_dir: str = Field(default="./data/weather")
+    data_dir: str = Field(
+        default=DEFAULT_DATA_DIR,
+        description="Where logs/ledger live. Default uses the Railway volume when mounted.",
+    )
     openmeteo_api_key: str = Field(
         default="",
         description="Optional paid Open-Meteo key (free tier is non-commercial, ~10k calls/day).",
@@ -113,3 +121,25 @@ class WeatherSettings(BaseModel):
 
     def kind_names(self) -> list[str]:
         return [k.strip().lower() for k in self.kinds.split(",") if k.strip()]
+
+    def data_path(self) -> Path:
+        """Resolved data directory.
+
+        With the default setting and a Railway volume mounted
+        (``RAILWAY_VOLUME_MOUNT_PATH``), data goes to ``<volume>/weather`` so it
+        survives redeploys. Falls back to the local default if that isn't writable.
+        """
+        volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+        if self.data_dir == DEFAULT_DATA_DIR and volume:
+            candidate = Path(volume) / "weather"
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                probe = candidate / ".write_test"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink()
+                return candidate
+            except OSError:
+                pass
+        path = Path(self.data_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
