@@ -90,7 +90,7 @@ def test_paper_cycle_trades_logs_and_settles(tmp_path: Path) -> None:
     # Paper position recorded; settled only once the climate day is over.
     assert eng.ledger.positions
     eng.now_fn = lambda: datetime(2026, 10, 29, 12, tzinfo=UTC)
-    eng._last_settle = 0.0
+    eng._last_settle = float("-inf")
     asyncio.run(eng._settle_paper())
     assert not eng.ledger.positions and eng.ledger.realized_cents != 0
 
