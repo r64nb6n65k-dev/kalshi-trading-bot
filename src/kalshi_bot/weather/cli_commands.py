@@ -45,28 +45,28 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
     def weather_check() -> None:
         """Check Kalshi series, NWS, Open-Meteo and IEM for every configured station."""
 
+        # Plain one-line-per-check output: readable in Railway's log viewer on a phone.
+        def say(msg: str) -> None:
+            print(f"[weather-check] {msg}", flush=True)
+
+        def ok(flag: bool) -> str:
+            return "OK  " if flag else "FAIL"
+
         async def _run() -> None:
+            say("starting")
             settings = load_settings()
             ws = settings.weather
             stations = resolve_stations(ws.station_codes(), ws.series_overrides)
             now = datetime.now(UTC)
-            table = Table(title="Weather data-source check", show_lines=True)
-            for col in (
-                "Station",
-                "Kalshi markets",
-                "NWS grid",
-                "NWS obs",
-                "Open-Meteo",
-                "IEM CLI",
-            ):
-                table.add_column(col, overflow="fold")
+            say(f"stations={','.join(s.code for s in stations)} kinds={ws.kinds}")
+            ua_set = "set KALSHI" not in ws.user_agent
+            say(f"user agent set: {ua_set}")
             om = OpenMeteoClient(ws.openmeteo_api_key)
             nws = NwsClient(ws.user_agent)
             try:
                 async with KalshiClient.from_settings(settings) as client:
                     for st in stations:
-                        # Kalshi
-                        k_lines = []
+                        say(f"===== {st.code} ({st.icao}) =====")
                         for kind_name in ws.kind_names():
                             series = st.series_for(Kind(kind_name))
                             try:
@@ -77,27 +77,23 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
                                 good = [e for e in evs if e.valid]
                                 bad = [e for e in evs if not e.valid]
                                 rules = next((m.rules_primary for m in mk if m.rules_primary), "")
-                                hint = (
-                                    "rules ok"
-                                    if rules and st.rules_hint.lower() in rules.lower()
-                                    else (
-                                        "no rules text"
-                                        if not rules
-                                        else f"[red]rules lack '{st.rules_hint}'[/]"
-                                    )
-                                )
-                                k_lines.append(
-                                    f"{_ok(bool(good))} {series}: {len(mk)} mkts, "
-                                    f"{len(good)} ok events, {len(bad)} bad; {hint}"
+                                if not rules:
+                                    hint = "no rules text"
+                                elif st.rules_hint.lower() in rules.lower():
+                                    hint = "rules ok"
+                                else:
+                                    hint = f"RULES LACK '{st.rules_hint}': {rules[:120]}"
+                                say(
+                                    f"{ok(bool(good))} kalshi {series}: {len(mk)} markets, "
+                                    f"{len(good)} good events, {len(bad)} bad; {hint}"
                                 )
                                 for e in bad[:2]:
-                                    k_lines.append(f"  [yellow]{e.event_ticker}: {e.problem}[/]")
+                                    say(f"     bad {e.event_ticker}: {e.problem[:160]}")
                                 if good:
                                     labels = ", ".join(b.bracket.label() for b in good[0].brackets)
-                                    k_lines.append(f"  {good[0].event_ticker}: {labels}")
+                                    say(f"     {good[0].event_ticker}: {labels}")
                             except Exception as exc:
-                                k_lines.append(f"{_ok(False)} {series}: {exc}")
-                        # NWS grid
+                                say(f"FAIL kalshi {series}: {exc!r}"[:300])
                         try:
                             g = await nws.grid_forecast(st)
                             hi = ", ".join(
@@ -106,49 +102,48 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
                             lo = ", ".join(
                                 f"{d:%m-%d}:{v:.0f}" for d, v in sorted(g.lows.items())[:3]
                             )
-                            grid_s = f"{_ok(bool(g.highs))} hi {hi}\nlo {lo}"
+                            say(f"{ok(bool(g.highs))} nws forecast: highs {hi} | lows {lo}")
                         except Exception as exc:
-                            grid_s = f"{_ok(False)} {exc}"
-                        # NWS obs
+                            say(f"FAIL nws forecast: {exc!r}"[:300])
                         try:
                             start, end = climate_day_window(st, climate_today(st, now))
                             rd = await nws.observations(st, start - timedelta(hours=1), now)
                             s = summarize(rd, start, end)
-                            obs_s = (
-                                f"{_ok(s.n_readings > 0)} {s.n_readings} readings; "
-                                f"latest {s.latest_temp_f or float('nan'):.1f}F; "
-                                f"max so far [{s.max_lo or float('nan'):.1f}, "
-                                f"{s.max_hi or float('nan'):.1f}]"
+                            latest = (
+                                f"{s.latest_temp_f:.1f}F" if s.latest_temp_f is not None else "-"
+                            )
+                            say(
+                                f"{ok(s.n_readings > 0)} nws observations: {s.n_readings} "
+                                f"readings today, latest {latest}"
                             )
                         except Exception as exc:
-                            obs_s = f"{_ok(False)} {exc}"
-                        # Open-Meteo
+                            say(f"FAIL nws observations: {exc!r}"[:300])
                         errs: list[str] = []
                         sets = await om.forecast_sets(
                             st, ws.ensemble_models, ws.deterministic_models, errs
                         )
-                        om_s = f"{_ok(bool(sets))} " + ", ".join(
-                            f"{h.source}({h.n_members})" for h in sets
+                        say(
+                            f"{ok(bool(sets))} open-meteo: "
+                            + (", ".join(f"{h.source}({h.n_members})" for h in sets) or "nothing")
                         )
-                        if errs:
-                            om_s += "\n[yellow]" + "\n".join(e[:90] for e in errs[:4]) + "[/]"
-                        # IEM
+                        for e in errs[:4]:
+                            say(f"     tried {e[:160]}")
                         try:
                             cli = await fetch_cli(st.icao, [now.year], ws.user_agent)
                             last = max(cli) if cli else None
-                            iem_s = (
-                                f"{_ok(last is not None)} {len(cli)} days; last {last}: "
-                                f"{cli[last] if last else ''}"
+                            say(
+                                f"{ok(last is not None)} climate archive: {len(cli)} days, "
+                                f"last {last} {cli[last] if last else ''}"
                             )
                         except Exception as exc:
-                            iem_s = f"{_ok(False)} {exc}"
-                        table.add_row(
-                            f"{st.code}\n{st.icao}", "\n".join(k_lines), grid_s, obs_s, om_s, iem_s
-                        )
+                            say(f"FAIL climate archive: {exc!r}"[:300])
+            except Exception as exc:
+                say(f"CRASHED: {exc!r}")
+                raise
             finally:
                 await om.aclose()
                 await nws.aclose()
-            console.print(table)
+            say("done")
 
         asyncio.run(_run())
 
