@@ -32,9 +32,26 @@ def _mid_probs(ev) -> dict[str, float]:  # type: ignore[no-untyped-def]
     return {k: v / s for k, v in raw.items()}
 
 
+LOOSE: dict[str, object] = {
+    "min_price": 3,
+    "max_price": 95,
+    "min_edge": 0.06,
+    "confidence": 0.7,
+    "intraday_confidence": 0.7,
+    "exit_margin": 0.04,
+    "reentry_cooldown_s": 600,
+}
+
+
 def _strategy(**kw: object) -> WeatherStrategy:
-    ws = WeatherSettings(partition_arb=False, **kw)  # type: ignore[arg-type]
+    """Mechanics tests use the original loose thresholds unless overridden."""
+    ws = WeatherSettings(partition_arb=False, **{**LOOSE, **kw})  # type: ignore[arg-type]
     return WeatherStrategy(ws, RiskManager())
+
+
+def _careful() -> WeatherStrategy:
+    """The shipped defaults."""
+    return WeatherStrategy(WeatherSettings(partition_arb=False), RiskManager())
 
 
 def test_buys_yes_when_model_beats_ask() -> None:
@@ -101,6 +118,54 @@ def test_partition_arbitrage_yes_set() -> None:
     ds = strat.decide(ev, _mid_probs(ev), {}, Budget(), 50_000, NOW)
     assert len(ds) == 8 and all(d.kind == "arb" and d.order.side is Side.YES for d in ds)
     assert len({d.order.count for d in ds}) == 1
+
+
+# --- careful defaults ---------------------------------------------------------
+def test_defaults_skip_cheap_long_shots() -> None:
+    # Model says 45% but the bracket costs 6c: a long shot. Defaults refuse it.
+    ev = _event({"70": (3, 6)})
+    probs = _mid_probs(ev)
+    t70 = next(b.ticker for b in ev.brackets if b.bracket.lo == 70)
+    probs[t70] = 0.45
+    assert _careful().decide(ev, probs, {}, Budget(), 50_000, NOW) == []
+    # Fading a 92% favourite = buying NO at 8c: also refused.
+    ev = _event({"70": (92, 95)})
+    probs = _mid_probs(ev)
+    probs[t70] = 0.40
+    assert _careful().decide(ev, probs, {}, Budget(), 50_000, NOW) == []
+
+
+def test_defaults_still_trade_a_big_mid_priced_edge() -> None:
+    ev = _event({"70": (26, 30)})
+    probs = _mid_probs(ev)
+    t70 = next(b.ticker for b in ev.brackets if b.bracket.lo == 70)
+    probs[t70] = 0.60
+    ds = _careful().decide(ev, probs, {}, Budget(), 50_000, NOW)
+    assert [(d.order.ticker, d.order.side) for d in ds] == [(t70, Side.YES)]
+
+
+def test_intraday_defers_more_to_market() -> None:
+    ev = _event({"70": (26, 30)})
+    probs = _mid_probs(ev)
+    t70 = next(b.ticker for b in ev.brackets if b.bracket.lo == 70)
+    # Day-ahead: 0.5*0.55 + 0.5*0.28 = 0.415 -> edge ~10c (trade).
+    # Intraday: 0.25*0.55 + 0.75*0.28 = 0.3475 -> edge ~3c (no trade).
+    probs[t70] = 0.55
+    assert _careful().decide(ev, probs, {}, Budget(), 50_000, NOW)
+    assert _careful().decide(ev, probs, {}, Budget(), 50_000, NOW, intraday=True) == []
+
+
+def test_no_flip_back_in_right_after_exit() -> None:
+    ev = _event({"70": (40, 44)})
+    probs = _mid_probs(ev)
+    t70 = next(b.ticker for b in ev.brackets if b.bracket.lo == 70)
+    probs[t70] = 0.05
+    strat = _strategy()
+    ds = strat.decide(ev, probs, {t70: 10}, Budget(), 50_000, NOW)
+    assert ds and ds[0].kind == "exit"
+    # Position now flat; the NO side looks attractive but we just traded it.
+    ds2 = strat.decide(ev, probs, {}, Budget(), 50_000, NOW + timedelta(minutes=5))
+    assert all(d.order.ticker != t70 for d in ds2)
 
 
 # --- ledger ----------------------------------------------------------------

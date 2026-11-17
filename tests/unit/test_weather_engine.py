@@ -64,6 +64,14 @@ def _engine(tmp_path: Path, mode: str, markets: list[Market], result: str | None
         samples=10_000,
         partition_arb=False,
         settle_check_interval=1,
+        # Plumbing tests: loose thresholds so the cheap test bracket trades.
+        min_price=3,
+        max_price=95,
+        min_edge=0.06,
+        confidence=0.7,
+        intraday_confidence=0.7,
+        exit_margin=0.04,
+        reentry_cooldown_s=600,
     )
     return WeatherEngine(
         FakeKalshi(markets, result),  # type: ignore[arg-type]
