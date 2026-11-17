@@ -101,7 +101,7 @@ class WeatherEngine:
         self._obs: dict[str, tuple[float, list[ObsReading]]] = {}
         self._last_log: dict[str, float] = {}
         self._warned: set[str] = set()
-        self._last_settle = 0.0
+        self._last_settle = float("-inf")  # monotonic clock can start near 0
         self._running = False
 
     async def aclose(self) -> None:
@@ -263,7 +263,7 @@ class WeatherEngine:
         res: ModelResult,
         probs: dict[str, float],
     ) -> None:
-        last = self._last_log.get(ev.event_ticker, 0.0)
+        last = self._last_log.get(ev.event_ticker, float("-inf"))
         if time.monotonic() - last < self.ws.log_interval:
             return
         self._last_log[ev.event_ticker] = time.monotonic()
