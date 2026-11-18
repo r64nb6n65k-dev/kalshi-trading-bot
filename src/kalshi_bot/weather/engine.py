@@ -33,6 +33,7 @@ from kalshi_bot.weather.model import ModelResult, build_distribution
 from kalshi_bot.weather.nws import NwsClient
 from kalshi_bot.weather.observations import ObsReading, summarize
 from kalshi_bot.weather.settings import WeatherSettings
+from kalshi_bot.weather.simple import decide_simple, forecast_odds
 from kalshi_bot.weather.stations import (
     Kind,
     Station,
@@ -94,6 +95,7 @@ def snapshot_dict(s: EventSnapshot, fee_rate: float) -> dict[str, Any]:
         )
     return {
         "event": s.event.event_ticker,
+        "source": "NWS forecast" if list(m.centers) == ["nws"] else "model",
         "station": s.station.code,
         "city": s.station.name,
         "kind": s.kind.value,
@@ -153,6 +155,8 @@ class WeatherEngine:
         self.last_error: str | None = None
         self.last_snapshots: list[dict[str, Any]] = []
         self.live_account: dict[str, Any] | None = None
+        self.settle_status: dict[str, Any] = {}
+        self._grids: dict[str, tuple[float, Any]] = {}
 
     async def aclose(self) -> None:
         await self.openmeteo.aclose()
@@ -266,8 +270,69 @@ class WeatherEngine:
             return True
         return now < close - timedelta(minutes=self.ws.stop_trading_minutes_before_close)
 
+    async def nws_grid(self, st: Station) -> Any:
+        """NWS forecast highs/lows by day, cached for ``forecast_refresh`` seconds."""
+        cached = self._grids.get(st.code)
+        if cached and time.monotonic() - cached[0] < self.ws.forecast_refresh:
+            return cached[1]
+        try:
+            grid = await self.nws.grid_forecast(st)
+        except Exception as exc:
+            logger.warning("%s: NWS forecast fetch failed: %s", st.code, exc)
+            return cached[1] if cached else None
+        self._grids[st.code] = (time.monotonic(), grid)
+        return grid
+
+    async def _cycle_simple(self, now: datetime) -> list[EventSnapshot]:
+        """Simple strategy: one NWS-forecast bet per city-day, held to settlement."""
+        positions, budget, _ = await self._account()
+        snapshots: list[EventSnapshot] = []
+        for st in self.stations:
+            grid = await self.nws_grid(st)
+            if grid is None:
+                continue
+            for kind in self.kinds:
+                try:
+                    events = await self.events(st, kind, now)
+                except Exception as exc:
+                    logger.warning("%s %s: market fetch failed: %s", st.code, kind.value, exc)
+                    continue
+                for ev in events:
+                    fc = (grid.highs if kind is Kind.HIGH else grid.lows).get(ev.day)
+                    if fc is None:
+                        continue
+                    res = forecast_odds(
+                        st, kind, ev.day, now, fc, self.calibration.get(st.code, kind)
+                    )
+                    if res is None:
+                        continue
+                    probs = {bm.ticker: res.prob(bm.bracket) for bm in ev.brackets}
+                    decisions: list[Decision] = []
+                    if self._can_trade(ev, now):
+                        decisions = decide_simple(
+                            ev, probs, positions, budget, self.ws, fc, day_started=res.intraday
+                        )
+                        for d in decisions:
+                            await self._execute(d, positions, ev)
+                    self._maybe_log(st, kind, ev, res, probs)
+                    snapshots.append(EventSnapshot(st, kind, ev, res, probs, decisions))
+        return snapshots
+
     async def cycle(self) -> list[EventSnapshot]:
         now = self.now_fn()
+        if self.ws.strategy == "simple":
+            snapshots = await self._cycle_simple(now)
+        else:
+            snapshots = await self._cycle_model(now)
+        if self.mode == "paper":
+            await self._settle_paper()
+        self.last_snapshots = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots]
+        self.last_cycle_at = datetime.now(UTC)
+        self.cycles += 1
+        return snapshots
+
+    async def _cycle_model(self, now: datetime) -> list[EventSnapshot]:
+        """Older multi-model strategy (strategy='model')."""
         positions, budget, bankroll = await self._account()
         snapshots: list[EventSnapshot] = []
         for st in self.stations:
@@ -314,11 +379,6 @@ class WeatherEngine:
                             await self._execute(d, positions, ev)
                     self._maybe_log(st, kind, ev, res, probs)
                     snapshots.append(EventSnapshot(st, kind, ev, res, probs, decisions))
-        if self.mode == "paper":
-            await self._settle_paper()
-        self.last_snapshots = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots]
-        self.last_cycle_at = datetime.now(UTC)
-        self.cycles += 1
         return snapshots
 
     def _maybe_log(
@@ -414,18 +474,41 @@ class WeatherEngine:
             return
         self._last_settle = time.monotonic()
         today = self.now_fn().astimezone(UTC).date().isoformat()
-        for ticker in list(self.ledger.positions):
-            if day_of(ticker) >= today:
-                continue  # climate day not over yet
+        due = [t for t in self.ledger.positions if day_of(t) < today]
+        settled = 0
+        waiting: list[str] = []
+        errors: list[str] = []
+        for ticker in due:
             try:
                 m = await self.client.get_market(ticker)
             except Exception as exc:
-                logger.debug("settle lookup %s failed: %s", ticker, exc)
+                errors.append(f"{ticker}: {exc}"[:200])
+                logger.warning("Settlement lookup failed for %s: %s", ticker, exc)
                 continue
             if m.result in ("yes", "no"):
                 pnl = self.ledger.settle(ticker, m.result)
+                settled += 1
                 logger.warning("PAPER SETTLED %s -> %s | pnl %+dc", ticker, m.result, pnl)
                 self.datalog.write("settle", ticker=ticker, result=m.result, pnl=pnl)
+            else:
+                waiting.append(f"{ticker} (Kalshi status: {m.status or '?'})")
+        self.settle_status = {
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "open_bets": len(self.ledger.positions),
+            "past_day": len(due),
+            "settled_now": settled,
+            "waiting": waiting[:10],
+            "errors": errors[:5],
+        }
+        if due:
+            logger.warning(
+                "Settlement check: %d bets past their day, %d settled, %d waiting on Kalshi, "
+                "%d errors",
+                len(due),
+                settled,
+                len(waiting),
+                len(errors),
+            )
 
     # ------------------------------------------------------------------
     async def run(self, max_cycles: int | None = None) -> None:

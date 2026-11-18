@@ -49,6 +49,13 @@ def recent_rows(log_dir: Path, types: set[str], max_files: int = 45) -> list[dic
     return out
 
 
+def storage_status(data_dir: Path) -> dict[str, Any]:
+    """Is the bot's memory (ledger, logs) on the Railway volume, or wiped on every deploy?"""
+    volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    persistent = volume is not None and data_dir.resolve().is_relative_to(Path(volume).resolve())
+    return {"path": str(data_dir), "volume": volume, "persistent": persistent}
+
+
 def build_data(engine: WeatherEngine) -> dict[str, Any]:
     now = datetime.now(UTC)
     snaps = list(engine.last_snapshots)
@@ -129,7 +136,12 @@ def build_data(engine: WeatherEngine) -> dict[str, Any]:
         else engine.last_cycle_at.isoformat(timespec="seconds"),
         "cycles": engine.cycles,
         "last_error": engine.last_error,
-        "min_edge": engine.ws.min_edge,
+        "min_edge": engine.ws.simple_margin
+        if engine.ws.strategy == "simple"
+        else engine.ws.min_edge,
+        "strategy": engine.ws.strategy,
+        "storage": storage_status(engine.data_dir),
+        "settlement": engine.settle_status,
         "account": account,
         "stats": {
             "trades": len(orders),
@@ -189,12 +201,12 @@ details summary{cursor:pointer;list-style:none}details summary::-webkit-details-
 a{color:var(--link)}.scroll{overflow-x:auto}.empty{color:var(--dim);font-size:14px}
 </style></head><body>
 <div class=top><h1>🌤️ Weather Bot</h1><span id=mode class=badge>…</span></div>
-<div class=sub id=status>Loading…</div><div id=err></div>
+<div class=sub id=status>Loading…</div><div id=err></div><div id=health></div>
 <h2>Money</h2><div class=g id=money></div>
 <h2>Results</h2><div class=g id=stats></div>
 <h2>Open bets</h2><div class=list id=open></div>
-<h2>Markets right now</h2><div class=sub>Model % vs Kalshi price. Green rows = bot sees an edge.
-Tap a city to expand.</div><div id=markets></div>
+<h2>Markets right now</h2><div class=sub>Forecast odds vs Kalshi price. 🟢 = the bot likes
+this one. Tap a city to expand.</div><div id=markets></div>
 <h2>Recent trades</h2><div id=trades></div>
 <h2>Settled</h2><div id=settles></div>
 <p class=sub><a href="/download/trades.csv">Download trades CSV</a> ·
@@ -219,6 +231,13 @@ $('mode').className='badge '+d.mode;
 $('status').textContent=`${d.stations.join(', ')} · ${d.kinds.join(' & ')} · last update `+
 `${ago(d.last_cycle_at)} · ${d.cycles} cycles`;
 $('err').innerHTML=d.last_error?`<div class=err>Last error ${d.last_error}</div>`:'';
+const st=d.storage,se=d.settlement||{};
+$('health').innerHTML=`<div class=sub>${d.strategy==='simple'?'Strategy: bet the NWS forecast':
+'Strategy: model'} · Memory: ${st.persistent?'✅ saved on Railway volume':
+'⚠️ NOT on a volume, so it resets on every update'}</div><div class=sub>Settlement check: ${
+se.checked_at?ago(se.checked_at)+' · '+se.past_day+' bets waiting for results'+
+(se.errors&&se.errors.length?' · ⚠️ '+se.errors[0]:'')+(se.waiting&&se.waiting.length?
+' · e.g. '+se.waiting[0]:''):'not run yet'}</div>`;
 if(d.mode==='live'){$('money').innerHTML=card('Kalshi balance',usd(a.balance_cents))+
 card('Open bets (mark)',sgn(a.unrealized_cents),cls(a.unrealized_cents));}
 else{const tot=a.realized_cents+a.unrealized_cents;
@@ -233,21 +252,24 @@ $('open').innerHTML=d.positions.length?d.positions.map(p=>{
 const pl=p.value_cents==null?null:p.value_cents-p.cost_cents;
 return `<div class=c><b>${p.city||''} ${p.kind||''} ${day(p.day)} · ${p.label||p.ticker}°</b>
  — ${p.side} ×${p.count} @ ${p.avg_price}¢<br><span class=s>cost ${usd(p.cost_cents)} · now
- ${p.bid??'-'}¢ · model win chance ${pct(p.p_win)} · </span><span class="${cls(pl)}">${sgn(pl)}
+ ${p.bid??'-'}¢ · win chance ${pct(p.p_win)} · </span><span class="${cls(pl)}">${sgn(pl)}
  </span></div>`}).join(''):'<div class=empty>No open bets.</div>';
 $('markets').innerHTML=d.markets.length?d.markets.map(m=>{
 const top=m.brackets.reduce((x,b)=>b.p>x.p?b:x,m.brackets[0]);
-const hot=m.brackets.some(b=>Math.max(b.edge_yes??-1,b.edge_no??-1)>=d.min_edge);
+const simple=d.strategy==='simple';
+const edge=b=>simple?(b===top?b.edge_yes??-1:-1):Math.max(b.edge_yes??-1,b.edge_no??-1);
+const hot=m.brackets.some(b=>edge(b)>=d.min_edge);
 const obs=m.obs_hi!=null?` · ${m.kind} so far ~${Math.round((m.obs_lo+m.obs_hi)/2)}°`:'';
-const rows=m.brackets.map(b=>{const e=Math.max(b.edge_yes??-1,b.edge_no??-1);
+const rows=m.brackets.map(b=>{const e=edge(b);
 return `<tr class="${e>=d.min_edge?'hot':''}"><td>${b.label}°</td><td>${pct(b.p)}</td>
 <td><div class=bar style="width:${Math.round(b.p*60)}px;margin-left:auto"></div></td>
 <td>${b.yes_bid??'-'}/${b.yes_ask??'-'}¢</td><td>${e>-1?Math.round(e*100)+0+'¢':'-'}</td></tr>`}).join('');
 const key=m.event;return `<details class="c mk" ${open_[key]?'open':''}
  ontoggle="open_['${key}']=this.open"><summary><h3>${hot?'🟢 ':''}${m.city} · ${m.kind} ·
- ${day(m.day)}</h3><div class=s>model ${m.mean}° ±${m.std} · most likely ${top.label}°
+ ${day(m.day)}</h3><div class=s>${m.source||'model'} ${m.mean}° ±${m.std} ·
+ most likely ${top.label}°
  (${pct(top.p)})${obs}${m.intraday?' · today':''}</div></summary>
-<table><tr><th>Bracket</th><th>Model</th><th></th><th>Bid/Ask</th><th>Best edge</th></tr>${rows}
+<table><tr><th>Bracket</th><th>Odds</th><th></th><th>Bid/Ask</th><th>Edge</th></tr>${rows}
 </table>${m.decisions.length?'<div class=s>Bot action: '+m.decisions.join('; ')+'</div>':''}
 </details>`}).join(''):'<div class=empty>No markets modeled yet. Give it a minute.</div>';
 $('trades').innerHTML=d.orders.length?'<div class=scroll><table><tr><th>When</th>'+
