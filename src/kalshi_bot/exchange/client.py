@@ -248,6 +248,16 @@ class KalshiClient:
         data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data["market"])
 
+    async def get_weather_index(self, city: str, last_sec: int = 1200) -> dict[str, Any]:
+        """Kalshi's minute-by-minute weather index (what hourly markets settle on).
+
+        ``GET /live_data/weather/{city}``: returns ``timeseries`` of points with
+        ``t`` (unix ms), ``v`` (°F, absent when incomplete) and ``status``.
+        """
+        return await self._request(
+            "GET", f"/live_data/weather/{city}", params={"last_sec": last_sec}
+        )
+
     async def get_orderbook(
         self,
         ticker: str,

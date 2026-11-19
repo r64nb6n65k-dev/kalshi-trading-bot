@@ -38,6 +38,7 @@ from kalshi_bot.weather.live import (
 )
 from kalshi_bot.weather.markets import (
     HOURLY,
+    HOURLY_INDEX_IDS,
     HOURLY_STATIONS,
     RAIN_SERIES,
     Candidate,
@@ -181,6 +182,8 @@ class WeatherEngine:
         self.warnings: list[str] = []
         self._extra: list[dict[str, Any]] = []
         self._obs_icao: dict[str, tuple[float, list[ObsReading]]] = {}
+        self._index_ids: dict[str, str] = {}
+        self._index_bad: set[str] = set()
         self._grids: dict[str, tuple[float, Any]] = {}
 
     async def aclose(self) -> None:
@@ -638,6 +641,33 @@ class WeatherEngine:
         self.warnings = warnings
         return []
 
+    async def hourly_index(self, series: str, now: datetime) -> tuple[float, float] | None:
+        """Latest value of Kalshi's own hourly index: (°F, minutes old), or None."""
+        ids = (
+            [self._index_ids[series]]
+            if series in self._index_ids
+            else [c for c in HOURLY_INDEX_IDS.get(series, []) if c not in self._index_bad]
+        )
+        for city in ids:
+            try:
+                data = await self.client.get_weather_index(city, last_sec=1200)
+            except Exception as exc:
+                if series not in self._index_ids:
+                    self._index_bad.add(city)
+                logger.debug("weather index %s failed: %s", city, exc)
+                continue
+            if series not in self._index_ids:
+                self._index_ids[series] = city
+                logger.warning("%s: reading Kalshi weather index '%s'", series, city)
+            points = [p for p in data.get("timeseries") or [] if p.get("v") is not None]
+            if not points:
+                return None
+            last = max(points, key=lambda p: int(p["t"]))
+            t = datetime.fromtimestamp(int(last["t"]) / 1000, tz=UTC)
+            age = (now - t).total_seconds() / 60
+            return (float(last["v"]), age) if age <= 15 else None
+        return None
+
     async def _live_hourly(
         self, now: datetime, positions: dict[str, int], budget: Budget
     ) -> list[dict[str, Any]]:
@@ -659,11 +689,20 @@ class WeatherEngine:
             if not soon:
                 continue
             temps: list[float] = []
-            for icao in HOURLY_STATIONS.get(series, []):
-                rd = [r for r in await self.obs_icao(icao, now) if r.kind == "inst"]
-                rd = [r for r in rd if (now - r.time).total_seconds() <= 40 * 60]
-                if rd:
-                    temps.append(max(rd, key=lambda r: r.time).mid_f)
+            gap = self.ws.hourly_live_gap
+            idx = await self.hourly_index(series, now)
+            if idx is not None:
+                temps = [idx[0]]
+                source = f"Kalshi index {idx[0]:.1f}° ({idx[1]:.0f} min ago)"
+            else:
+                # Fallback: average the index's member airports; be stricter.
+                gap = self.ws.hourly_fallback_gap
+                for icao in HOURLY_STATIONS.get(series, []):
+                    rd = [r for r in await self.obs_icao(icao, now) if r.kind == "inst"]
+                    rd = [r for r in rd if (now - r.time).total_seconds() <= 40 * 60]
+                    if rd:
+                        temps.append(max(rd, key=lambda r: r.time).mid_f)
+                source = f"{len(temps)} index airports avg (index unavailable)"
             grid = await self.nws_grid(place)
             for ev_ticker, ms in sorted(soon.items()):
                 target = hourly_target(ms[0])
@@ -684,15 +723,15 @@ class WeatherEngine:
                 rows: list[tuple[Market, str, Verdict | None]] = []
                 decisions: list[Decision] = []
                 for m in ms:
-                    v = hourly_verdict(m, projected, self.ws.hourly_live_gap)
+                    v = hourly_verdict(m, projected, gap)
                     rows.append((m, (m.yes_sub_title or m.ticker).replace(" or above", "+"), v))
                     if v is not None and not decisions:  # one bet per city-hour
                         decisions += await self._bet(
                             m, v, ev_ticker, target.date().isoformat(), positions, budget, now
                         )
                 evidence = (
-                    f"now {current:.1f}° across {len(temps)} airports, NWS change "
-                    f"{change:+.1f}° -> ~{projected:.0f}° at the reading"
+                    f"{source if idx is not None else f'now {current:.1f}°, ' + source}; "
+                    f"NWS change {change:+.1f}° -> ~{projected:.1f}° at the reading"
                 )
                 out.append(self._snap(ev_ticker, "hourly", place.name, place.code,
                                       target.date().isoformat(), evidence, rows, decisions,

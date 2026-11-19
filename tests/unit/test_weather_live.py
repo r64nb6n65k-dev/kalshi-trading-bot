@@ -187,3 +187,60 @@ def test_never_buy_what_kalshi_calls_a_long_shot(price: int, bought: bool) -> No
     d = lock_bet(_m("45° or above", max(price - 2, 0), price), v, "E", "d", {}, Budget(),
                  WeatherSettings())  # fmt: skip
     assert (d is not None) is bought
+
+
+class FakeKalshiIndex(FakeKalshiLive):
+    """Kalshi knows the NYC index as 'new-york'; 'nyc' is rejected."""
+
+    def __init__(self, value: float, minutes_old: float) -> None:
+        super().__init__()
+        self.value, self.minutes_old = value, minutes_old
+        self.asked: list[str] = []
+
+    async def get_weather_index(self, city: str, last_sec: int = 1200) -> dict[str, Any]:
+        self.asked.append(city)
+        if city != "new-york":
+            raise RuntimeError("400 unknown city")
+        t = int((T.timestamp() - self.minutes_old * 60) * 1000)
+        return {"city": city, "timeseries": [
+            {"t": t - 60_000, "v": self.value - 0.2, "status": "normal"},
+            {"t": t, "v": self.value, "status": "normal"},
+            {"t": t + 60_000, "status": "incomplete"},
+        ]}  # fmt: skip
+
+
+def _hourly_engine(tmp_path: Path, client: FakeKalshiIndex):  # type: ignore[no-untyped-def]
+    eng = _engine(tmp_path, "paper", [], strategy="live")
+    eng.client = client  # type: ignore[assignment]
+    eng.nws = FakeNwsLive()  # type: ignore[assignment]
+    eng.now_fn = lambda: T
+    eng.ws = eng.ws.model_copy(update={"hourly": True, "rain": False})
+    return eng
+
+
+def test_hourly_reads_kalshis_own_index(tmp_path: Path) -> None:
+    k = FakeKalshiIndex(61.5, minutes_old=3)
+    eng = _hourly_engine(tmp_path, k)
+    asyncio.run(eng.cycle())
+    snap = next(s for s in eng.last_snapshots if s["kind"] == "hourly")
+    assert "Kalshi index 61.5°" in snap["evidence"]
+    # 61.5 vs the 65 line is 3.5° (index gap is 3°) -> NO at 90c.
+    assert eng.ledger.signed_positions()["KXTEMPNYCHS-26OCT2819-T64.99"] < 0
+    assert eng._index_ids["KXTEMPNYCHS"] == "new-york"
+    # Next cycle goes straight to the ID that worked.
+    k.asked.clear()
+    asyncio.run(eng.cycle())
+    assert k.asked == ["new-york"]
+
+
+def test_hourly_close_call_is_skipped(tmp_path: Path) -> None:
+    eng = _hourly_engine(tmp_path, FakeKalshiIndex(63.0, minutes_old=3))
+    asyncio.run(eng.cycle())
+    assert not [t for t in eng.ledger.positions if t.startswith("KXTEMP")]  # only 2° away
+
+
+def test_stale_index_falls_back_to_member_airports(tmp_path: Path) -> None:
+    eng = _hourly_engine(tmp_path, FakeKalshiIndex(61.5, minutes_old=40))
+    asyncio.run(eng.cycle())
+    snap = next(s for s in eng.last_snapshots if s["kind"] == "hourly")
+    assert "index unavailable" in snap["evidence"]

@@ -126,7 +126,15 @@ class WeatherSettings(BaseModel):
         ),
     )
     hourly_live_gap: float = Field(
-        default=5.0, gt=0, description="Hourly: reading must look this many °F from the line."
+        default=3.0,
+        gt=0,
+        description="Hourly, using Kalshi's own index: projected reading must be this many °F "
+        "from the line.",
+    )
+    hourly_fallback_gap: float = Field(
+        default=5.0,
+        gt=0,
+        description="Hourly, when the index can't be read and airports are used instead.",
     )
     hourly_live_minutes: float = Field(
         default=60.0, gt=0, description="Hourly: only bet within this many minutes of the reading."
