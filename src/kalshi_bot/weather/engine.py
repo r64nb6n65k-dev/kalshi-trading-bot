@@ -23,12 +23,24 @@ from kalshi_bot.exchange.client import KalshiClient
 from kalshi_bot.exchange.models import Action, Side
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.telemetry.logging import get_logger
-from kalshi_bot.weather.brackets import WeatherEvent, group_events
+from kalshi_bot.weather.brackets import WeatherEvent, group_events, parse_event_date
 from kalshi_bot.weather.calibration import CalibrationStore
 from kalshi_bot.weather.datalog import DataLog
 from kalshi_bot.weather.fees import fee_cents, fee_per_contract
 from kalshi_bot.weather.forecasts import ForecastBundle, OpenMeteoClient
 from kalshi_bot.weather.ledger import PaperLedger, budget_from_live, day_of
+from kalshi_bot.weather.markets import (
+    HOURLY,
+    RAIN_SERIES,
+    Candidate,
+    candidate_rows,
+    decide_binary,
+    hourly_sigma,
+    hourly_target,
+    rain_city,
+    rain_place,
+    threshold_prob,
+)
 from kalshi_bot.weather.model import ModelResult, build_distribution
 from kalshi_bot.weather.nws import NwsClient
 from kalshi_bot.weather.observations import ObsReading, summarize
@@ -96,6 +108,8 @@ def snapshot_dict(s: EventSnapshot, fee_rate: float) -> dict[str, Any]:
     return {
         "event": s.event.event_ticker,
         "source": "NWS forecast" if list(m.centers) == ["nws"] else "model",
+        "pick": "top" if list(m.centers) == ["nws"] else "any",
+        "target_time": None,
         "station": s.station.code,
         "city": s.station.name,
         "kind": s.kind.value,
@@ -156,6 +170,8 @@ class WeatherEngine:
         self.last_snapshots: list[dict[str, Any]] = []
         self.live_account: dict[str, Any] | None = None
         self.settle_status: dict[str, Any] = {}
+        self.warnings: list[str] = []
+        self._extra: list[dict[str, Any]] = []
         self._grids: dict[str, tuple[float, Any]] = {}
 
     async def aclose(self) -> None:
@@ -209,6 +225,8 @@ class WeatherEngine:
 
     async def events(self, st: Station, kind: Kind, now: datetime) -> list[WeatherEvent]:
         series = st.series_for(kind)
+        if not series:
+            return []
         markets = await self.client.get_all_markets(series_ticker=series, status="open")
         out: list[WeatherEvent] = []
         for ev in group_events(markets):
@@ -227,7 +245,7 @@ class WeatherEngine:
                 self._warn_once(
                     f"norules:{series}", "%s: rules text unavailable; station not verified", series
                 )
-            elif st.rules_hint.lower() not in rules.lower():
+            elif not st.rules_match(rules):
                 self._warn_once(
                     f"rules:{series}",
                     "%s rules do not mention '%s' -- station mismatch? Not trading. Rules: %s",
@@ -313,10 +331,177 @@ class WeatherEngine:
                             ev, probs, positions, budget, self.ws, fc, day_started=res.intraday
                         )
                         for d in decisions:
-                            await self._execute(d, positions, ev)
+                            await self._execute(d, positions, ev.event_ticker)
                     self._maybe_log(st, kind, ev, res, probs)
                     snapshots.append(EventSnapshot(st, kind, ev, res, probs, decisions))
+        extra: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        if self.ws.hourly:
+            extra += await self._cycle_hourly(now, positions, budget)
+        if self.ws.rain:
+            extra += await self._cycle_rain(now, positions, budget, warnings)
+        self._extra = extra
+        self.warnings = warnings
         return snapshots
+
+    def _open_for_trading(self, close_time: str | None, now: datetime) -> bool:
+        if self.mode == "log":
+            return False
+        close = _parse_ts(close_time)
+        return close is None or now < close - timedelta(
+            minutes=self.ws.stop_trading_minutes_before_close
+        )
+
+    def _log_extra(self, snap: dict[str, Any]) -> None:
+        last = self._last_log.get(snap["event"], float("-inf"))
+        if time.monotonic() - last < self.ws.log_interval:
+            return
+        self._last_log[snap["event"]] = time.monotonic()
+        self.datalog.write(
+            "model",
+            event=snap["event"],
+            series=snap["event"].split("-")[0],
+            station=snap["station"],
+            kind=snap["kind"],
+            day=snap["day"],
+            bucket=snap["kind"],
+            intraday=False,
+            mu=snap["mean"],
+            lead_hours=snap["lead_hours"],
+            brackets=snap["brackets"],
+        )
+
+    async def _cycle_hourly(
+        self, now: datetime, positions: dict[str, int], budget: Budget
+    ) -> list[dict[str, Any]]:
+        """Hourly 'X° or above at H o'clock' markets: bet the NWS hourly forecast."""
+        out: list[dict[str, Any]] = []
+        for series, place in HOURLY.items():
+            try:
+                markets = await self.client.get_all_markets(series_ticker=series, status="open")
+            except Exception as exc:
+                logger.warning("%s: market fetch failed: %s", series, exc)
+                continue
+            if not markets:
+                continue
+            grid = await self.nws_grid(place)
+            if grid is None:
+                continue
+            by_event: dict[str, list[Any]] = {}
+            for m in markets:
+                by_event.setdefault(m.event_ticker or m.ticker.rsplit("-", 1)[0], []).append(m)
+            for ev_ticker, ms in sorted(by_event.items()):
+                target = hourly_target(ms[0])
+                if target is None:
+                    continue
+                lead_h = (target - now).total_seconds() / 3600
+                mu = grid.temp_at(target)
+                if lead_h <= 0 or mu is None:
+                    continue
+                sigma = hourly_sigma(lead_h)
+                cands = []
+                for m in ms:
+                    p = threshold_prob(m, mu, sigma)
+                    if p is not None:
+                        label = (m.yes_sub_title or m.subtitle or m.ticker).replace(
+                            " or above", "+"
+                        )
+                        cands.append(Candidate(m, p, label))
+                cands.sort(key=lambda c: -c.p)
+                decisions: list[Decision] = []
+                if lead_h * 60 >= self.ws.hourly_min_lead_minutes and self._open_for_trading(
+                    ms[0].close_time, now
+                ):
+                    decisions = decide_binary(
+                        cands,
+                        ev_ticker + "-",
+                        ev_ticker,
+                        target.date().isoformat(),
+                        positions,
+                        budget,
+                        self.ws,
+                        f"NWS says {mu:.0f}° at that hour",
+                    )
+                    for d in decisions:
+                        await self._execute(d, positions, ev_ticker)
+                snap = {
+                    "event": ev_ticker, "source": "NWS hourly forecast", "pick": "any",
+                    "station": place.code, "city": place.name, "kind": "hourly",
+                    "day": target.date().isoformat(), "target_time": target.isoformat(),
+                    "mean": round(mu, 1), "std": round(sigma, 1), "lead_hours": round(lead_h, 1),
+                    "intraday": False, "obs_lo": None, "obs_hi": None,
+                    "brackets": candidate_rows(cands, self.ws),
+                    "decisions": [d.reason for d in decisions],
+                }  # fmt: skip
+                self._log_extra(snap)
+                out.append(snap)
+        return out
+
+    async def _cycle_rain(
+        self, now: datetime, positions: dict[str, int], budget: Budget, warnings: list[str]
+    ) -> list[dict[str, Any]]:
+        """Daily 'Where will it rain?' markets: bet the NWS chance of rain, per city."""
+        try:
+            markets = await self.client.get_all_markets(series_ticker=RAIN_SERIES, status="open")
+        except Exception as exc:
+            logger.warning("%s: market fetch failed: %s", RAIN_SERIES, exc)
+            return []
+        by_event: dict[str, list[Any]] = {}
+        for m in markets:
+            by_event.setdefault(m.event_ticker or m.ticker.rsplit("-", 1)[0], []).append(m)
+        out: list[dict[str, Any]] = []
+        for ev_ticker, ms in sorted(by_event.items()):
+            day = parse_event_date(ev_ticker)
+            if day is None:
+                continue
+            cands: list[Candidate] = []
+            decisions: list[Decision] = []
+            for m in ms:
+                city = rain_city(m)
+                if city is None:
+                    label = m.yes_sub_title or m.subtitle or m.ticker
+                    warnings.append(f"Rain market for unknown city '{label}' skipped")
+                    continue
+                place = rain_place(city)
+                grid = await self.nws_grid(place)
+                if grid is None:
+                    continue
+                start = datetime(day.year, day.month, day.day, tzinfo=UTC) - timedelta(
+                    hours=place.std_utc_offset_hours
+                )
+                end = start + timedelta(hours=24)
+                if now >= end:
+                    continue
+                p = grid.rain_chance(start, end)
+                if p is None:
+                    continue
+                c = Candidate(m, p, city)
+                cands.append(c)
+                hours_in = (now - start).total_seconds() / 3600
+                if hours_in <= self.ws.rain_cutoff_hours and self._open_for_trading(
+                    m.close_time, now
+                ):
+                    ds = decide_binary(
+                        [c], m.ticker, ev_ticker, day.isoformat(), positions, budget,
+                        self.ws, f"NWS: {p:.0%} chance of rain in {city}",
+                    )  # fmt: skip
+                    for d in ds:
+                        await self._execute(d, positions, ev_ticker)
+                    decisions += ds
+            if not cands:
+                continue
+            cands.sort(key=lambda c: c.label)
+            snap = {
+                "event": ev_ticker, "source": "NWS chance of rain", "pick": "any",
+                "station": "RAIN", "city": "Where will it rain?", "kind": "rain",
+                "day": day.isoformat(), "target_time": None, "mean": None, "std": None,
+                "lead_hours": None, "intraday": False, "obs_lo": None, "obs_hi": None,
+                "brackets": candidate_rows(cands, self.ws),
+                "decisions": [d.reason for d in decisions],
+            }  # fmt: skip
+            self._log_extra(snap)
+            out.append(snap)
+        return out
 
     async def cycle(self) -> list[EventSnapshot]:
         now = self.now_fn()
@@ -326,7 +511,7 @@ class WeatherEngine:
             snapshots = await self._cycle_model(now)
         if self.mode == "paper":
             await self._settle_paper()
-        self.last_snapshots = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots]
+        self.last_snapshots = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots] + self._extra
         self.last_cycle_at = datetime.now(UTC)
         self.cycles += 1
         return snapshots
@@ -376,7 +561,7 @@ class WeatherEngine:
                             ev, probs, positions, budget, bankroll, now, intraday=res.intraday
                         )
                         for d in decisions:
-                            await self._execute(d, positions, ev)
+                            await self._execute(d, positions, ev.event_ticker)
                     self._maybe_log(st, kind, ev, res, probs)
                     snapshots.append(EventSnapshot(st, kind, ev, res, probs, decisions))
         return snapshots
@@ -416,7 +601,7 @@ class WeatherEngine:
             ],
         )
 
-    async def _execute(self, d: Decision, positions: dict[str, int], ev: WeatherEvent) -> None:
+    async def _execute(self, d: Decision, positions: dict[str, int], event_ticker: str) -> None:
         o = d.order
         cur = positions.get(o.ticker, 0)
         verdict = self.risk.check(o, cur)
@@ -455,7 +640,7 @@ class WeatherEngine:
             "order",
             mode=self.mode,
             kind=d.kind,
-            event=ev.event_ticker,
+            event=event_ticker,
             ticker=o.ticker,
             action=o.action.value,
             side=o.side.value,
@@ -474,7 +659,9 @@ class WeatherEngine:
             return
         self._last_settle = time.monotonic()
         today = self.now_fn().astimezone(UTC).date().isoformat()
-        due = [t for t in self.ledger.positions if day_of(t) < today]
+        # Check every open bet: hourly markets settle within the hour, daily ones
+        # the next morning. Kalshi says "not yet" for the rest.
+        due = [t for t in self.ledger.positions if day_of(t) <= today or day_of(t) == "unknown"]
         settled = 0
         waiting: list[str] = []
         errors: list[str] = []

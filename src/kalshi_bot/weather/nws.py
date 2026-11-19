@@ -8,11 +8,12 @@ email address).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
+import numpy as np
 
 from kalshi_bot.weather.observations import ObsReading, parse_observation
 from kalshi_bot.weather.stations import Station, climate_day_window
@@ -72,6 +73,48 @@ def extremes_by_climate_day(
 class GridForecast:
     highs: dict[date, float]
     lows: dict[date, float]
+    # (start, end, value) periods: hourly-ish temperature in F, rain chance 0-1.
+    temps: list[tuple[datetime, datetime, float]] = field(default_factory=list)
+    pops: list[tuple[datetime, datetime, float]] = field(default_factory=list)
+
+    def temp_at(self, t: datetime) -> float | None:
+        for start, end, v in self.temps:
+            if start <= t < end:
+                return v
+        return None
+
+    def rain_chance(self, start: datetime, end: datetime) -> float | None:
+        """Chance of measurable rain at some point in ``[start, end)``.
+
+        NWS gives chances for separate periods. Treating them as independent
+        overstates the daily chance; taking only the largest understates it.
+        Use the midpoint of the two.
+        """
+        ps = [v for s, e, v in self.pops if s < end and e > start]
+        if not ps:
+            return None
+        biggest = max(ps)
+        independent = 1.0 - float(np.prod([1.0 - p for p in ps]))
+        return biggest + 0.5 * (independent - biggest)
+
+
+def periods(grid_props: dict[str, Any], key: str) -> list[tuple[datetime, datetime, float]]:
+    block = grid_props.get(key) or {}
+    uom = str(block.get("uom") or "")
+    out: list[tuple[datetime, datetime, float]] = []
+    for row in block.get("values") or []:
+        if row.get("value") is None:
+            continue
+        span = parse_valid_time(str(row.get("validTime", "")))
+        if span is None:
+            continue
+        v = float(row["value"])
+        if key == "temperature":
+            v = _to_f(v, uom or "wmoUnit:degC")
+        elif uom.endswith("percent") or v > 1:
+            v = v / 100.0
+        out.append((span[0], span[1], v))
+    return out
 
 
 class NwsClient:
@@ -105,6 +148,8 @@ class NwsClient:
         return GridForecast(
             highs=extremes_by_climate_day(props, station, "maxTemperature"),
             lows=extremes_by_climate_day(props, station, "minTemperature"),
+            temps=periods(props, "temperature"),
+            pops=periods(props, "probabilityOfPrecipitation"),
         )
 
     async def observations(

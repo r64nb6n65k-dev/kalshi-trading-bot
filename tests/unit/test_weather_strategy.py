@@ -96,7 +96,8 @@ def test_day_budget_blocks_entries() -> None:
     t70 = next(b.ticker for b in ev.brackets if b.bracket.lo == 70)
     probs[t70] = 0.45
     b = Budget()
-    b.add("OTHER-CITY", "OTHER", "2026-10-28", 10_000)  # day cap already used elsewhere
+    cap = WeatherSettings().max_cost_per_day_cents
+    b.add("OTHER-CITY", "OTHER", "2026-10-28", cap)  # day cap already used elsewhere
     assert _strategy().decide(ev, probs, {}, b, 50_000, NOW) == []
 
 

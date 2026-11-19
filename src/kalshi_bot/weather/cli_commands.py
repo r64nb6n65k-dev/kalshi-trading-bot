@@ -79,7 +79,7 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
                                 rules = next((m.rules_primary for m in mk if m.rules_primary), "")
                                 if not rules:
                                     hint = "no rules text"
-                                elif st.rules_hint.lower() in rules.lower():
+                                elif st.rules_match(rules):
                                     hint = "rules ok"
                                 else:
                                     hint = f"RULES LACK '{st.rules_hint}': {rules[:120]}"

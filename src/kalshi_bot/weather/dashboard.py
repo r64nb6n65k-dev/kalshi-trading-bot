@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kalshi_bot.telemetry.logging import get_logger
+from kalshi_bot.weather.fees import fee_cents
 
 if TYPE_CHECKING:
     from kalshi_bot.weather.engine import WeatherEngine
@@ -47,6 +48,48 @@ def recent_rows(log_dir: Path, types: set[str], max_files: int = 45) -> list[dic
             continue
     out.sort(key=lambda r: str(r.get("t", "")), reverse=True)
     return out
+
+
+MARKET_TYPES = (("KXHIGH", "Daily high"), ("KXLOWT", "Daily low"), ("KXTEMP", "Hourly"),
+                ("KXRAIN", "Rain"))  # fmt: skip
+
+
+def market_type(ticker: str) -> str:
+    for prefix, name in MARKET_TYPES:
+        if ticker.startswith(prefix):
+            return name
+    return "Other"
+
+
+def scoreboard(
+    orders: list[dict[str, Any]],
+    settles: list[dict[str, Any]],
+    open_costs: dict[str, int],
+    fee_rate: float,
+) -> list[dict[str, Any]]:
+    """Results per market type, so you can see which kinds make money."""
+    rows: dict[str, dict[str, Any]] = {}
+
+    def row(t: str) -> dict[str, Any]:
+        return rows.setdefault(
+            t, {"type": t, "bets": 0, "open": 0, "wins": 0, "losses": 0, "pnl_cents": 0}
+        )
+
+    for o in orders:
+        r = row(market_type(str(o.get("ticker", ""))))
+        if o.get("action") == "buy":
+            r["bets"] += 1
+        price, n = int(o.get("fill_price") or 0), int(o.get("filled") or 0)
+        r["pnl_cents"] -= fee_cents(price, n, fee_rate)
+    for x in settles:
+        r = row(market_type(str(x.get("ticker", ""))))
+        pnl = int(x.get("pnl") or 0)
+        r["pnl_cents"] += pnl
+        r["wins" if pnl > 0 else "losses"] += 1
+    for t in open_costs:
+        row(market_type(t))["open"] += 1
+    order = [name for _, name in MARKET_TYPES] + ["Other"]
+    return sorted(rows.values(), key=lambda r: order.index(r["type"]))
 
 
 def storage_status(data_dir: Path) -> dict[str, Any]:
@@ -142,6 +185,13 @@ def build_data(engine: WeatherEngine) -> dict[str, Any]:
         "strategy": engine.ws.strategy,
         "storage": storage_status(engine.data_dir),
         "settlement": engine.settle_status,
+        "warnings": sorted(set(engine.warnings))[:8],
+        "scoreboard": scoreboard(
+            recent_rows(engine.datalog.dir, {"order"}, max_files=10_000),
+            recent_rows(engine.datalog.dir, {"settle"}, max_files=10_000),
+            {p["ticker"]: int(p["cost_cents"]) for p in raw},
+            engine.ws.fee_rate,
+        ),
         "account": account,
         "stats": {
             "trades": len(orders),
@@ -204,6 +254,7 @@ a{color:var(--link)}.scroll{overflow-x:auto}.empty{color:var(--dim);font-size:14
 <div class=sub id=status>Loading…</div><div id=err></div><div id=health></div>
 <h2>Money</h2><div class=g id=money></div>
 <h2>Results</h2><div class=g id=stats></div>
+<h2>Scoreboard by market type</h2><div id=score></div>
 <h2>Open bets</h2><div class=list id=open></div>
 <h2>Markets right now</h2><div class=sub>Forecast odds vs Kalshi price. 🟢 = the bot likes
 this one. Tap a city to expand.</div><div id=markets></div>
@@ -235,8 +286,10 @@ const st=d.storage,se=d.settlement||{};
 $('health').innerHTML=`<div class=sub>${d.strategy==='simple'?'Strategy: bet the NWS forecast':
 'Strategy: model'} · Memory: ${st.persistent?'✅ saved on Railway volume':
 '⚠️ NOT on a volume, so it resets on every update'}</div><div class=sub>Settlement check: ${
-se.checked_at?ago(se.checked_at)+' · '+se.past_day+' bets waiting for results'+
-(se.errors&&se.errors.length?' · ⚠️ '+se.errors[0]:'')+(se.waiting&&se.waiting.length?
+se.checked_at?ago(se.checked_at)+' · '+(se.past_day-se.settled_now)+' bets waiting for results'+
+(se.settled_now?' · '+se.settled_now+' just settled':'')+
+(se.errors&&se.errors.length?' · ⚠️ '+se.errors[0]:'')+(d.warnings.length?
+'</div><div class=s>⚠️ '+d.warnings.join(' · '):'')+(se.waiting&&se.waiting.length?
 ' · e.g. '+se.waiting[0]:''):'not run yet'}</div>`;
 if(d.mode==='live'){$('money').innerHTML=card('Kalshi balance',usd(a.balance_cents))+
 card('Open bets (mark)',sgn(a.unrealized_cents),cls(a.unrealized_cents));}
@@ -246,6 +299,11 @@ card('Realized (after fees)',sgn(a.realized_cents),cls(a.realized_cents))+
 card('Open bets (mark)',sgn(a.unrealized_cents),cls(a.unrealized_cents))+
 card('Cash available',usd(a.bankroll_cents))+card('In open bets',usd(a.open_cost_cents))+
 card('Fees paid',usd(a.fees_cents));}
+$('score').innerHTML=d.scoreboard.length?'<div class=scroll><table><tr><th>Type</th><th>Bets</th>'+
+'<th>Open</th><th>Won–Lost</th><th>P&L*</th></tr>'+d.scoreboard.map(r=>`<tr><td>${r.type}</td>
+<td>${r.bets}</td><td>${r.open}</td><td>${r.wins}–${r.losses}</td><td class="${cls(r.pnl_cents)}">
+${sgn(r.pnl_cents)}</td></tr>`).join('')+'</table></div><div class=s>*settled results minus all '+
+'fees paid</div>':'<div class=empty>No bets yet.</div>';
 $('stats').innerHTML=card('Trades',s.trades)+card('Settled',s.settled)+
 card('Record',s.wins+'–'+s.losses)+card('Win rate',s.win_rate==null?'-':s.win_rate+'%');
 $('open').innerHTML=d.positions.length?d.positions.map(p=>{
@@ -257,19 +315,23 @@ return `<div class=c><b>${p.city||''} ${p.kind||''} ${day(p.day)} · ${p.label||
 $('markets').innerHTML=d.markets.length?d.markets.map(m=>{
 const top=m.brackets.reduce((x,b)=>b.p>x.p?b:x,m.brackets[0]);
 const simple=d.strategy==='simple';
-const edge=b=>simple?(b===top?b.edge_yes??-1:-1):Math.max(b.edge_yes??-1,b.edge_no??-1);
+const edge=b=>m.pick==='top'?(b===top?b.edge_yes??-1:-1):Math.max(b.edge_yes??-1,b.edge_no??-1);
 const hot=m.brackets.some(b=>edge(b)>=d.min_edge);
 const obs=m.obs_hi!=null?` · ${m.kind} so far ~${Math.round((m.obs_lo+m.obs_hi)/2)}°`:'';
 const rows=m.brackets.map(b=>{const e=edge(b);
-return `<tr class="${e>=d.min_edge?'hot':''}"><td>${b.label}°</td><td>${pct(b.p)}</td>
+const deg=m.kind==='rain'||m.kind==='hourly'?'':'°';
+return `<tr class="${e>=d.min_edge?'hot':''}"><td>${b.label}${deg}</td><td>${pct(b.p)}</td>
 <td><div class=bar style="width:${Math.round(b.p*60)}px;margin-left:auto"></div></td>
 <td>${b.yes_bid??'-'}/${b.yes_ask??'-'}¢</td><td>${e>-1?Math.round(e*100)+0+'¢':'-'}</td></tr>`}).join('');
+const title=m.kind==='hourly'?`${m.city} · ${when(m.target_time)}`:m.kind==='rain'?
+`🌧️ ${m.city} · ${day(m.day)}`:`${m.city} · ${m.kind} · ${day(m.day)}`;
+const n=m.brackets.length;
+const info=m.kind==='rain'?`${m.source} · ${n} ${n===1?'city':'cities'}`:`${m.source||'model'} `+
+`${m.mean}° ±${m.std}`+(m.pick==='top'?` · most likely ${top.label}° (${pct(top.p)})`:'');
 const key=m.event;return `<details class="c mk" ${open_[key]?'open':''}
- ontoggle="open_['${key}']=this.open"><summary><h3>${hot?'🟢 ':''}${m.city} · ${m.kind} ·
- ${day(m.day)}</h3><div class=s>${m.source||'model'} ${m.mean}° ±${m.std} ·
- most likely ${top.label}°
- (${pct(top.p)})${obs}${m.intraday?' · today':''}</div></summary>
-<table><tr><th>Bracket</th><th>Odds</th><th></th><th>Bid/Ask</th><th>Edge</th></tr>${rows}
+ ontoggle="open_['${key}']=this.open"><summary><h3>${hot?'🟢 ':''}${title}</h3>
+<div class=s>${info}${obs}${m.intraday?' · today':''}</div></summary>
+<table><tr><th>${m.kind==='rain'?'City':'Range'}</th><th>${m.kind==='rain'?'Rain':'Odds'}</th><th></th><th>Bid/Ask</th><th>Edge</th></tr>${rows}
 </table>${m.decisions.length?'<div class=s>Bot action: '+m.decisions.join('; ')+'</div>':''}
 </details>`}).join(''):'<div class=empty>No markets modeled yet. Give it a minute.</div>';
 $('trades').innerHTML=d.orders.length?'<div class=scroll><table><tr><th>When</th>'+

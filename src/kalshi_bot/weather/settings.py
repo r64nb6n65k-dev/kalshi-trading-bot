@@ -18,8 +18,22 @@ class WeatherSettings(BaseModel):
     """Everything the weather engine, model and strategy need."""
 
     # --- Universe -----------------------------------------------------------
-    stations: str = Field(default="NYC,CHI,AUS,MIA,DEN", description="Comma-separated codes.")
-    kinds: str = Field(default="high", description="'high', 'low' or 'high,low'.")
+    stations: str = Field(
+        default="NYC,CHI,AUS,MIA,DEN,LAX,PHX,SFO,SEA,LV,SAN,MIN,ATL,BOS,HOU,OKC,DAL,DC,TTN",
+        description="Comma-separated codes (see stations.py).",
+    )
+    kinds: str = Field(default="high,low", description="'high', 'low' or 'high,low'.")
+    hourly: bool = Field(default=True, description="Trade the hourly temperature markets.")
+    rain: bool = Field(default=True, description="Trade the daily 'Where will it rain?' markets.")
+    hourly_min_lead_minutes: float = Field(
+        default=45.0,
+        ge=0,
+        description="Don't bet an hourly market this close to its reading time.",
+    )
+    rain_cutoff_hours: float = Field(
+        default=6.0,
+        description="Stop betting a day's rain market this many hours after local midnight.",
+    )
     series_overrides: dict[str, str] = Field(
         default_factory=dict,
         description='Override series tickers, e.g. {"NYC:low": "KXLOWTNYC"}.',
@@ -133,7 +147,7 @@ class WeatherSettings(BaseModel):
     max_cost_per_market_cents: int = Field(default=1_500, gt=0)
     max_cost_per_event_cents: int = Field(default=2_500, gt=0)
     max_cost_per_day_cents: int = Field(
-        default=10_000,
+        default=60_000,
         gt=0,
         description="Cap across ALL cities for one date (weather systems are correlated).",
     )
