@@ -54,7 +54,20 @@ market` for a lead bucket, the model has no edge there, so don't trade it.
 4. Bet **before** the day starts, then **hold to settlement**. No selling,
    no NO bets, no same-day trading.
 
-Code: `src/kalshi_bot/weather/simple.py` (about 100 lines). It uses only the NWS,
+It covers every Kalshi weather market that settles within a day:
+
+| Market | Forecast used | One bet per | When it bets |
+|---|---|---|---|
+| Daily high / low (19 cities, `stations.py`) | NWS forecast high/low | city-day | before the day starts |
+| Hourly temperature (NYC, Chicago, Miami, LA) | NWS hourly forecast for that hour | city-hour | until 45 min before the reading |
+| Daily rain ("Where will it rain?") | NWS chance of rain over the local day | city-day | until 6 AM local that day |
+
+Hourly and rain bets can be YES or NO, whichever side the forecast favors
+more. Turn types off with `KALSHI_WEATHER__HOURLY=false`, `KALSHI_WEATHER__RAIN=false`
+or `KALSHI_WEATHER__KINDS=high`. The dashboard's **Scoreboard by market type**
+shows which ones make money.
+
+Code: `src/kalshi_bot/weather/simple.py` (daily) and `markets.py` (hourly, rain). It uses only the NWS,
 not Open-Meteo. The older multi-model strategy is still available with
 `KALSHI_WEATHER__STRATEGY=model`; the model sections below describe it.
 
