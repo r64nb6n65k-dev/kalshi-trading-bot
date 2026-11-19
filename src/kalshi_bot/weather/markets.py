@@ -50,13 +50,24 @@ HOURLY: dict[str, Station] = {
     "KXTEMPLAXHS": _place("LAX-H", "LA coastal hourly", 33.95, -118.40, -8),
 }
 
-# Airports to read live temperatures from for each hourly index (the index
-# blends several metro airports; these are the main ones).
+# Kalshi's own live index (the number hourly markets settle on) is read from
+# GET /live_data/weather/{city}. Candidate city IDs per series: the first one
+# Kalshi recognises is remembered.
+HOURLY_INDEX_IDS: dict[str, list[str]] = {
+    "KXTEMPNYCHS": ["nyc", "new-york", "newyork", "new_york", "ny"],
+    "KXTEMPCHIHS": ["chicago", "chi"],
+    "KXTEMPMIAH": ["miami", "mia"],
+    "KXTEMPLAXHS": ["la-coastal", "la_coastal", "lacoastal", "los-angeles", "la", "lax"],
+}
+
+# Fallback if the index can't be read: the index's member airports, averaged.
+# NYC and LA lists from minutetemp.com (Kalshi re-estimates small per-station
+# offsets weekly, which this ignores); Chicago and Miami are best guesses.
 HOURLY_STATIONS: dict[str, list[str]] = {
-    "KXTEMPNYCHS": ["KNYC", "KLGA", "KJFK", "KEWR"],
-    "KXTEMPCHIHS": ["KORD", "KMDW"],
-    "KXTEMPMIAH": ["KMIA", "KFLL", "KOPF"],
-    "KXTEMPLAXHS": ["KLAX", "KSMO", "KLGB"],
+    "KXTEMPNYCHS": ["KLGA", "KEWR", "KTEB", "KCDW", "KHPN", "KFRG", "KSMQ", "KISP"],
+    "KXTEMPCHIHS": ["KORD", "KMDW", "KPWK", "KDPA", "KARR"],
+    "KXTEMPMIAH": ["KMIA", "KFLL", "KOPF", "KTMB", "KHWO"],
+    "KXTEMPLAXHS": ["KHHR", "KLAX", "KSMO", "KLGB", "KSNA"],
 }
 
 RAIN_SERIES = "KXRAIN"
