@@ -152,14 +152,34 @@ class NwsClient:
             pops=periods(props, "probabilityOfPrecipitation"),
         )
 
+    async def nearest_station(self, place: Station) -> str:
+        """ICAO of the NWS observation station closest to a place (cached)."""
+        if place.icao:
+            return place.icao
+        key = f"near:{place.code}"
+        if key not in self._grid_urls:
+            pts = await self._get(f"/points/{place.lat:.4f},{place.lon:.4f}")
+            stations = await self._get(str(pts["properties"]["observationStations"]))
+            first = (stations.get("features") or [{}])[0].get("properties") or {}
+            self._grid_urls[key] = str(first.get("stationIdentifier") or "")
+        return self._grid_urls[key]
+
     async def observations(
         self,
         station: Station,
         start: datetime,
         end: datetime,
     ) -> list[ObsReading]:
+        return await self.observations_icao(station.icao, start, end)
+
+    async def observations_icao(
+        self,
+        icao: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[ObsReading]:
         data = await self._get(
-            f"/stations/{station.icao}/observations",
+            f"/stations/{icao}/observations",
             start=start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             end=end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             limit=500,

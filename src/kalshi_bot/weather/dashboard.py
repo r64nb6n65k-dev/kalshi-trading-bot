@@ -256,8 +256,8 @@ a{color:var(--link)}.scroll{overflow-x:auto}.empty{color:var(--dim);font-size:14
 <h2>Results</h2><div class=g id=stats></div>
 <h2>Scoreboard by market type</h2><div id=score></div>
 <h2>Open bets</h2><div class=list id=open></div>
-<h2>Markets right now</h2><div class=sub>Forecast odds vs Kalshi price. 🟢 = the bot likes
-this one. Tap a city to expand.</div><div id=markets></div>
+<h2>Markets right now</h2><div class=sub>"Odds" = how sure the bot is, from live readings
+("-" = not decided yet, so no bet). 🟢 = bet placed. Tap to expand.</div><div id=markets></div>
 <h2>Recent trades</h2><div id=trades></div>
 <h2>Settled</h2><div id=settles></div>
 <p class=sub><a href="/download/trades.csv">Download trades CSV</a> ·
@@ -316,17 +316,19 @@ $('markets').innerHTML=d.markets.length?d.markets.map(m=>{
 const top=m.brackets.reduce((x,b)=>b.p>x.p?b:x,m.brackets[0]);
 const simple=d.strategy==='simple';
 const edge=b=>m.pick==='top'?(b===top?b.edge_yes??-1:-1):Math.max(b.edge_yes??-1,b.edge_no??-1);
-const hot=m.brackets.some(b=>edge(b)>=d.min_edge);
+const hot=m.hot??m.brackets.some(b=>edge(b)>=d.min_edge);
 const obs=m.obs_hi!=null?` · ${m.kind} so far ~${Math.round((m.obs_lo+m.obs_hi)/2)}°`:'';
 const rows=m.brackets.map(b=>{const e=edge(b);
 const deg=m.kind==='rain'||m.kind==='hourly'?'':'°';
-return `<tr class="${e>=d.min_edge?'hot':''}"><td>${b.label}${deg}</td><td>${pct(b.p)}</td>
+return `<tr class="${e>=d.min_edge||b.verdict?'hot':''}"><td>${b.label}${deg}</td>
+<td>${pct(b.p)}</td>
 <td><div class=bar style="width:${Math.round(b.p*60)}px;margin-left:auto"></div></td>
 <td>${b.yes_bid??'-'}/${b.yes_ask??'-'}¢</td><td>${e>-1?Math.round(e*100)+0+'¢':'-'}</td></tr>`}).join('');
 const title=m.kind==='hourly'?`${m.city} · ${when(m.target_time)}`:m.kind==='rain'?
 `🌧️ ${m.city} · ${day(m.day)}`:`${m.city} · ${m.kind} · ${day(m.day)}`;
 const n=m.brackets.length;
-const info=m.kind==='rain'?`${m.source} · ${n} ${n===1?'city':'cities'}`:`${m.source||'model'} `+
+const info=m.evidence?m.evidence:m.kind==='rain'?`${m.source} · ${n} ${n===1?'city':'cities'}`:
+`${m.source||'model'} `+
 `${m.mean}° ±${m.std}`+(m.pick==='top'?` · most likely ${top.label}° (${pct(top.p)})`:'');
 const key=m.event;return `<details class="c mk" ${open_[key]?'open':''}
  ontoggle="open_['${key}']=this.open"><summary><h3>${hot?'🟢 ':''}${title}</h3>
