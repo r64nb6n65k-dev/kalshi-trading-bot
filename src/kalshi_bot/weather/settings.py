@@ -23,7 +23,13 @@ class WeatherSettings(BaseModel):
         description="Comma-separated codes (see stations.py).",
     )
     kinds: str = Field(default="high,low", description="'high', 'low' or 'high,low'.")
-    hourly: bool = Field(default=True, description="Trade the hourly temperature markets.")
+    hourly: bool = Field(
+        default=False,
+        description=(
+            "Trade the hourly temperature markets. Off: they settle on Kalshi's own blend of "
+            "stations, which ran 7-10°F colder than the four main NYC airports in testing."
+        ),
+    )
     rain: bool = Field(default=True, description="Trade the daily 'Where will it rain?' markets.")
     hourly_min_lead_minutes: float = Field(
         default=45.0,
@@ -115,6 +121,15 @@ class WeatherSettings(BaseModel):
     live_max_price: int = Field(default=97, ge=1, le=99, description="Never pay more than this.")
     live_cushion_cents: int = Field(
         default=2, ge=0, description="Price must be this far below the chance of winning."
+    )
+    live_min_price: int = Field(
+        default=60,
+        ge=1,
+        le=99,
+        description=(
+            "Only buy a side Kalshi also prices as the favourite (at least this many cents). "
+            "If the bot is sure but the market says it's a long shot, the bot is missing something."
+        ),
     )
     hourly_live_gap: float = Field(
         default=5.0, gt=0, description="Hourly: reading must look this many °F from the line."

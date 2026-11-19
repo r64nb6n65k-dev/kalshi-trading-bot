@@ -686,7 +686,8 @@ class WeatherEngine:
                 for m in ms:
                     v = hourly_verdict(m, projected, self.ws.hourly_live_gap)
                     rows.append((m, (m.yes_sub_title or m.ticker).replace(" or above", "+"), v))
-                    if v is not None and not decisions:  # one bet per city-hour
+                    already = any(t.startswith(ev_ticker + "-") and n for t, n in positions.items())
+                    if v is not None and not decisions and not already:  # one per city-hour
                         decisions += await self._bet(
                             m, v, ev_ticker, target.date().isoformat(), positions, budget, now
                         )
