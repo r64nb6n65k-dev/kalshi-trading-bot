@@ -102,11 +102,25 @@ class WeatherSettings(BaseModel):
 
     # --- Which strategy ------------------------------------------------------
     strategy: str = Field(
-        default="simple",
+        default="live",
         description=(
-            "'simple' = bet the National Weather Service forecast, one bet per city-day, "
-            "held to settlement. 'model' = the older multi-model strategy."
+            "'live' = only bet outcomes live airport readings show are already decided "
+            "(see live.py). 'simple' = bet the NWS forecast before the day starts. "
+            "'model' = the older multi-model strategy."
         ),
+    )
+
+    # --- Live strategy ----------------------------------------------------------
+    live_stake_cents: int = Field(default=1_000, gt=0, description="Money per bet ($10).")
+    live_max_price: int = Field(default=97, ge=1, le=99, description="Never pay more than this.")
+    live_cushion_cents: int = Field(
+        default=2, ge=0, description="Price must be this far below the chance of winning."
+    )
+    hourly_live_gap: float = Field(
+        default=5.0, gt=0, description="Hourly: reading must look this many °F from the line."
+    )
+    hourly_live_minutes: float = Field(
+        default=60.0, gt=0, description="Hourly: only bet within this many minutes of the reading."
     )
 
     # --- Simple strategy --------------------------------------------------------

@@ -42,7 +42,26 @@ already has.
 **The go/no-go gate is step 5.** If `Brier model` isn't clearly below `Brier
 market` for a lead bucket, the model has no edge there, so don't trade it.
 
-## Strategy: bet the forecast (default)
+## Strategy: bet what's already decided (default, `STRATEGY=live`)
+
+The bot doesn't try to out-forecast Kalshi. It watches live NWS airport
+readings, the same data the markets settle on, and bets only when an
+outcome is already decided or nearly so. Then it buys the favourite.
+
+| Market | When it bets | Side |
+|---|---|---|
+| Daily high | Thermometer already passed a range | NO on that range (99.5% sure) |
+| Daily high | After 4 PM: 3°F+ below the high, rest-of-day forecast 3°F+ below it | YES on the high's range (95%), NO above it |
+| Daily low | Already dropped below a range / after 10 AM, rest of day stays 3°F+ warmer | mirror of the above |
+| Rain | Airport already measured 0.01"+ today | YES (97%) |
+| Rain | Raining now and NWS 80%+ for the rest of the day | YES (90%) |
+| Rain | After 8 PM, dry all day, NWS 5% or less | NO (95%) |
+| Hourly | Last hour: current readings + NWS trend put it 5°F+ from the line | that side (95%) |
+
+It only pays up to the chance of winning minus 2 cents, never above 97 cents, and
+bets $10 (`LIVE_STAKE_CENTS`) once per market. Code: `src/kalshi_bot/weather/live.py`.
+
+## Strategy: bet the forecast (`STRATEGY=simple`)
 
 `KALSHI_WEATHER__STRATEGY=simple` (the default) does one thing:
 

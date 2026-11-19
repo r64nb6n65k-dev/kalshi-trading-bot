@@ -24,6 +24,10 @@ _T_GROUP = re.compile(r"(?<=\s)T([01])(\d{3})(?:[01]\d{3})?(?=\s|$)")
 _MAX6 = re.compile(r"(?<=\s)1([01])(\d{3})(?=\s|$)")
 _MIN6 = re.compile(r"(?<=\s)2([01])(\d{3})(?=\s|$)")
 _EXT24 = re.compile(r"(?<=\s)4([01])(\d{3})([01])(\d{3})(?=\s|$)")
+# Hourly rainfall since the last hourly report, hundredths of an inch (P0012 = 0.12").
+_PRECIP_HR = re.compile(r"(?<=\s)P(\d{4})(?=\s|$)")
+# Rain or drizzle reported as present weather (body of the METAR, before RMK).
+_WX_RAIN = re.compile(r"(?<=\s)[-+]?(?:VC)?(?:TS|SH|FZ)?[A-Z]*(?:RA|DZ)[A-Z]*(?=\s)")
 
 WINDOW_TOLERANCE = timedelta(minutes=10)
 
@@ -46,7 +50,9 @@ class ObsReading:
     """One bound-carrying reading.
 
     ``kind``: ``inst`` (instantaneous), ``max6``/``min6`` (6h extreme ending at
-    ``time``), ``max24``/``min24`` (climate-day extreme).
+    ``time``), ``max24``/``min24`` (climate-day extreme), ``precip`` (inches of
+    rain in the hour before ``time``, in ``lo_f``), ``rain_now`` (rain or
+    drizzle falling at ``time``).
     """
 
     time: datetime
@@ -85,6 +91,19 @@ def parse_observation(props: dict[str, Any]) -> list[ObsReading]:
             v = float(value)
             c = (v - 32.0) * 5.0 / 9.0 if unit.endswith("degF") else v
             out.append(ObsReading(t, "inst", *_interval_f(c, 0.5)))
+
+    # Weather groups only: skip the station ID and time (e.g. "KRAP 191051Z").
+    body = " " + " ".join(raw.split(" RMK ", 1)[0].split()[2:]) + " "
+    if _WX_RAIN.search(body):
+        out.append(ObsReading(t, "rain_now", 1.0, 1.0))
+    if m := _PRECIP_HR.search(rmk):
+        inches = int(m.group(1)) / 100.0
+        out.append(ObsReading(t, "precip", inches, inches))
+    elif " RMK " not in raw:
+        mm = (props.get("precipitationLastHour") or {}).get("value")
+        if mm is not None and raw.strip() == "":
+            inches = float(mm) / 25.4
+            out.append(ObsReading(t, "precip", inches, inches))
 
     if rmk.strip():
         if m := _MAX6.search(rmk):
@@ -154,3 +173,31 @@ def summarize(readings: list[ObsReading], start: datetime, end: datetime) -> Obs
         s.max_lo, s.max_hi = max(max_los), max(max_his)
         s.min_lo, s.min_hi = min(min_los), min(min_his)
     return s
+
+
+@dataclass(slots=True)
+class RainSummary:
+    inches: float  # measured rain so far in the window
+    raining_now: bool  # rain/drizzle in the latest report (within 75 min)
+    latest_time: datetime | None
+
+
+def rain_so_far(readings: list[ObsReading], start: datetime, end: datetime) -> RainSummary:
+    """Measured rain in ``[start, end)``. Hourly amounts are deduplicated by hour."""
+    by_hour: dict[datetime, float] = {}
+    latest: datetime | None = None
+    for r in readings:
+        if not start <= r.time < end:
+            continue
+        if latest is None or r.time > latest:
+            latest = r.time
+        if r.kind == "precip":
+            key = r.time.replace(minute=0, second=0, microsecond=0)
+            by_hour[key] = max(by_hour.get(key, 0.0), r.lo_f)
+    raining = False
+    if latest is not None:
+        recent = [r for r in readings if r.time >= latest - timedelta(minutes=75)]
+        raining = any(r.kind == "rain_now" for r in recent if r.time == latest) or any(
+            r.kind == "rain_now" and r.time >= latest - timedelta(minutes=20) for r in recent
+        )
+    return RainSummary(round(sum(by_hour.values()), 2), raining, latest)

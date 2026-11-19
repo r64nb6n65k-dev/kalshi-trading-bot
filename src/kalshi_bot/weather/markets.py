@@ -50,6 +50,15 @@ HOURLY: dict[str, Station] = {
     "KXTEMPLAXHS": _place("LAX-H", "LA coastal hourly", 33.95, -118.40, -8),
 }
 
+# Airports to read live temperatures from for each hourly index (the index
+# blends several metro airports; these are the main ones).
+HOURLY_STATIONS: dict[str, list[str]] = {
+    "KXTEMPNYCHS": ["KNYC", "KLGA", "KJFK", "KEWR"],
+    "KXTEMPCHIHS": ["KORD", "KMDW"],
+    "KXTEMPMIAH": ["KMIA", "KFLL", "KOPF"],
+    "KXTEMPLAXHS": ["KLAX", "KSMO", "KLGB"],
+}
+
 RAIN_SERIES = "KXRAIN"
 
 # City name (as Kalshi writes it) -> (lat, lon, standard UTC offset).

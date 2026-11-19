@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from kalshi_bot.exchange.client import KalshiClient
-from kalshi_bot.exchange.models import Action, Side
+from kalshi_bot.exchange.models import Action, Market, Side
 from kalshi_bot.risk.manager import RiskManager
 from kalshi_bot.telemetry.logging import get_logger
 from kalshi_bot.weather.brackets import WeatherEvent, group_events, parse_event_date
@@ -29,8 +29,16 @@ from kalshi_bot.weather.datalog import DataLog
 from kalshi_bot.weather.fees import fee_cents, fee_per_contract
 from kalshi_bot.weather.forecasts import ForecastBundle, OpenMeteoClient
 from kalshi_bot.weather.ledger import PaperLedger, budget_from_live, day_of
+from kalshi_bot.weather.live import (
+    Verdict,
+    daily_verdicts,
+    hourly_verdict,
+    lock_bet,
+    rain_verdict,
+)
 from kalshi_bot.weather.markets import (
     HOURLY,
+    HOURLY_STATIONS,
     RAIN_SERIES,
     Candidate,
     candidate_rows,
@@ -43,7 +51,7 @@ from kalshi_bot.weather.markets import (
 )
 from kalshi_bot.weather.model import ModelResult, build_distribution
 from kalshi_bot.weather.nws import NwsClient
-from kalshi_bot.weather.observations import ObsReading, summarize
+from kalshi_bot.weather.observations import ObsReading, rain_so_far, summarize
 from kalshi_bot.weather.settings import WeatherSettings
 from kalshi_bot.weather.simple import decide_simple, forecast_odds
 from kalshi_bot.weather.stations import (
@@ -172,6 +180,7 @@ class WeatherEngine:
         self.settle_status: dict[str, Any] = {}
         self.warnings: list[str] = []
         self._extra: list[dict[str, Any]] = []
+        self._obs_icao: dict[str, tuple[float, list[ObsReading]]] = {}
         self._grids: dict[str, tuple[float, Any]] = {}
 
     async def aclose(self) -> None:
@@ -503,9 +512,263 @@ class WeatherEngine:
             out.append(snap)
         return out
 
+    async def obs_icao(self, icao: str, now: datetime) -> list[ObsReading]:
+        """Last ~30 hours of readings for any station, cached ``obs_refresh`` seconds."""
+        cached = self._obs_icao.get(icao)
+        if cached and time.monotonic() - cached[0] < self.ws.obs_refresh:
+            return cached[1]
+        try:
+            readings = await self.nws.observations_icao(icao, now - timedelta(hours=30), now)
+        except Exception as exc:
+            logger.warning("%s observations failed: %s", icao, exc)
+            return cached[1] if cached else []
+        self._obs_icao[icao] = (time.monotonic(), readings)
+        return readings
+
+    def _snap(
+        self,
+        event: str,
+        kind: str,
+        city: str,
+        station: str,
+        day_iso: str,
+        evidence: str,
+        rows: list[tuple[Market, str, Verdict | None]],
+        decisions: list[Decision],
+        target_time: str | None = None,
+    ) -> dict[str, Any]:
+        """Dashboard card for the live strategy."""
+        brackets = []
+        for m, label, v in rows:
+            p = None if v is None else (v.p_win if v.side is Side.YES else 1 - v.p_win)
+            brackets.append(
+                {
+                    "ticker": m.ticker,
+                    "label": label,
+                    "p": p,
+                    "yes_bid": m.yes_bid,
+                    "yes_ask": m.yes_ask,
+                    "no_bid": m.no_bid,
+                    "no_ask": m.no_ask,
+                    "edge_yes": None,
+                    "edge_no": None,
+                    "verdict": None if v is None else f"{v.side.value.upper()}: {v.why}",
+                }
+            )
+        return {
+            "event": event, "source": "Live readings", "pick": "any", "station": station,
+            "city": city, "kind": kind, "day": day_iso, "target_time": target_time,
+            "mean": None, "std": None, "lead_hours": None, "intraday": True,
+            "obs_lo": None, "obs_hi": None, "evidence": evidence, "hot": bool(decisions),
+            "brackets": brackets, "decisions": [d.reason for d in decisions],
+        }  # fmt: skip
+
+    async def _bet(
+        self,
+        m: Market,
+        v: Verdict,
+        event: str,
+        day_iso: str,
+        positions: dict[str, int],
+        budget: Budget,
+        now: datetime,
+    ) -> list[Decision]:
+        if not self._open_for_trading(m.close_time, now):
+            return []
+        d = lock_bet(m, v, event, day_iso, positions, budget, self.ws)
+        if d is None:
+            return []
+        await self._execute(d, positions, event)
+        return [d]
+
+    async def _cycle_live(self, now: datetime) -> list[EventSnapshot]:
+        """Bet only what live airport readings show is already decided (live.py)."""
+        positions, budget, _ = await self._account()
+        extra: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for st in self.stations:
+            today = climate_today(st, now)
+            start, end = climate_day_window(st, today)
+            local_hour = ((now - start).total_seconds() / 3600) % 24
+            readings: list[ObsReading] | None = None
+            grid: Any = None
+            for kind in self.kinds:
+                try:
+                    events = [e for e in await self.events(st, kind, now) if e.day == today]
+                except Exception as exc:
+                    logger.warning("%s %s: market fetch failed: %s", st.code, kind.value, exc)
+                    continue
+                if not events:
+                    continue
+                if readings is None:
+                    readings = await self.obs_icao(st.icao, now)
+                    grid = await self.nws_grid(st)
+                obs = summarize(readings, start, end)
+                rest = [] if grid is None else [v for a, b, v in grid.temps if b > now and a < end]
+                for ev in events:
+                    pairs = [(bm.ticker, bm.bracket) for bm in ev.brackets]
+                    verdicts = daily_verdicts(kind, pairs, obs, rest, local_hour)
+                    decisions: list[Decision] = []
+                    for bm in ev.brackets:
+                        v = verdicts.get(bm.ticker)
+                        if v is not None:
+                            decisions += await self._bet(
+                                bm.market, v, ev.event_ticker, today.isoformat(),
+                                positions, budget, now,
+                            )  # fmt: skip
+                    so_far = obs.max_lo if kind is Kind.HIGH else obs.min_hi
+                    evidence = (
+                        f"{kind.value} so far {so_far:.1f}° · now {obs.latest_temp_f:.0f}° · "
+                        f"{obs.n_readings} readings"
+                        if so_far is not None and obs.latest_temp_f is not None
+                        else "no readings yet"
+                    )
+                    extra.append(self._snap(
+                        ev.event_ticker, kind.value, st.name, st.code, today.isoformat(),
+                        evidence,
+                        [(bm.market, bm.bracket.label(), verdicts.get(bm.ticker))
+                         for bm in ev.brackets],
+                        decisions,
+                    ))  # fmt: skip
+        if self.ws.hourly:
+            extra += await self._live_hourly(now, positions, budget)
+        if self.ws.rain:
+            extra += await self._live_rain(now, positions, budget, warnings)
+        self._extra = extra
+        self.warnings = warnings
+        return []
+
+    async def _live_hourly(
+        self, now: datetime, positions: dict[str, int], budget: Budget
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for series, place in HOURLY.items():
+            try:
+                markets = await self.client.get_all_markets(series_ticker=series, status="open")
+            except Exception as exc:
+                logger.warning("%s: market fetch failed: %s", series, exc)
+                continue
+            by_event: dict[str, list[Market]] = {}
+            for m in markets:
+                by_event.setdefault(m.event_ticker or m.ticker.rsplit("-", 1)[0], []).append(m)
+            soon = {
+                e: ms for e, ms in by_event.items()
+                if (t := hourly_target(ms[0])) is not None
+                and 0 < (t - now).total_seconds() / 60 <= self.ws.hourly_live_minutes
+            }  # fmt: skip
+            if not soon:
+                continue
+            temps: list[float] = []
+            for icao in HOURLY_STATIONS.get(series, []):
+                rd = [r for r in await self.obs_icao(icao, now) if r.kind == "inst"]
+                rd = [r for r in rd if (now - r.time).total_seconds() <= 40 * 60]
+                if rd:
+                    temps.append(max(rd, key=lambda r: r.time).mid_f)
+            grid = await self.nws_grid(place)
+            for ev_ticker, ms in sorted(soon.items()):
+                target = hourly_target(ms[0])
+                assert target is not None
+                if not temps:
+                    out.append(self._snap(ev_ticker, "hourly", place.name, place.code,
+                                          target.date().isoformat(), "no live readings",
+                                          [(m, m.yes_sub_title or m.ticker, None) for m in ms],
+                                          [], target.isoformat()))  # fmt: skip
+                    continue
+                current = sum(temps) / len(temps)
+                change = 0.0
+                if grid is not None:
+                    a, b = grid.temp_at(now), grid.temp_at(target)
+                    if a is not None and b is not None:
+                        change = b - a
+                projected = current + change
+                rows: list[tuple[Market, str, Verdict | None]] = []
+                decisions: list[Decision] = []
+                for m in ms:
+                    v = hourly_verdict(m, projected, self.ws.hourly_live_gap)
+                    rows.append((m, (m.yes_sub_title or m.ticker).replace(" or above", "+"), v))
+                    if v is not None and not decisions:  # one bet per city-hour
+                        decisions += await self._bet(
+                            m, v, ev_ticker, target.date().isoformat(), positions, budget, now
+                        )
+                evidence = (
+                    f"now {current:.1f}° across {len(temps)} airports, NWS change "
+                    f"{change:+.1f}° -> ~{projected:.0f}° at the reading"
+                )
+                out.append(self._snap(ev_ticker, "hourly", place.name, place.code,
+                                      target.date().isoformat(), evidence, rows, decisions,
+                                      target.isoformat()))  # fmt: skip
+        return out
+
+    async def _live_rain(
+        self,
+        now: datetime,
+        positions: dict[str, int],
+        budget: Budget,
+        warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        try:
+            markets = await self.client.get_all_markets(series_ticker=RAIN_SERIES, status="open")
+        except Exception as exc:
+            logger.warning("%s: market fetch failed: %s", RAIN_SERIES, exc)
+            return []
+        by_event: dict[str, list[Market]] = {}
+        for m in markets:
+            by_event.setdefault(m.event_ticker or m.ticker.rsplit("-", 1)[0], []).append(m)
+        out: list[dict[str, Any]] = []
+        for ev_ticker, ms in sorted(by_event.items()):
+            day = parse_event_date(ev_ticker)
+            if day is None:
+                continue
+            rows: list[tuple[Market, str, Verdict | None]] = []
+            decisions: list[Decision] = []
+            for m in ms:
+                city = rain_city(m)
+                if city is None:
+                    warnings.append(
+                        f"Rain market for unknown city '{m.yes_sub_title or m.ticker}' skipped"
+                    )
+                    continue
+                place = rain_place(city)
+                start = datetime(day.year, day.month, day.day, tzinfo=UTC) - timedelta(
+                    hours=place.std_utc_offset_hours
+                )
+                end = start + timedelta(hours=24)
+                if not start <= now < end:
+                    rows.append((m, city, None))  # not today yet
+                    continue
+                try:
+                    icao = await self.nws.nearest_station(place)
+                except Exception as exc:
+                    logger.warning("%s: nearest station lookup failed: %s", city, exc)
+                    rows.append((m, city, None))
+                    continue
+                rain = rain_so_far(await self.obs_icao(icao, now), start, end)
+                grid = await self.nws_grid(place)
+                pop = None if grid is None else grid.rain_chance(now, end)
+                local_hour = (now - start).total_seconds() / 3600
+                v = rain_verdict(rain, pop, local_hour)
+                label = (
+                    f'{city} ({icao}: {rain.inches:.2f}"{", raining" if rain.raining_now else ""})'
+                )
+                rows.append((m, label, v))
+                if v is not None:
+                    decisions += await self._bet(
+                        m, v, ev_ticker, day.isoformat(), positions, budget, now
+                    )
+            if rows:
+                rows.sort(key=lambda r: r[1])
+                n_called = sum(1 for r in rows if r[2] is not None)
+                out.append(self._snap(ev_ticker, "rain", "Where will it rain?", "RAIN",
+                                      day.isoformat(),
+                                      f"{n_called} of {len(rows)} cities already decided",
+                                      rows, decisions))  # fmt: skip
+        return out
+
     async def cycle(self) -> list[EventSnapshot]:
         now = self.now_fn()
-        if self.ws.strategy == "simple":
+        if self.ws.strategy == "live":
+            snapshots = await self._cycle_live(now)
+        elif self.ws.strategy == "simple":
             snapshots = await self._cycle_simple(now)
         else:
             snapshots = await self._cycle_model(now)
