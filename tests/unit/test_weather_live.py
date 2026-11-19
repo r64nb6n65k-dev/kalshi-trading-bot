@@ -162,6 +162,7 @@ def test_engine_live_bets_only_decided_outcomes(tmp_path: Path) -> None:
     eng.client = FakeKalshiLive()  # type: ignore[assignment]
     eng.nws = FakeNwsLive()  # type: ignore[assignment]
     eng.now_fn = lambda: T  # 6 PM in New York
+    eng.ws = eng.ws.model_copy(update={"hourly": True})
     asyncio.run(eng.cycle())
     pos = eng.ledger.signed_positions()
     # High locked at 62.4 (rest of day 50°): YES on "63 or below" at 90c.
@@ -174,3 +175,15 @@ def test_engine_live_bets_only_decided_outcomes(tmp_path: Path) -> None:
     assert kinds == {"high", "hourly", "rain"}
     rain = next(s for s in eng.last_snapshots if s["kind"] == "rain")
     assert rain["hot"] and '0.12"' in rain["brackets"][0]["label"]
+
+
+@pytest.mark.parametrize(
+    ("price", "bought"),
+    # This morning's real NYC hourly YES buys, all "95% sure".
+    [(1, False), (8, False), (24, False), (56, False), (88, True), (91, True), (93, True)],
+)
+def test_never_buy_what_kalshi_calls_a_long_shot(price: int, bought: bool) -> None:
+    v = Verdict(Side.YES, 0.95, "sure")
+    d = lock_bet(_m("45° or above", max(price - 2, 0), price), v, "E", "d", {}, Budget(),
+                 WeatherSettings())  # fmt: skip
+    assert (d is not None) is bought

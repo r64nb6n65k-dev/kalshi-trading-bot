@@ -58,8 +58,15 @@ outcome is already decided or nearly so. Then it buys the favourite.
 | Rain | After 8 PM, dry all day, NWS 5% or less | NO (95%) |
 | Hourly | Last hour: current readings + NWS trend put it 5°F+ from the line | that side (95%) |
 
-It only pays up to the chance of winning minus 2 cents, never above 97 cents, and
-bets $10 (`LIVE_STAKE_CENTS`) once per market. Code: `src/kalshi_bot/weather/live.py`.
+It only buys a side Kalshi **also** prices as the favourite (60¢+,
+`LIVE_MIN_PRICE`). If the bot is "sure" but the market says long shot, the bot
+is assumed to be missing something. It pays at most the chance of winning
+minus 2 cents, never above 97 cents, and bets $10 (`LIVE_STAKE_CENTS`) once
+per market.
+
+Note: hourly markets settle on Kalshi's own blend of stations. In testing,
+New York's hourly number ran 7-10°F colder than Central Park, LaGuardia, JFK
+and Newark. `HOURLY=false` turns them off. Code: `src/kalshi_bot/weather/live.py`.
 
 ## Strategy: bet the forecast (`STRATEGY=simple`)
 

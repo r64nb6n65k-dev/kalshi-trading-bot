@@ -176,7 +176,7 @@ def test_engine_trades_daily_hourly_and_rain(tmp_path: Path) -> None:
     eng = _engine(tmp_path, "paper", [], strategy="simple")
     eng.client = FakeKalshiAll()  # type: ignore[assignment]
     eng.nws = FakeNwsAll()  # type: ignore[assignment]
-    eng.ws = eng.ws.model_copy(update={"min_price": 12, "max_price": 88})
+    eng.ws = eng.ws.model_copy(update={"min_price": 12, "max_price": 88, "hourly": True})
     snaps = asyncio.run(eng.cycle())
     assert len(snaps) == 1  # the daily high event
     kinds = {s["kind"] for s in eng.last_snapshots}

@@ -116,6 +116,15 @@ class WeatherSettings(BaseModel):
     live_cushion_cents: int = Field(
         default=2, ge=0, description="Price must be this far below the chance of winning."
     )
+    live_min_price: int = Field(
+        default=60,
+        ge=1,
+        le=99,
+        description=(
+            "Only buy a side Kalshi also prices as the favourite (at least this many cents). "
+            "If the bot is sure but the market says it's a long shot, the bot is missing something."
+        ),
+    )
     hourly_live_gap: float = Field(
         default=5.0, gt=0, description="Hourly: reading must look this many °F from the line."
     )

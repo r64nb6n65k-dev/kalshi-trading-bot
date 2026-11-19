@@ -20,8 +20,9 @@ Hourly ("35° or above at 5 AM?"): within the last hour, current airport
   readings plus the NWS forecast change put the reading 5°F+ away from the
   strike. Bet the side it's on.
 
-A bet is placed only if the price is below the chance of winning (minus a
-2-cent cushion) and at most 97 cents.
+A bet is placed only if Kalshi also prices our side as the favourite (60c+),
+the price is below our chance of winning minus a 2-cent cushion, and it's
+at most 97 cents.
 """
 
 from __future__ import annotations
@@ -166,6 +167,8 @@ def lock_bet(
         price = market.no_ask or (100 - market.yes_bid if market.yes_bid else None)
     if not price:
         return None
+    if price < ws.live_min_price:
+        return None  # market strongly disagrees: assume we're missing something
     limit = min(ws.live_max_price, int(v.p_win * 100) - ws.live_cushion_cents)
     if price > limit:
         return None
