@@ -56,8 +56,15 @@ class FakeNws:
         return None
 
 
-def _engine(tmp_path: Path, mode: str, markets: list[Market], result: str | None = None):  # type: ignore[no-untyped-def]
+def _engine(  # type: ignore[no-untyped-def]
+    tmp_path: Path,
+    mode: str,
+    markets: list[Market],
+    result: str | None = None,
+    strategy: str = "model",
+):
     ws = WeatherSettings(
+        strategy=strategy,
         stations="NYC",
         kinds="high",
         data_dir=str(tmp_path),

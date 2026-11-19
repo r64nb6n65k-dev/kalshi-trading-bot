@@ -19,7 +19,7 @@ class WeatherSettings(BaseModel):
 
     # --- Universe -----------------------------------------------------------
     stations: str = Field(default="NYC,CHI,AUS,MIA,DEN", description="Comma-separated codes.")
-    kinds: str = Field(default="high,low", description="'high', 'low' or 'high,low'.")
+    kinds: str = Field(default="high", description="'high', 'low' or 'high,low'.")
     series_overrides: dict[str, str] = Field(
         default_factory=dict,
         description='Override series tickers, e.g. {"NYC:low": "KXLOWTNYC"}.',
@@ -86,7 +86,24 @@ class WeatherSettings(BaseModel):
         description="How much of today's observed-vs-forecast anomaly carries forward.",
     )
 
-    # --- Strategy -----------------------------------------------------------
+    # --- Which strategy ------------------------------------------------------
+    strategy: str = Field(
+        default="simple",
+        description=(
+            "'simple' = bet the National Weather Service forecast, one bet per city-day, "
+            "held to settlement. 'model' = the older multi-model strategy."
+        ),
+    )
+
+    # --- Simple strategy --------------------------------------------------------
+    simple_margin: float = Field(
+        default=0.05,
+        ge=0,
+        description="Buy only if the forecast odds beat Kalshi's price + fee by this (0.05 = 5c).",
+    )
+    simple_stake_cents: int = Field(default=500, gt=0, description="Money per bet ($5).")
+
+    # --- Model strategy (strategy='model') -----------------------------------
     min_edge: float = Field(
         default=0.08,
         ge=0,

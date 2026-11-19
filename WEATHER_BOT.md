@@ -42,6 +42,22 @@ already has.
 **The go/no-go gate is step 5.** If `Brier model` isn't clearly below `Brier
 market` for a lead bucket, the model has no edge there, so don't trade it.
 
+## Strategy: bet the forecast (default)
+
+`KALSHI_WEATHER__STRATEGY=simple` (the default) does one thing:
+
+1. Take the **National Weather Service forecast high** for tomorrow.
+2. Turn it into odds per range (NWS is usually within ~2.6°F a day out).
+3. Buy **one** bet per city-day on the most likely range, only if Kalshi's
+   price is at least **5¢ below** those odds after fees, and only between
+   12¢ and 88¢. Stake: **$5** (`SIMPLE_STAKE_CENTS`).
+4. Bet **before** the day starts, then **hold to settlement**. No selling,
+   no NO bets, no same-day trading.
+
+Code: `src/kalshi_bot/weather/simple.py` (about 100 lines). It uses only the NWS,
+not Open-Meteo. The older multi-model strategy is still available with
+`KALSHI_WEATHER__STRATEGY=model`; the model sections below describe it.
+
 ## Dashboard
 
 `weather-run` serves a phone-friendly dashboard on `$PORT` (Railway sets it;
