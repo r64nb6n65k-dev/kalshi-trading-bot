@@ -56,17 +56,17 @@ outcome is already decided or nearly so. Then it buys the favourite.
 | Rain | Airport already measured 0.01"+ today | YES (97%) |
 | Rain | Raining now and NWS 80%+ for the rest of the day | YES (90%) |
 | Rain | After 8 PM, dry all day, NWS 5% or less | NO (95%) |
-| Hourly (**off by default**, `HOURLY=true` to enable) | Last hour: current readings + NWS trend put it 5°F+ from the line | that side (95%) |
+| Hourly | Last hour: current readings + NWS trend put it 5°F+ from the line | that side (95%) |
 
 It only buys a side Kalshi **also** prices as the favourite (60¢+,
 `LIVE_MIN_PRICE`). If the bot is "sure" but the market says long shot, the bot
 is assumed to be missing something. It pays at most the chance of winning
 minus 2 cents, never above 97 cents, and bets $10 (`LIVE_STAKE_CENTS`) once
-per market (once per city-hour for hourly).
+per market.
 
-Hourly markets are off because they settle on Kalshi's own blend of stations.
-In testing, New York's hourly number ran 7-10°F colder than Central Park,
-LaGuardia, JFK and Newark, so the bot can't measure what it would be betting on. Code: `src/kalshi_bot/weather/live.py`.
+Note: hourly markets settle on Kalshi's own blend of stations. In testing,
+New York's hourly number ran 7-10°F colder than Central Park, LaGuardia, JFK
+and Newark. `HOURLY=false` turns them off. Code: `src/kalshi_bot/weather/live.py`.
 
 ## Strategy: bet the forecast (`STRATEGY=simple`)
 

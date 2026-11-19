@@ -23,13 +23,7 @@ class WeatherSettings(BaseModel):
         description="Comma-separated codes (see stations.py).",
     )
     kinds: str = Field(default="high,low", description="'high', 'low' or 'high,low'.")
-    hourly: bool = Field(
-        default=False,
-        description=(
-            "Trade the hourly temperature markets. Off: they settle on Kalshi's own blend of "
-            "stations, which ran 7-10°F colder than the four main NYC airports in testing."
-        ),
-    )
+    hourly: bool = Field(default=True, description="Trade the hourly temperature markets.")
     rain: bool = Field(default=True, description="Trade the daily 'Where will it rain?' markets.")
     hourly_min_lead_minutes: float = Field(
         default=45.0,

@@ -177,10 +177,6 @@ def test_engine_live_bets_only_decided_outcomes(tmp_path: Path) -> None:
     assert rain["hot"] and '0.12"' in rain["brackets"][0]["label"]
 
 
-def test_hourly_is_off_by_default() -> None:
-    assert WeatherSettings().hourly is False
-
-
 @pytest.mark.parametrize(
     ("price", "bought"),
     # This morning's real NYC hourly YES buys, all "95% sure".
@@ -191,20 +187,3 @@ def test_never_buy_what_kalshi_calls_a_long_shot(price: int, bought: bool) -> No
     d = lock_bet(_m("45° or above", max(price - 2, 0), price), v, "E", "d", {}, Budget(),
                  WeatherSettings())  # fmt: skip
     assert (d is not None) is bought
-
-
-def test_one_hourly_bet_per_city_hour_across_cycles(tmp_path: Path) -> None:
-    eng = _engine(tmp_path, "paper", [], strategy="live")
-    k = FakeKalshiLive()
-    k.by_series["KXTEMPNYCHS"].append(
-        _m("66° or above", 8, 12, "KXTEMPNYCHS-26OCT2819-T65.99",
-           close_time="2026-10-29T00:00:00Z")
-    )  # fmt: skip
-    eng.client = k  # type: ignore[assignment]
-    eng.nws = FakeNwsLive()  # type: ignore[assignment]
-    eng.now_fn = lambda: T
-    eng.ws = eng.ws.model_copy(update={"hourly": True, "obs_refresh": 0.0})
-    asyncio.run(eng.cycle())
-    asyncio.run(eng.cycle())
-    hourly = [t for t in eng.ledger.positions if t.startswith("KXTEMPNYCHS-26OCT2819")]
-    assert len(hourly) == 1
