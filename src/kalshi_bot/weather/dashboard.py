@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any
 
 from kalshi_bot.telemetry.logging import get_logger
 from kalshi_bot.weather.fees import fee_cents
+from kalshi_bot.weather.prices import CRYPTO, INDEXES, asset_for
+from kalshi_bot.weather.sports import league_for
 
 if TYPE_CHECKING:
     from kalshi_bot.weather.engine import WeatherEngine
@@ -58,6 +60,12 @@ def market_type(ticker: str) -> str:
     for prefix, name in MARKET_TYPES:
         if ticker.startswith(prefix):
             return name
+    series = ticker.split("-")[0].upper()
+    if league_for(series) is not None:
+        return "Sports"
+    asset = asset_for(series)
+    if asset is not None:
+        return "Crypto" if asset in CRYPTO else "Stock index" if asset in INDEXES else "Commodities"
     return "Other"
 
 
@@ -88,7 +96,9 @@ def scoreboard(
         r["wins" if pnl > 0 else "losses"] += 1
     for t in open_costs:
         row(market_type(t))["open"] += 1
-    order = [name for _, name in MARKET_TYPES] + ["Other"]
+    order = [name for _, name in MARKET_TYPES] + [
+        "Sports", "Crypto", "Commodities", "Stock index", "Other",
+    ]  # fmt: skip
     return sorted(rows.values(), key=lambda r: order.index(r["type"]))
 
 
@@ -319,7 +329,7 @@ const edge=b=>m.pick==='top'?(b===top?b.edge_yes??-1:-1):Math.max(b.edge_yes??-1
 const hot=m.hot??m.brackets.some(b=>edge(b)>=d.min_edge);
 const obs=m.obs_hi!=null?` · ${m.kind} so far ~${Math.round((m.obs_lo+m.obs_hi)/2)}°`:'';
 const rows=m.brackets.map(b=>{const e=edge(b);
-const deg=m.kind==='rain'||m.kind==='hourly'?'':'°';
+const deg=m.kind==='high'||m.kind==='low'?'°':'';
 return `<tr class="${e>=d.min_edge||b.verdict?'hot':''}"><td>${b.label}${deg}</td>
 <td>${pct(b.p)}</td>
 <td><div class=bar style="width:${Math.round(b.p*60)}px;margin-left:auto"></div></td>
@@ -333,8 +343,10 @@ const info=m.evidence?m.evidence:m.kind==='rain'?`${m.source} · ${n} ${n===1?'c
 const key=m.event;return `<details class="c mk" ${open_[key]?'open':''}
  ontoggle="open_['${key}']=this.open"><summary><h3>${hot?'🟢 ':''}${title}</h3>
 <div class=s>${info}${obs}${m.intraday?' · today':''}</div></summary>
-<table><tr><th>${m.kind==='rain'?'City':'Range'}</th><th>${m.kind==='rain'?'Rain':'Odds'}</th><th></th><th>Bid/Ask</th><th>Edge</th></tr>${rows}
-</table>${m.decisions.length?'<div class=s>Bot action: '+m.decisions.join('; ')+'</div>':''}
+<div class=scroll><table><tr><th>${m.kind==='rain'?'City':['high','low','hourly'].includes(m.kind)?
+'Range':'Market'}</th><th>${m.kind==='rain'?'Rain':'Odds'}</th><th></th><th>Bid/Ask</th>
+<th>Edge</th></tr>${rows}</table></div>
+${m.decisions.length?'<div class=s>Bot action: '+m.decisions.join('; ')+'</div>':''}
 </details>`}).join(''):'<div class=empty>No markets modeled yet. Give it a minute.</div>';
 $('trades').innerHTML=d.orders.length?'<div class=scroll><table><tr><th>When</th>'+
 '<th>Market</th><th>Side</th>'+

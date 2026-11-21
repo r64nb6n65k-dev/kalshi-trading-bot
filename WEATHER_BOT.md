@@ -70,6 +70,23 @@ bot reads that exact number from Kalshi's public feed
 (`GET /live_data/weather/{city}`), so it bets on what actually settles.
 `HOURLY=false` turns them off. Code: `src/kalshi_bot/weather/live.py`.
 
+## Beyond weather: sports and price markets (same idea)
+
+With `STRATEGY=live`, a second loop (every 15 s, `FAST_POLL_INTERVAL`) applies the
+same rule to other Kalshi markets. It only bets when live data shows the outcome
+is decided, buys Kalshi's favourite (60¢+) and never pays above 97¢.
+
+| Markets | Live data | Decided when |
+|---|---|---|
+| Sports game winners (NFL, college football, NBA, WNBA, college basketball, NHL, MLB, EPL/MLS/UCL/La Liga/Serie A/Bundesliga/Ligue 1), found from Kalshi's Sports category | ESPN public scoreboard | Game final; or basketball (lead−3)² > seconds left; football 17+ pts ≤7 min or 9+ pts ≤100 s; hockey 3+ goals ≤10 min or 2+ ≤90 s; baseball 4+ runs in the 9th or 6+ in the 8th; soccer 2+ goals from the 85th minute |
+| Crypto, commodities and stock indexes closing in the next 5 min (`PRICE_WINDOW_SECONDS`) | Coinbase plus Kalshi's own CF Benchmarks / underlying streams (`data/multi_asset.py`) | Price is 3+ standard moves (`PRICE_Z`) from the line at its recent speed |
+
+Politics, economics and other event markets are not traded: there is no live
+data feed that shows those outcomes are decided before Kalshi settles them.
+Turn the new markets off with `KALSHI_WEATHER__SPORTS=false` or
+`KALSHI_WEATHER__PRICES=false`. The dashboard scoreboard shows Sports, Crypto,
+Commodities and Stock index results separately. Code: `sports.py`, `prices.py`.
+
 ## Strategy: bet the forecast (`STRATEGY=simple`)
 
 `KALSHI_WEATHER__STRATEGY=simple` (the default) does one thing:
