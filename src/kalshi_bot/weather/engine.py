@@ -59,6 +59,7 @@ from kalshi_bot.weather.prices import (
     INDEXES,
     PRODUCTS,
     asset_for,
+    contract_kind,
     price_verdict,
     vol_per_sqrt_second,
 )
@@ -184,6 +185,8 @@ class WeatherEngine:
         self._fast_snaps: list[dict[str, Any]] = []
         self._sports_series: tuple[float, list[str]] = (float("-inf"), [])
         self._series_markets: dict[str, tuple[float, list[Market]]] = {}
+        self.price_status: dict[str, Any] = {}
+        self.sports_status: dict[str, Any] = {}
         self._bundles: dict[str, tuple[float, ForecastBundle]] = {}
         self._obs: dict[str, tuple[float, list[ObsReading]]] = {}
         self._last_log: dict[str, float] = {}
@@ -1052,6 +1055,12 @@ class WeatherEngine:
         self, now: datetime, positions: dict[str, int], budget: Budget
     ) -> list[dict[str, Any]]:
         """Game-winner markets for games ESPN shows as over or out of reach."""
+        status: dict[str, Any] = {
+            "checked_at": now.isoformat(timespec="seconds"), "series": 0, "live_games": 0,
+            "matched": 0, "unmatched": 0, "decided": 0, "bets": 0, "skipped": {}, "error": None,
+        }  # fmt: skip
+        self.sports_status = status
+        skipped: dict[str, int] = status["skipped"]
         stamp, series_list = self._sports_series
         if time.monotonic() - stamp > 600:
             try:
@@ -1064,6 +1073,8 @@ class WeatherEngine:
                 logger.warning("Sports game series found: %s", ", ".join(series_list))
             except Exception as exc:
                 logger.warning("sports series discovery failed: %s", exc)
+                status["error"] = f"Kalshi sports list failed: {exc}"[:200]
+        status["series"] = len(series_list)
         out: list[dict[str, Any]] = []
         for series in series_list:
             league = league_for(series)
@@ -1072,9 +1083,11 @@ class WeatherEngine:
                 games = [g for g in await self.espn.games(league) if g.state in ("in", "post")]
             except Exception as exc:
                 logger.warning("ESPN %s failed: %s", league.code, exc)
+                status["error"] = f"ESPN {league.code}: {exc}"[:200]
                 continue
             if not games:
                 continue
+            status["live_games"] += len(games)
             try:
                 markets = await self._markets_for(series)
             except Exception as exc:
@@ -1090,22 +1103,31 @@ class WeatherEngine:
                 found = match_game(ev_ticker, ms, games)
                 if found is None:
                     continue
+                status["matched"] += 1
                 g, mapping = found
                 outcome = decided(league, g)
                 verdicts = verdicts_for(mapping, outcome) if outcome else {}
                 n_decided += bool(outcome)
+                status["decided"] += bool(outcome)
                 day_iso = g.day.isoformat()
                 for m in ms:
                     v = verdicts.get(m.ticker)
                     if v is not None:
-                        decisions += await self._bet(
+                        made = await self._bet(
                             m, v, ev_ticker, day_iso, positions, budget, now, refresh=True
                         )
+                        if made:
+                            status["bets"] += 1
+                            decisions += made
+                        else:
+                            r = self._why_no_bet(m, v, positions, 1e9)
+                            skipped[r] = skipped.get(r, 0) + 1
                 a, b = g.teams
                 label = f"{a.abbr} {a.score}-{b.score} {b.abbr} · {g.detail}"
                 show = next((m for m in ms if verdicts.get(m.ticker, None) and
                              verdicts[m.ticker].side is Side.YES), ms[0])  # fmt: skip
                 rows.append((show, label, verdicts.get(show.ticker)))
+            status["unmatched"] += max(0, len(games) - len(rows))
             if rows:
                 out.append(self._snap(
                     f"SPORTS-{league.code}", "sports", f"{league.code} live games", league.code,
@@ -1115,11 +1137,41 @@ class WeatherEngine:
                 ))  # fmt: skip
         return out
 
+    def _why_no_bet(self, m: Market, v: Verdict, positions: dict[str, int], secs: float) -> str:
+        """Plain reason a decided market wasn't bought (for the dashboard)."""
+        if positions.get(m.ticker):
+            return "already bet"
+        if secs < self.ws.price_stop_seconds:
+            return "too close to close"
+        price = m.yes_ask if v.side is Side.YES else (
+            m.no_ask or (100 - m.yes_bid if m.yes_bid else None)
+        )  # fmt: skip
+        if not price:
+            return "no one selling"
+        if price < self.ws.live_min_price:
+            return f"Kalshi disagrees (under {self.ws.live_min_price}c)"
+        limit = min(self.ws.live_max_price, int(v.p_win * 100) - self.ws.live_cushion_cents)
+        if price > limit:
+            return f"too expensive (over {limit}c)"
+        return "spending cap"
+
     async def _live_prices(
         self, now: datetime, positions: dict[str, int], budget: Budget
     ) -> list[dict[str, Any]]:
         """Crypto/commodity/index markets closing soon, decided by the live price."""
+        status: dict[str, Any] = {
+            "checked_at": now.isoformat(timespec="seconds"),
+            "closing_soon": 0, "price_markets": 0, "decided": 0, "bets": 0,
+            "skipped": {}, "feeds": {}, "error": None,
+        }  # fmt: skip
+        self.price_status = status
+        skipped: dict[str, int] = status["skipped"]
+
+        def skip(reason: str) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+
         if self.price_feed is None:
+            status["error"] = "price feed not running"
             return []
         window = self.ws.price_window_seconds
         try:
@@ -1130,35 +1182,53 @@ class WeatherEngine:
             )
         except Exception as exc:
             logger.warning("closing-soon market fetch failed: %s", exc)
+            status["error"] = f"Kalshi closing-soon search failed: {exc}"[:200]
             return []
+        status["closing_soon"] = len(markets)
         groups: dict[str, list[tuple[Market, str, Verdict | None]]] = {}
         decisions: list[Decision] = []
         for m in markets:
             asset = asset_for(m.series_ticker or m.ticker.split("-")[0])
             close = _parse_ts(m.close_time)
-            if (
-                asset is None
-                or close is None
-                or (m.status or "active") not in ("active", "open", "initialized")
-            ):
+            if asset is None or close is None:
+                continue
+            status["price_markets"] += 1
+            if (m.status or "active") not in ("active", "open", "initialized"):
+                skip(f"market {m.status}")
                 continue
             secs = (close - now).total_seconds()
             ticks = self.price_feed.snapshot(PRODUCTS[asset])
-            if not ticks or (now - ticks[-1].timestamp).total_seconds() > 30:
+            age = None if not ticks else (now - ticks[-1].timestamp).total_seconds()
+            status["feeds"][asset] = None if age is None else round(age)
+            if age is None or age > 30:
+                skip("no live price")
                 continue
             vol = vol_per_sqrt_second(ticks, now)
             if vol is None:
+                skip("not enough price history yet")
+                continue
+            if contract_kind(m) is None:
+                skip("unknown contract type")
                 continue
             v = price_verdict(m, ticks[-1].price, vol, secs, self.ws.price_z)
             if v is None:
+                skip("not decided yet")
                 continue
+            status["decided"] += 1
             day = parse_event_date(m.event_ticker or m.ticker)
-            decisions += await self._bet(
+            made = await self._bet(
                 m, v, m.event_ticker or m.ticker, (day or now.date()).isoformat(),
                 positions, budget, now, refresh=True,
                 stop_seconds=self.ws.price_stop_seconds,
             )  # fmt: skip
+            if made:
+                status["bets"] += 1
+                decisions += made
+            else:
+                skip(self._why_no_bet(m, v, positions, secs))
             groups.setdefault(asset, []).append((m, m.yes_sub_title or m.ticker, v))
+        if status["price_markets"]:
+            logger.info("Prices: %s", status)
         out: list[dict[str, Any]] = []
         for asset, rows in sorted(groups.items()):
             kind = "crypto" if asset in CRYPTO else "index" if asset in INDEXES else "commodity"

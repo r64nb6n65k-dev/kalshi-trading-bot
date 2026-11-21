@@ -75,6 +75,22 @@ def _fmt(x: float) -> str:
     return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:,.2f}" if abs(x) >= 10 else f"{x:.4g}"
 
 
+def contract_kind(market: Market) -> str | None:
+    """'greater' / 'less' / 'between' (or the >=/<= forms), inferred from the
+    strikes when Kalshi uses another label (e.g. on 15-minute up/down markets)."""
+    st = (market.strike_type or "").lower()
+    if st in ("greater", "greater_or_equal", "less", "less_or_equal", "between"):
+        return st
+    fl, cap = market.floor_strike, market.cap_strike
+    if fl is not None and cap is not None:
+        return "between"
+    if fl is not None:
+        return "greater_or_equal"
+    if cap is not None:
+        return "less_or_equal"
+    return None
+
+
 def price_verdict(
     market: Market, price: float, vol: float, seconds_left: float, z_needed: float
 ) -> Verdict | None:
@@ -82,7 +98,7 @@ def price_verdict(
     if seconds_left <= 0:
         return None
     move = price * vol * math.sqrt(max(seconds_left, 30.0))  # 1 std dev of the move left
-    st = (market.strike_type or "").lower()
+    st = contract_kind(market) or ""
     fl, cap = market.floor_strike, market.cap_strike
 
     def z(line: float) -> float:
