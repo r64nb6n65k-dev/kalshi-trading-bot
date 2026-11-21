@@ -26,8 +26,9 @@ _MONTHS = {
         start=1,
     )
 }
-# Optional trailing hour for hourly markets: KXTEMPNYCHS-26NOV1605.
-_EVENT_DATE_RE = re.compile(r"-(\d{2})([A-Z]{3})(\d{2})(?:\d{2})?(?:-|$)")
+# The date may be followed by an hour (KXTEMPNYCHS-26NOV1605), a time
+# (KXBTC15M-26NOV211430) or team codes (KXNBAGAME-26NOV22BOSGSW).
+_EVENT_DATE_RE = re.compile(r"-(\d{2})([A-Z]{3})(\d{2})(?=[0-9A-Z]|-|$)")
 # Labels may use an en dash between numbers.
 _RANGE_RE = re.compile(r"(-?\d+)\s*°?\s*(?:F\s*)?(?:to|-|\u2013|through)\s*(-?\d+)\s*°?", re.I)
 _ABOVE_RE = re.compile(r"(-?\d+)\s*°?\s*(?:F\s*)?or\s+(?:above|higher|more|greater)", re.I)

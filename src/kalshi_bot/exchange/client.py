@@ -248,6 +248,11 @@ class KalshiClient:
         data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data["market"])
 
+    async def get_series_list(self, category: str) -> list[dict[str, Any]]:
+        """All series in a Kalshi category (e.g. "Sports", "Crypto")."""
+        data = await self._request("GET", "/series", params={"category": category})
+        return [s for s in data.get("series", []) if isinstance(s, dict)]
+
     async def get_weather_index(self, city: str, last_sec: int = 1200) -> dict[str, Any]:
         """Kalshi's minute-by-minute weather index (what hourly markets settle on).
 

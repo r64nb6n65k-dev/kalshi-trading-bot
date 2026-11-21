@@ -32,6 +32,7 @@ from kalshi_bot.weather.forecasts import OpenMeteoClient
 from kalshi_bot.weather.ledger import PaperLedger
 from kalshi_bot.weather.nws import NwsClient
 from kalshi_bot.weather.observations import summarize
+from kalshi_bot.weather.prices import DecidedPriceFeed
 from kalshi_bot.weather.report import calibrate_from_log, calibrate_history, evaluate
 from kalshi_bot.weather.stations import Kind, climate_day_window, climate_today, resolve_stations
 
@@ -264,8 +265,15 @@ def register_weather_commands(app: typer.Typer, console: Console) -> None:
 
         async def _run() -> None:
             async with KalshiClient.from_settings(settings) as client:
+                feed = None
+                if settings.weather.strategy == "live" and settings.weather.prices:
+                    feed = DecidedPriceFeed(settings)
                 engine = WeatherEngine(
-                    client, settings.weather, RiskManager.from_settings(settings.risk), mode=mode
+                    client,
+                    settings.weather,
+                    RiskManager.from_settings(settings.risk),
+                    mode=mode,
+                    price_feed=feed,
                 )
                 if dashboard:
                     start_weather_dashboard(engine)

@@ -110,6 +110,24 @@ class WeatherSettings(BaseModel):
         ),
     )
 
+    # --- Beyond weather (same "already decided" idea) ----------------------------
+    sports: bool = Field(default=True, description="Game-winner markets decided by live scores.")
+    prices: bool = Field(
+        default=True, description="Crypto/commodity/index markets decided by price near close."
+    )
+    fast_poll_interval: float = Field(
+        default=15.0, gt=0, description="Seconds between sports/price checks."
+    )
+    price_window_seconds: float = Field(
+        default=300.0, gt=0, description="Only judge price markets this close to their close."
+    )
+    price_stop_seconds: float = Field(
+        default=10.0, ge=0, description="Stop betting a price market this close to its close."
+    )
+    price_z: float = Field(
+        default=3.0, gt=0, description="Standard moves the price must sit from the line."
+    )
+
     # --- Live strategy ----------------------------------------------------------
     live_stake_cents: int = Field(default=1_000, gt=0, description="Money per bet ($10).")
     live_max_price: int = Field(default=97, ge=1, le=99, description="Never pay more than this.")

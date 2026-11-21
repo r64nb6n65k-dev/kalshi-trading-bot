@@ -12,6 +12,7 @@ Modes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import traceback
 from collections.abc import Callable
@@ -53,8 +54,17 @@ from kalshi_bot.weather.markets import (
 from kalshi_bot.weather.model import ModelResult, build_distribution
 from kalshi_bot.weather.nws import NwsClient
 from kalshi_bot.weather.observations import ObsReading, rain_so_far, summarize
+from kalshi_bot.weather.prices import (
+    CRYPTO,
+    INDEXES,
+    PRODUCTS,
+    asset_for,
+    price_verdict,
+    vol_per_sqrt_second,
+)
 from kalshi_bot.weather.settings import WeatherSettings
 from kalshi_bot.weather.simple import decide_simple, forecast_odds
+from kalshi_bot.weather.sports import EspnClient, decided, league_for, match_game, verdicts_for
 from kalshi_bot.weather.stations import (
     Kind,
     Station,
@@ -144,6 +154,8 @@ class WeatherEngine:
         now_fn: Callable[[], datetime] | None = None,
         openmeteo: OpenMeteoClient | None = None,
         nws: NwsClient | None = None,
+        price_feed: Any = None,
+        espn: Any = None,
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
@@ -165,6 +177,13 @@ class WeatherEngine:
         self.strategy = WeatherStrategy(settings, risk)
         self.openmeteo = openmeteo or OpenMeteoClient(settings.openmeteo_api_key)
         self.nws = nws or NwsClient(settings.user_agent)
+        # Non-weather markets (sports.py, prices.py), run on a faster loop.
+        self.price_feed = price_feed
+        self.espn = espn or EspnClient()
+        self._slow_snaps: list[dict[str, Any]] = []
+        self._fast_snaps: list[dict[str, Any]] = []
+        self._sports_series: tuple[float, list[str]] = (float("-inf"), [])
+        self._series_markets: dict[str, tuple[float, list[Market]]] = {}
         self._bundles: dict[str, tuple[float, ForecastBundle]] = {}
         self._obs: dict[str, tuple[float, list[ObsReading]]] = {}
         self._last_log: dict[str, float] = {}
@@ -189,6 +208,7 @@ class WeatherEngine:
     async def aclose(self) -> None:
         await self.openmeteo.aclose()
         await self.nws.aclose()
+        await self.espn.aclose()
 
     def _warn_once(self, key: str, msg: str, *args: object) -> None:
         if key not in self._warned:
@@ -575,9 +595,26 @@ class WeatherEngine:
         positions: dict[str, int],
         budget: Budget,
         now: datetime,
+        refresh: bool = False,
+        stop_seconds: float | None = None,
     ) -> list[Decision]:
-        if not self._open_for_trading(m.close_time, now):
+        if positions.get(m.ticker):
             return []
+        if stop_seconds is None:
+            if not self._open_for_trading(m.close_time, now):
+                return []
+        else:
+            close = _parse_ts(m.close_time)
+            if self.mode == "log" or (
+                close is not None and (close - now).total_seconds() < stop_seconds
+            ):
+                return []
+        if refresh:  # fast markets: re-read the book right before betting
+            try:
+                m = await self.client.get_market(m.ticker)
+            except Exception as exc:
+                logger.warning("quote refresh failed for %s: %s", m.ticker, exc)
+                return []
         d = lock_bet(m, v, event, day_iso, positions, budget, self.ws)
         if d is None:
             return []
@@ -813,7 +850,8 @@ class WeatherEngine:
             snapshots = await self._cycle_model(now)
         if self.mode == "paper":
             await self._settle_paper()
-        self.last_snapshots = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots] + self._extra
+        self._slow_snaps = [snapshot_dict(s, self.ws.fee_rate) for s in snapshots] + self._extra
+        self.last_snapshots = self._slow_snaps + self._fast_snaps
         self.last_cycle_at = datetime.now(UTC)
         self.cycles += 1
         return snapshots
@@ -1000,6 +1038,160 @@ class WeatherEngine:
             )
 
     # ------------------------------------------------------------------
+    # Sports and price markets (fast loop)
+    # ------------------------------------------------------------------
+    async def _markets_for(self, series: str, ttl: float = 60.0) -> list[Market]:
+        hit = self._series_markets.get(series)
+        if hit and time.monotonic() - hit[0] < ttl:
+            return hit[1]
+        ms = await self.client.get_all_markets(series_ticker=series, status="open")
+        self._series_markets[series] = (time.monotonic(), ms)
+        return ms
+
+    async def _live_sports(
+        self, now: datetime, positions: dict[str, int], budget: Budget
+    ) -> list[dict[str, Any]]:
+        """Game-winner markets for games ESPN shows as over or out of reach."""
+        stamp, series_list = self._sports_series
+        if time.monotonic() - stamp > 600:
+            try:
+                found_series = await self.client.get_series_list("Sports")
+                series_list = sorted(
+                    {str(r.get("ticker", "")).upper() for r in found_series} - {""}
+                )
+                series_list = [x for x in series_list if league_for(x) is not None]
+                self._sports_series = (time.monotonic(), series_list)
+                logger.warning("Sports game series found: %s", ", ".join(series_list))
+            except Exception as exc:
+                logger.warning("sports series discovery failed: %s", exc)
+        out: list[dict[str, Any]] = []
+        for series in series_list:
+            league = league_for(series)
+            assert league is not None
+            try:
+                games = [g for g in await self.espn.games(league) if g.state in ("in", "post")]
+            except Exception as exc:
+                logger.warning("ESPN %s failed: %s", league.code, exc)
+                continue
+            if not games:
+                continue
+            try:
+                markets = await self._markets_for(series)
+            except Exception as exc:
+                logger.warning("%s: market fetch failed: %s", series, exc)
+                continue
+            by_event: dict[str, list[Market]] = {}
+            for m in markets:
+                by_event.setdefault(m.event_ticker or m.ticker.rsplit("-", 1)[0], []).append(m)
+            rows: list[tuple[Market, str, Verdict | None]] = []
+            decisions: list[Decision] = []
+            n_decided = 0
+            for ev_ticker, ms in sorted(by_event.items()):
+                found = match_game(ev_ticker, ms, games)
+                if found is None:
+                    continue
+                g, mapping = found
+                outcome = decided(league, g)
+                verdicts = verdicts_for(mapping, outcome) if outcome else {}
+                n_decided += bool(outcome)
+                day_iso = g.day.isoformat()
+                for m in ms:
+                    v = verdicts.get(m.ticker)
+                    if v is not None:
+                        decisions += await self._bet(
+                            m, v, ev_ticker, day_iso, positions, budget, now, refresh=True
+                        )
+                a, b = g.teams
+                label = f"{a.abbr} {a.score}-{b.score} {b.abbr} · {g.detail}"
+                show = next((m for m in ms if verdicts.get(m.ticker, None) and
+                             verdicts[m.ticker].side is Side.YES), ms[0])  # fmt: skip
+                rows.append((show, label, verdicts.get(show.ticker)))
+            if rows:
+                out.append(self._snap(
+                    f"SPORTS-{league.code}", "sports", f"{league.code} live games", league.code,
+                    now.date().isoformat(),
+                    f"{len(rows)} live/finished games matched · {n_decided} decided",
+                    rows, decisions,
+                ))  # fmt: skip
+        return out
+
+    async def _live_prices(
+        self, now: datetime, positions: dict[str, int], budget: Budget
+    ) -> list[dict[str, Any]]:
+        """Crypto/commodity/index markets closing soon, decided by the live price."""
+        if self.price_feed is None:
+            return []
+        window = self.ws.price_window_seconds
+        try:
+            markets = await self.client.get_all_markets(
+                min_close_ts=int(now.timestamp()),
+                max_close_ts=int(now.timestamp() + window),
+                mve_filter="exclude",
+            )
+        except Exception as exc:
+            logger.warning("closing-soon market fetch failed: %s", exc)
+            return []
+        groups: dict[str, list[tuple[Market, str, Verdict | None]]] = {}
+        decisions: list[Decision] = []
+        for m in markets:
+            asset = asset_for(m.series_ticker or m.ticker.split("-")[0])
+            close = _parse_ts(m.close_time)
+            if (
+                asset is None
+                or close is None
+                or (m.status or "active") not in ("active", "open", "initialized")
+            ):
+                continue
+            secs = (close - now).total_seconds()
+            ticks = self.price_feed.snapshot(PRODUCTS[asset])
+            if not ticks or (now - ticks[-1].timestamp).total_seconds() > 30:
+                continue
+            vol = vol_per_sqrt_second(ticks, now)
+            if vol is None:
+                continue
+            v = price_verdict(m, ticks[-1].price, vol, secs, self.ws.price_z)
+            if v is None:
+                continue
+            day = parse_event_date(m.event_ticker or m.ticker)
+            decisions += await self._bet(
+                m, v, m.event_ticker or m.ticker, (day or now.date()).isoformat(),
+                positions, budget, now, refresh=True,
+                stop_seconds=self.ws.price_stop_seconds,
+            )  # fmt: skip
+            groups.setdefault(asset, []).append((m, m.yes_sub_title or m.ticker, v))
+        out: list[dict[str, Any]] = []
+        for asset, rows in sorted(groups.items()):
+            kind = "crypto" if asset in CRYPTO else "index" if asset in INDEXES else "commodity"
+            mine = [d for d in decisions if asset_for(d.order.ticker.split("-")[0]) == asset]
+            out.append(self._snap(
+                f"PRICE-{asset}", kind, f"{asset} closing soon", asset, now.date().isoformat(),
+                f"{len(rows)} markets decided by price in the last "
+                f"{window / 60:.0f} min before close", rows, mine,
+            ))  # fmt: skip
+        return out
+
+    async def fast_cycle(self) -> None:
+        now = self.now_fn()
+        positions, budget, _ = await self._account()
+        fast: list[dict[str, Any]] = []
+        if self.ws.sports:
+            fast += await self._live_sports(now, positions, budget)
+        if self.ws.prices:
+            fast += await self._live_prices(now, positions, budget)
+        self._fast_snaps = fast
+        self.last_snapshots = self._slow_snaps + fast
+
+    async def _fast_loop(self) -> None:
+        while self._running:
+            try:
+                await self.fast_cycle()
+            except Exception:
+                logger.exception("fast cycle (sports/prices) failed; continuing")
+                self.last_error = (
+                    f"{datetime.now(UTC):%H:%M:%S} UTC: {traceback.format_exc(limit=1)}"
+                )
+            await asyncio.sleep(self.ws.fast_poll_interval)
+
     async def run(self, max_cycles: int | None = None) -> None:
         self._running = True
         logger.warning(
@@ -1009,6 +1201,11 @@ class WeatherEngine:
             ",".join(k.value for k in self.kinds),
         )
         n = 0
+        fast_task: asyncio.Task[None] | None = None
+        if self.ws.strategy == "live" and (self.ws.sports or self.ws.prices):
+            if self.ws.prices and self.price_feed is not None:
+                await self.price_feed.start()
+            fast_task = asyncio.create_task(self._fast_loop(), name="sports-prices")
         try:
             while self._running:
                 try:
@@ -1025,6 +1222,12 @@ class WeatherEngine:
                 await asyncio.sleep(self.ws.poll_interval)
         finally:
             self._running = False
+            if fast_task is not None:
+                fast_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await fast_task
+            if self.price_feed is not None:
+                await self.price_feed.stop()
             await self.aclose()
 
     def stop(self) -> None:
