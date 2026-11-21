@@ -309,7 +309,7 @@ const sline=ss.checked_at?`<div class=s>Sports: ${ss.series} leagues · ${ss.liv
 (reasons(ss.skipped)?` · skipped: ${reasons(ss.skipped)}`:'')+
 (ss.error?` · ⚠️ ${ss.error}`:'')+'</div>':'';
 const extra=pline+sline;
-const strat={live:'bet what\'s already decided',simple:'bet the NWS forecast',
+const strat={live:'bet only decided outcomes',simple:'bet the NWS forecast',
 model:'model'}[d.strategy]||d.strategy;
 $('health').innerHTML=extra+`<div class=sub>Strategy: ${strat} · Memory: ${
 st.persistent?'✅ saved on Railway volume':

@@ -63,3 +63,19 @@ def test_data_path_prefers_railway_volume(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH")
     monkeypatch.chdir(tmp_path)
     assert WeatherSettings().data_path() == Path(DEFAULT_DATA_DIR)
+
+
+def test_dashboard_script_is_valid_javascript(tmp_path: Path) -> None:
+    """A single stray quote in the page script blanks the whole dashboard."""
+    import shutil
+    import subprocess
+
+    from kalshi_bot.weather.dashboard import HTML
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not installed")
+    script = tmp_path / "dash.js"
+    script.write_text(HTML.split("<script>")[1].split("</script>")[0], encoding="utf-8")
+    result = subprocess.run([node, "--check", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
