@@ -195,6 +195,8 @@ def build_data(engine: WeatherEngine) -> dict[str, Any]:
         "strategy": engine.ws.strategy,
         "storage": storage_status(engine.data_dir),
         "settlement": engine.settle_status,
+        "price_status": engine.price_status,
+        "sports_status": engine.sports_status,
         "warnings": sorted(set(engine.warnings))[:8],
         "scoreboard": scoreboard(
             recent_rows(engine.datalog.dir, {"order"}, max_files=10_000),
@@ -293,8 +295,24 @@ $('status').textContent=`${d.stations.join(', ')} · ${d.kinds.join(' & ')} · l
 `${ago(d.last_cycle_at)} · ${d.cycles} cycles`;
 $('err').innerHTML=d.last_error?`<div class=err>Last error ${d.last_error}</div>`:'';
 const st=d.storage,se=d.settlement||{};
-$('health').innerHTML=`<div class=sub>${d.strategy==='simple'?'Strategy: bet the NWS forecast':
-'Strategy: model'} · Memory: ${st.persistent?'✅ saved on Railway volume':
+const reasons=o=>Object.entries(o||{}).sort((a,b)=>b[1]-a[1])
+.map(([k,v])=>`${k} ${v}`).join(', ');
+const ps=d.price_status||{},ss=d.sports_status||{};
+const feeds=Object.entries(ps.feeds||{})
+.map(([a,s])=>`${a} ${s==null?'⚠️ no price':s+'s old'}`).join(', ');
+const pline=ps.checked_at?`<div class=s>Crypto/commodities: ${ps.price_markets} markets `+
+`closing soon · ${ps.decided} decided · ${ps.bets} bets`+(feeds?` · prices: ${feeds}`:'')+
+(reasons(ps.skipped)?` · skipped: ${reasons(ps.skipped)}`:'')+
+(ps.error?` · ⚠️ ${ps.error}`:'')+'</div>':'';
+const sline=ss.checked_at?`<div class=s>Sports: ${ss.series} leagues · ${ss.live_games} `+
+`live/final games · ${ss.matched} matched · ${ss.decided} decided · ${ss.bets} bets`+
+(reasons(ss.skipped)?` · skipped: ${reasons(ss.skipped)}`:'')+
+(ss.error?` · ⚠️ ${ss.error}`:'')+'</div>':'';
+const extra=pline+sline;
+const strat={live:'bet what\'s already decided',simple:'bet the NWS forecast',
+model:'model'}[d.strategy]||d.strategy;
+$('health').innerHTML=extra+`<div class=sub>Strategy: ${strat} · Memory: ${
+st.persistent?'✅ saved on Railway volume':
 '⚠️ NOT on a volume, so it resets on every update'}</div><div class=sub>Settlement check: ${
 se.checked_at?ago(se.checked_at)+' · '+(se.past_day-se.settled_now)+' bets waiting for results'+
 (se.settled_now?' · '+se.settled_now+' just settled':'')+

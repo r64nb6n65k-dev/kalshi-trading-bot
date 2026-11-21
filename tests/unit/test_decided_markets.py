@@ -236,3 +236,31 @@ def test_fast_cycle_respects_toggles(tmp_path: Path) -> None:
     eng.ws = eng.ws.model_copy(update={"sports": False, "prices": False})
     asyncio.run(eng.fast_cycle())
     assert not eng.ledger.positions
+
+
+def test_unlabelled_contract_type_is_inferred_from_strikes() -> None:
+    m = _mk("KXBTC15M-26NOV230315-15", "BTC", 50, 52, strike_type="custom",
+            floor_strike=99_000.0)  # fmt: skip
+    v = price_verdict(m, 100_000.0, 5e-5, 120.0, 3.0)
+    assert v is not None and v.side is Side.YES
+
+
+def test_price_status_explains_skips(tmp_path: Path) -> None:
+    eng = _engine(tmp_path, "paper", [], strategy="live")
+    k = FakeKalshiAll()
+    close = k.closing[0].close_time
+    # Decided, but Kalshi already asks 98c: too expensive.
+    k.closing[0] = _mk(
+        "KXBTC15M-26NOV222200-00", "BTC", 97, 98, strike_type="greater",
+        floor_strike=99_000.0, close_time=close, series_ticker="KXBTC15M",
+    )  # fmt: skip
+    eng.client = k  # type: ignore[assignment]
+    eng.espn = FakeEspn()
+    eng.price_feed = FakeFeed()
+    eng.now_fn = lambda: NOW
+    eng.ws = eng.ws.model_copy(update={"sports": False})
+    asyncio.run(eng.fast_cycle())
+    st = eng.price_status
+    assert st["price_markets"] == 1 and st["decided"] == 1 and st["bets"] == 0
+    assert any("too expensive" in r for r in st["skipped"])
+    assert st["feeds"]["BTC"] is not None
