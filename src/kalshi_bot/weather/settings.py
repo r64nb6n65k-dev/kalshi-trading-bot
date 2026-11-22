@@ -119,7 +119,7 @@ class WeatherSettings(BaseModel):
         default=15.0, gt=0, description="Seconds between sports/price checks."
     )
     price_window_seconds: float = Field(
-        default=300.0, gt=0, description="Only judge price markets this close to their close."
+        default=900.0, gt=0, description="Only judge price markets this close to their close."
     )
     price_stop_seconds: float = Field(
         default=10.0, ge=0, description="Stop betting a price market this close to its close."

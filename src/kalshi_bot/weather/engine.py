@@ -186,6 +186,10 @@ class WeatherEngine:
         self._sports_series: tuple[float, list[str]] = (float("-inf"), [])
         self._series_markets: dict[str, tuple[float, list[Market]]] = {}
         self.price_status: dict[str, Any] = {}
+        # Running tally for today (UTC): ticker -> last outcome, so the dashboard
+        # can say why crypto/commodity markets were or weren't bet.
+        self._price_day = ""
+        self._price_seen: dict[str, str] = {}
         self.sports_status: dict[str, Any] = {}
         self._bundles: dict[str, tuple[float, ForecastBundle]] = {}
         self._obs: dict[str, tuple[float, list[ObsReading]]] = {}
@@ -1167,8 +1171,15 @@ class WeatherEngine:
         self.price_status = status
         skipped: dict[str, int] = status["skipped"]
 
+        if self._price_day != now.date().isoformat():
+            self._price_day, self._price_seen = now.date().isoformat(), {}
+        seen = self._price_seen
+        current = ""
+
         def skip(reason: str) -> None:
             skipped[reason] = skipped.get(reason, 0) + 1
+            if seen.get(current) != "bet":
+                seen[current] = reason
 
         if self.price_feed is None:
             status["error"] = "price feed not running"
@@ -1193,6 +1204,7 @@ class WeatherEngine:
             if asset is None or close is None:
                 continue
             status["price_markets"] += 1
+            current = m.ticker
             if (m.status or "active") not in ("active", "open", "initialized"):
                 skip(f"market {m.status}")
                 continue
@@ -1223,10 +1235,15 @@ class WeatherEngine:
             )  # fmt: skip
             if made:
                 status["bets"] += 1
+                seen[m.ticker] = "bet"
                 decisions += made
             else:
                 skip(self._why_no_bet(m, v, positions, secs))
             groups.setdefault(asset, []).append((m, m.yes_sub_title or m.ticker, v))
+        tally: dict[str, int] = {}
+        for outcome in seen.values():
+            tally[outcome] = tally.get(outcome, 0) + 1
+        status["today"] = {"markets": len(seen), "bets": tally.pop("bet", 0), "why_not": tally}
         if status["price_markets"]:
             logger.info("Prices: %s", status)
         out: list[dict[str, Any]] = []
