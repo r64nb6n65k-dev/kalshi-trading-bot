@@ -264,3 +264,17 @@ def test_price_status_explains_skips(tmp_path: Path) -> None:
     assert st["price_markets"] == 1 and st["decided"] == 1 and st["bets"] == 0
     assert any("too expensive" in r for r in st["skipped"])
     assert st["feeds"]["BTC"] is not None
+    # The day's running tally remembers it, and a later bet replaces the reason.
+    assert st["today"] == {"markets": 1, "bets": 0, "why_not": {"too expensive (over 95c)": 1}}
+    k.closing[0] = _mk(
+        "KXBTC15M-26NOV222200-00", "BTC", 92, 94, strike_type="greater",
+        floor_strike=99_000.0, close_time=close, series_ticker="KXBTC15M",
+    )  # fmt: skip
+    asyncio.run(eng.fast_cycle())
+    assert eng.price_status["today"] == {"markets": 1, "bets": 1, "why_not": {}}
+
+
+def test_price_window_is_fifteen_minutes() -> None:
+    from kalshi_bot.weather.settings import WeatherSettings
+
+    assert WeatherSettings().price_window_seconds == 900

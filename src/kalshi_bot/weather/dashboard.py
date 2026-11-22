@@ -303,7 +303,9 @@ const feeds=Object.entries(ps.feeds||{})
 const pline=ps.checked_at?`<div class=s>Crypto/commodities: ${ps.price_markets} markets `+
 `closing soon · ${ps.decided} decided · ${ps.bets} bets`+(feeds?` · prices: ${feeds}`:'')+
 (reasons(ps.skipped)?` · skipped: ${reasons(ps.skipped)}`:'')+
-(ps.error?` · ⚠️ ${ps.error}`:'')+'</div>':'';
+(ps.error?` · ⚠️ ${ps.error}`:'')+'</div>'+(ps.today?`<div class=s>Crypto/commodities today: `+
+`${ps.today.markets} markets checked · ${ps.today.bets} bets`+(reasons(ps.today.why_not)?
+` · why not: ${reasons(ps.today.why_not)}`:'')+'</div>':''):'';
 const sline=ss.checked_at?`<div class=s>Sports: ${ss.series} leagues · ${ss.live_games} `+
 `live/final games · ${ss.matched} matched · ${ss.decided} decided · ${ss.bets} bets`+
 (reasons(ss.skipped)?` · skipped: ${reasons(ss.skipped)}`:'')+
