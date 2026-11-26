@@ -215,6 +215,8 @@ def decided(league: League, g: Game) -> tuple[Team | None, float, str] | None:
         return leader, 0.995, f"final: {score}"
     if g.state != "in" or leader is None:
         return None
+    if g.clock <= 0 and league.sport not in ("soccer", "baseball"):
+        return None  # between periods: ESPN can show the next period at 0:00
     why = f"{score}, {g.detail}"
     s = league.sport
     if s == "basketball":

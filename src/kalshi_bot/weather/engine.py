@@ -42,6 +42,7 @@ from kalshi_bot.weather.markets import (
     HOURLY_INDEX_IDS,
     HOURLY_STATIONS,
     RAIN_SERIES,
+    RAIN_STATIONS,
     Candidate,
     candidate_rows,
     decide_binary,
@@ -60,6 +61,7 @@ from kalshi_bot.weather.prices import (
     PRODUCTS,
     asset_for,
     contract_kind,
+    in_futures_break,
     price_verdict,
     vol_per_sqrt_second,
 )
@@ -820,7 +822,7 @@ class WeatherEngine:
                     rows.append((m, city, None))  # not today yet
                     continue
                 try:
-                    icao = await self.nws.nearest_station(place)
+                    icao = RAIN_STATIONS.get(city) or await self.nws.nearest_station(place)
                 except Exception as exc:
                     logger.warning("%s: nearest station lookup failed: %s", city, exc)
                     rows.append((m, city, None))
@@ -1205,6 +1207,9 @@ class WeatherEngine:
                 continue
             status["price_markets"] += 1
             current = m.ticker
+            if asset not in CRYPTO and in_futures_break(close):
+                skip("futures daily break (5-6pm ET)")
+                continue
             if (m.status or "active") not in ("active", "open", "initialized"):
                 skip(f"market {m.status}")
                 continue

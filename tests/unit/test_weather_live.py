@@ -124,7 +124,7 @@ class FakeKalshiLive:
                 _m("65° or above", 10, 14, "KXTEMPNYCHS-26OCT2819-T64.99",
                    close_time="2026-10-29T00:00:00Z"),
             ],
-            "KXRAIN": [_m("Miami", 60, 64, "KXRAIN-26OCT28-MIA")],
+            "KXRAIN": [_m("Miami", 88, 90, "KXRAIN-26OCT28-MIA")],
         }  # fmt: skip
 
     async def get_all_markets(self, **params: Any) -> list[Market]:

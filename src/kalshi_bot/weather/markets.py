@@ -72,6 +72,10 @@ HOURLY_STATIONS: dict[str, list[str]] = {
 
 RAIN_SERIES = "KXRAIN"
 
+# Rain is settled at the city's main airport; the station nearest downtown
+# can be a different one (Tampa downtown -> Peter O. Knight, not KTPA).
+RAIN_STATIONS: dict[str, str] = {"Tampa": "KTPA", "New Orleans": "KMSY"}
+
 # City name (as Kalshi writes it) -> (lat, lon, standard UTC offset).
 RAIN_CITIES: dict[str, tuple[float, float, int]] = {
     "Albuquerque": (35.08, -106.65, -7), "Atlanta": (33.75, -84.39, -5),

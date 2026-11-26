@@ -20,6 +20,7 @@ import itertools
 import math
 from collections.abc import Sequence
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from kalshi_bot.data.multi_asset import MultiAssetPriceFeed
 from kalshi_bot.exchange.models import Market, Side
@@ -36,6 +37,18 @@ PRODUCTS: dict[str, str] = {
 }  # fmt: skip
 CRYPTO = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "BCH", "BNB", "HYPE", "NEAR", "TON", "ZEC"}
 INDEXES = {"INX", "NASDAQ100"}
+
+
+def in_futures_break(close: datetime) -> bool:
+    """True for markets closing 4:45-6:15pm New York time.
+
+    Futures pause 5-6pm ET every day, so the price feed freezes and looks
+    calm while the market's settlement price is set elsewhere. Every
+    commodity loss so far closed in this window.
+    """
+    local = close.astimezone(ZoneInfo("America/New_York"))
+    minutes = local.hour * 60 + local.minute
+    return 16 * 60 + 45 <= minutes <= 18 * 60 + 15
 
 
 def asset_for(series_ticker: str) -> str | None:
