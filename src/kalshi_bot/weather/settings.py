@@ -135,7 +135,7 @@ class WeatherSettings(BaseModel):
         default=2, ge=0, description="Price must be this far below the chance of winning."
     )
     live_min_price: int = Field(
-        default=60,
+        default=85,
         ge=1,
         le=99,
         description=(

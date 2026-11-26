@@ -278,3 +278,28 @@ def test_price_window_is_fifteen_minutes() -> None:
     from kalshi_bot.weather.settings import WeatherSettings
 
     assert WeatherSettings().price_window_seconds == 900
+
+
+def test_futures_break_window() -> None:
+    from kalshi_bot.weather.prices import in_futures_break
+
+    # Nov: New York is UTC-5. 5:15pm ET = 22:15 UTC.
+    assert in_futures_break(datetime(2026, 11, 25, 22, 15, tzinfo=UTC))
+    assert in_futures_break(datetime(2026, 11, 25, 21, 45, tzinfo=UTC))  # 4:45pm
+    assert not in_futures_break(datetime(2026, 11, 25, 23, 30, tzinfo=UTC))  # 6:30pm
+    assert not in_futures_break(datetime(2026, 11, 25, 16, 30, tzinfo=UTC))  # 11:30am
+
+
+def test_no_sports_bet_between_periods() -> None:
+    nba = LEAGUES["NBA"]
+    # The real loss: ESPN showed "0.0 - 4th" at 93-88 while it was really
+    # the break after the 3rd quarter.
+    g = _game((93, 88), 4, 0.0)
+    assert decided(nba, g) is None
+    assert decided(nba, _game((93, 88), 4, 3.0)) is not None
+
+
+def test_min_price_is_85() -> None:
+    from kalshi_bot.weather.settings import WeatherSettings
+
+    assert WeatherSettings().live_min_price == 85
